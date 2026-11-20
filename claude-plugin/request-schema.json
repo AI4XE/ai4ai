@@ -1,0 +1,140 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "requiredFeatures": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "handoff",
+          "spawn",
+          "status",
+          "message",
+          "cancel",
+          "stop",
+          "list",
+          "surface-preserve",
+          "surface-cross",
+          "spawn-isolation",
+          "spawn-policy",
+          "model-override",
+          "reasoning-effort-override",
+          "tmux-fallback"
+        ]
+      },
+      "description": "Feature names this caller requires; the request fails when the harness does not declare them."
+    },
+    "operation": {
+      "enum": [
+        "handoff",
+        "spawn",
+        "status",
+        "message",
+        "cancel",
+        "stop",
+        "list",
+        "capabilities"
+      ],
+      "description": "Operation to perform: handoff, spawn, status, message, cancel/stop, list or capabilities."
+    },
+    "operationId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "description": "Caller-chosen idempotency key; reusing it with different input is rejected."
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "description": "Target agent: \"self\" for this session or an owned executor id."
+    },
+    "owner": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "description": "For list: only return executors created by this owner identity."
+    },
+    "mode": {
+      "enum": [
+        "compact",
+        "restart"
+      ],
+      "description": "Handoff mode: restart (default) starts a fresh context containing only the task material with no summary; compact is an explicit opt-in that keeps a harness-generated history summary."
+    },
+    "surface": {
+      "enum": [
+        "preserve",
+        "tui",
+        "headless",
+        "web"
+      ],
+      "description": "Interaction surface: preserve (default) or an explicit cross-surface target."
+    },
+    "task": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "description": "Seed material for handoff, spawn or message: the task the context or executor adopts."
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Optional model override; when omitted the harness configuration is inherited."
+    },
+    "reasoningEffort": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Optional reasoning-effort override (for example low, medium, high); when omitted the harness configuration is inherited."
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Child policy for spawned executors; a denial returns forbidden.",
+      "properties": {
+        "allowSelfHandoff": {
+          "type": "boolean",
+          "description": "Whether a spawned executor may renew its own context (default true)."
+        },
+        "allowSpawnChildren": {
+          "type": "boolean",
+          "description": "Whether a spawned executor may create further executors (default false)."
+        },
+        "allowSelfStop": {
+          "type": "boolean",
+          "description": "Whether a spawned executor may stop itself (default true)."
+        }
+      }
+    },
+    "isolation": {
+      "enum": [
+        "inherit",
+        "isolated"
+      ],
+      "description": "Executor isolation: inherit the caller environment (default) or isolated."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16,
+      "description": "Number of detached executors to spawn (1-16)."
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 300000,
+      "description": "Maximum wait in milliseconds for a stop confirmation."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Human-readable reason recorded with the operation."
+    }
+  },
+  "required": [
+    "operation",
+    "operationId"
+  ]
+}

@@ -1,0 +1,4 @@
+# Native DSH integration. Does not change models, permissions or delegation policy.
+- insert:
+    - id: ai4ai-session-capabilities
+      name: ai4ai/dsh

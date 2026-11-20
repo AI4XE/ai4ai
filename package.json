@@ -1,0 +1,93 @@
+{
+  "name": "ai4ai",
+  "version": "0.0.3",
+  "description": "AI Harness Extension Kit: portable self-handoff and detached executors across AI coding harnesses",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AI4XE/ai4ai.git"
+  },
+  "homepage": "https://github.com/AI4XE/ai4ai#readme",
+  "bugs": {
+    "url": "https://github.com/AI4XE/ai4ai/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "ai4ai": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./contract": {
+      "types": "./dist/contract/index.d.ts",
+      "import": "./dist/contract/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    },
+    "./adapters/claude": {
+      "types": "./dist/adapters/claude/adapter.d.ts",
+      "import": "./dist/adapters/claude/adapter.js"
+    },
+    "./adapters/codex": {
+      "types": "./dist/adapters/codex/adapter.d.ts",
+      "import": "./dist/adapters/codex/adapter.js"
+    },
+    "./adapters/opencode": {
+      "types": "./dist/adapters/opencode/adapter.d.ts",
+      "import": "./dist/adapters/opencode/adapter.js"
+    },
+    "./adapters/dsh": {
+      "types": "./dist/adapters/dsh/adapter.d.ts",
+      "import": "./dist/adapters/dsh/adapter.js"
+    },
+    "./dsh": {
+      "types": "./dist/adapters/dsh/plugin.d.ts",
+      "import": "./dist/adapters/dsh/plugin.js"
+    },
+    "./installer": {
+      "types": "./dist/install/manager.d.ts",
+      "import": "./dist/install/manager.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "listedByDefault": true
+    }
+  },
+  "files": [
+    "dist",
+    "claude-plugin/.claude-plugin/plugin.json",
+    "claude-plugin/hooks",
+    "claude-plugin/dist",
+    "claude-plugin/package.json",
+    "claude-plugin/request-schema.json",
+    "opencode-plugin",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "docs/banner.svg",
+    "docs/banner.zh-CN.svg",
+    "docs/contract.md"
+  ],
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "check": "node tools/check-version.mjs",
+    "docs": "node tools/gen-contract-doc.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ajv": "^8.17.1",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="240" viewBox="0 0 1280 240" role="img" aria-label="AI4AI — AI Harness Extension Kit — Let AI Manage Itself">
+  <defs>
+    <linearGradient id="wordmark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#08B9EE"/>
+      <stop offset="1" stop-color="#008BD5"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="240" fill="#0F172A"/>
+  <text x="640" y="96" text-anchor="middle" fill="url(#wordmark)" font-family="Arial, Helvetica, sans-serif" font-size="68" font-weight="700" letter-spacing="-1">AI4AI</text>
+  <text x="640" y="134" text-anchor="middle" fill="#A5B2C5" font-family="Arial, Helvetica, sans-serif" font-size="19" letter-spacing="4">AI HARNESS EXTENSION KIT</text>
+  <text x="640" y="193" text-anchor="middle" fill="#E2E8F0" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700">Let AI Manage Itself</text>
+</svg>
