@@ -1,6 +1,6 @@
 import type {
   Availability, ContextVerification, HandoffMode, HandoffPhase, HarnessId, Isolation, LifecycleState,
-  ModelVerification, Operation, Os, PercentSource, State, Surface, SourceLabel, AutoCompactSource,
+  ModelVerification, Operation, Os, PercentSource, State, StoredProofMechanism, Surface, SourceLabel, AutoCompactSource,
 } from './states.js';
 import type { Feature } from './version.js';
 
@@ -95,7 +95,8 @@ export interface ContractError {
 export interface AdoptionProof {
   source: Identity;
   successor: Identity;
-  mechanism: 'new-session' | 'surface-replacement';
+  /** Current adapters produce the first two; `new-session` is legacy read-only. */
+  mechanism: StoredProofMechanism;
   nativeEvidence: string;
 }
 
@@ -179,7 +180,6 @@ export interface CapabilityDeclaration {
     modelOverride: Availability;
     reasoningEffortOverride: Availability;
     crossSurface: Availability;
-    tmuxFallback: 'off' | 'experimental';
   };
   spawn: {
     availability: Availability;

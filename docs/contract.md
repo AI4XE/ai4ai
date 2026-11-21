@@ -52,10 +52,13 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
   is not required to visit every value in order, and `scheduled` is optional: an adapter may
   report `pending` -> `applied` -> `completed` directly when its native safe point is atomic.
 - `successor` is a complete Identity: `harness`, `workspace`, `surface`, `session`,
-  `generation` and `agent`. An implementation may reuse the same `session` and increment
-  `generation` (for example when a harness replaces the context in place); the remaining
-  fields must still be reported truthfully. `session` + `generation` alone is not a
-  successor identity.
+  `generation` and `agent`. A handoff always keeps the native `session` and advances only
+  `generation`; it never changes the session identity. Use `spawn` for a new session, and
+  never fabricate a successor identity from a CLI carrier id.
+- `proof.mechanism` is `surface-replacement` (zero-summary in-place restart) or
+  `native-compaction` (explicit compact opt-in that used the harness summarizer).
+  `new-session` is legacy read-only evidence from releases before 0.0.5 and is accepted
+  only when re-reading those records; current adapters never produce it.
 - The first `handoff` call may return `pending` because the native transition completes at a
   safe point. Re-querying with the same `operationId` is idempotent and returns the
   progressed (eventually `completed`) result; it must not start a second transition.
@@ -65,14 +68,14 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 - `operation`: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `capabilities`.
 - `operationId`: caller-chosen idempotency key.
 - `target`: `"self"` or an owned executor id (`handoff`, `status`, `message`, `cancel`).
-- `mode`: `compact` | `restart` (`compact` in place, `restart` fresh context).
+- `mode`: `compact` | `restart` (`restart` is the default and replaces the context in place with the material only; `compact` is an explicit opt-in that uses the harness summarizer and is refused where the capability declaration does not list it).
 - `surface`: `preserve` | `tui` | `headless` | `web`; default `preserve`. A silent surface change is forbidden.
 - `task`: seed material for `handoff`, `spawn`, `message`.
 - `model`, `reasoningEffort`: optional overrides. The default is to pass nothing and inherit the harness configuration.
 - `policy`: `allowSelfHandoff` (default `true`), `allowSpawnChildren` (default `false`), `allowSelfStop` (default `true`).
 - `isolation`: `inherit` | `isolated`; `inherit` is the default.
 - `count`: 1..16 for `spawn`; the adapter declares the effective concurrency limit and over-limit requests fail loudly.
-- `requiredFeatures`: optional mandatory feature names: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `surface-preserve`, `surface-cross`, `spawn-isolation`, `spawn-policy`, `model-override`, `reasoning-effort-override`, `tmux-fallback`.
+- `requiredFeatures`: optional mandatory feature names: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `surface-preserve`, `surface-cross`, `spawn-isolation`, `spawn-policy`, `model-override`, `reasoning-effort-override`.
 
 ## Result fields
 
@@ -95,7 +98,7 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 - `unavailable`: names of fields the adapter could not obtain; their values are `null`. Missing values are never omitted or replaced with 0/empty placeholders.
 - `notices`: `{ code, impact: "none", action_required: false, message }`. **Skills must treat notices as informational: never stop, retry or prompt because of one.**
 - `error`: `{ code, message }` for refusals and failures.
-- `proof` (handoff completion): source/successor identities, mechanism and native evidence.
+- `proof` (any result that claims a context replacement, including `applied`): source/successor identities, mechanism and native evidence. For a current mechanism the successor `session` must equal the source `session`; a mismatch is rejected as `invalid-result`, never accepted as a handoff.
 - `capabilities`, `executors` for the corresponding operations.
 
 ## Status resolution: the per-field source ladder
@@ -210,8 +213,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
           "spawn-isolation",
           "spawn-policy",
           "model-override",
-          "reasoning-effort-override",
-          "tmux-fallback"
+          "reasoning-effort-override"
         ]
       },
       "description": "Feature names this caller requires; the request fails when the harness does not declare them."
@@ -1287,8 +1289,9 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         },
         "mechanism": {
           "enum": [
-            "new-session",
-            "surface-replacement"
+            "surface-replacement",
+            "native-compaction",
+            "new-session"
           ]
         },
         "nativeEvidence": {
@@ -1388,12 +1391,6 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
                   "unsupported",
                   "not-tested"
                 ]
-              },
-              "tmuxFallback": {
-                "enum": [
-                  "off",
-                  "experimental"
-                ]
               }
             },
             "required": [
@@ -1401,8 +1398,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "modes",
               "modelOverride",
               "reasoningEffortOverride",
-              "crossSurface",
-              "tmuxFallback"
+              "crossSurface"
             ]
           },
           "spawn": {

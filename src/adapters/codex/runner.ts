@@ -17,6 +17,7 @@
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer } from './app-server.js';
+import { applyRevertHandoff, type RpcTransport } from './native-handoff.js';
 
 const args = process.argv.slice(2);
 const threadIndex = args.indexOf('--thread');
@@ -131,49 +132,57 @@ const applyHandoff = async (): Promise<boolean> => {
     let successorThreadId = threadId;
     let successorTurnId: string | undefined;
     if (mode === 'restart') {
-      // Native in-place restart in the same app-server process: a new thread
-      // with no history and the material as its first turn. No summarizer runs.
-      const fresh = await server.request('thread/start', {
-        cwd, approvalPolicy: 'never', sandbox: 'workspace-write', sessionStartSource: 'clear',
-      }, handoffTimeoutMs) as { thread?: { id?: string; model?: string } };
-      successorThreadId = fresh.thread?.id ?? '';
-      if (!successorThreadId) throw new Error('thread/start returned no thread id');
-      threadId = successorThreadId;
-      if (fresh.thread?.model) {
-        threadModel = fresh.thread.model;
-        if (executorDir) {
-          try { await writeFile(path.join(executorDir, 'model.json'), JSON.stringify({ model: threadModel }) + '\n'); } catch { /* best effort */ }
-        }
-      }
-      // The supervisor observes session_id lines and replaces the executor's
-      // session pointer while keeping the executorId.
-      process.stdout.write(JSON.stringify({ session_id: threadId }) + '\n');
-      events = [];
+      // Same-thread restart: revert the thread to its start (durable and live
+      // context), then run the material as the next turn in that thread. The
+      // thread id is unchanged and no summarizer runs.
+      const transport: RpcTransport = {
+        call: (method, params, timeoutMs) => server.request(method, params, timeoutMs),
+        onMessage: listener => {
+          server.onNotification((method, params) => listener({ method, params }));
+          return () => undefined;
+        },
+      };
+      const archiveDir = path.join(
+        executorDir ?? path.join(cwd, '.ai4ai'),
+        'handoff-archive', threadId, new Date().toISOString().replace(/[:.]/g, '-'),
+      );
       answer = '';
-      const started = await server.request('turn/start', { threadId, input: [{ type: 'text', text: delivery }] }, handoffTimeoutMs) as { turn?: { id?: string } };
-      successorTurnId = started?.turn?.id;
-      const settled = await settle(successorTurnId, handoffTimeoutMs);
+      const outcome = await applyRevertHandoff(transport, {
+        threadId, deliveryText: delivery, archiveDir,
+        idleTimeoutMs: handoffTimeoutMs, turnTimeoutMs: handoffTimeoutMs,
+      });
+      successorThreadId = threadId;
+      successorTurnId = outcome.successorTurnId;
+      const phase = outcome.ok ? (outcome.completed ? 'completed' : 'applied') : 'failed';
       const finalRecord = {
         ...record,
-        phase: settled.ok ? 'completed' : 'failed',
+        phase,
         mechanism: 'restart',
+        proofMechanism: 'surface-replacement',
         successorThreadId,
         successorSessionId: successorThreadId,
         successorTurnId,
-        ...(settled.ok ? {} : { error: settled.detail }),
+        archive: outcome.archive ?? null,
+        reason: outcome.reason,
+        ...(outcome.code ? { errorCode: outcome.code } : {}),
+        ...(outcome.ok ? {} : { error: outcome.reason }),
         appliedAt: new Date().toISOString(),
       };
       await writeHandoff(finalRecord);
       handoff = {
-        operationId, phase: finalRecord.phase, mechanism: 'restart',
+        operationId, phase, mechanism: 'restart', proofMechanism: 'surface-replacement',
         successorThreadId, successorTurnId,
-        ...(settled.ok ? {} : { error: settled.detail }),
+        archive: outcome.archive ?? null,
+        ...(outcome.ok ? {} : { error: outcome.reason }),
       };
-      if (!settled.ok) {
-        failure = `codex headless restart handoff failed: ${settled.detail}`;
+      if (!outcome.ok) {
+        failure = `codex headless restart handoff failed: ${outcome.reason}`;
         exitCode = 1;
         return false;
       }
+      // The successor identity is the same thread; report it so a supervisor
+      // can reconcile without inventing a new session.
+      process.stdout.write(JSON.stringify({ session_id: threadId }) + '\n');
       return true;
     }
 
@@ -194,6 +203,7 @@ const applyHandoff = async (): Promise<boolean> => {
       phase: settled.ok ? 'completed' : 'failed',
       compacted: true,
       mechanism: 'compact',
+      proofMechanism: 'native-compaction',
       successorThreadId: threadId,
       successorTurnId,
       ...(settled.ok ? {} : { error: settled.detail }),
@@ -201,7 +211,7 @@ const applyHandoff = async (): Promise<boolean> => {
     };
     await writeHandoff(finalRecord);
     handoff = {
-      operationId, phase: finalRecord.phase, compacted: true, mechanism: 'compact', successorThreadId: threadId, successorTurnId,
+      operationId, phase: finalRecord.phase, compacted: true, mechanism: 'compact', proofMechanism: 'native-compaction', successorThreadId: threadId, successorTurnId,
       ...(settled.ok ? {} : { error: settled.detail }),
     };
     if (!settled.ok) {

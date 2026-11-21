@@ -177,6 +177,16 @@ export async function markStoppedIfDead(home: string, executorId: string, status
   }
 }
 
+// Provider credentials must reach the detached carrier through the supervisor's
+// process environment, never through spec.json on disk. Keep non-secret carrier
+// settings (DSH_HOME, PATH, HOME, ...) in the spec; filter API keys/tokens.
+const SENSITIVE_ENV = /(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD|AUTH|CREDENTIALS?)(?:$|_)/i;
+export function persistedEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!env) return undefined;
+  const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !SENSITIVE_ENV.test(key)));
+  return Object.keys(kept).length ? kept : undefined;
+}
+
 /**
  * Start a detached supervisor. The supervisor, not the caller, owns the harness
  * process, so closing the caller's session or killing the caller cannot end it.
@@ -186,10 +196,11 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
   await mkdir(directory, { recursive: true });
   const task = await readFile(spec.taskFile, 'utf8');
   await writeFile(path.join(directory, 'task.md'), task);
+  const persisted = persistedEnv(spec.env);
   await writeAtomic(path.join(directory, 'spec.json'), {
     command: spec.command,
     args: spec.args,
-    ...(spec.env ? { env: spec.env } : {}),
+    ...(persisted ? { env: persisted } : {}),
     cwd: spec.cwd,
     inputFile: 'task.prompt',
     ...(spec.sessionRegex ? { sessionRegex: spec.sessionRegex } : {}),
@@ -203,7 +214,11 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
   const runtime = resolveNodeRuntime();
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) if (value !== undefined && !spec.envExclude?.includes(key)) env[key] = value;
-  const fullEnv = { ...env, ...(spec.env ?? {}), AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory };
+  // The carrier runs with `cwd: spec.cwd`, but an inherited PWD can still name
+  // the caller's directory. Harnesses such as OpenCode resolve their project
+  // config through PWD, so a detached executor started with --workspace from
+  // another directory would load the wrong config and fail every provider call.
+  const fullEnv = { ...env, ...(spec.env ?? {}), PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory };
   await writeAtomic(path.join(directory, 'launch.json'), { runtime, supervisor, at: new Date().toISOString() });
   const child = spawn(runtime, [supervisor, '--dir', directory], {
     detached: true,

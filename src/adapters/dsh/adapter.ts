@@ -161,25 +161,43 @@ export class DshAdapter extends ExternalExecutorAdapter {
   }
 
   capabilities(os: Os): CapabilityDeclaration[] {
+    // All three platforms were exercised in this release. macOS and native
+    // Windows use the DSH_HOME credential chain (OPENCODE_API_KEY) rather than
+    // a clean profile without credentials. On Windows the installer needs the
+    // real JS entry (AI4AI_DSH_ENTRY) because a .cmd entry is refused, but the
+    // carrier also accepts a .cmd wrapper. The Web surface was exercised through
+    // the Web UI on all three platforms (isolated profiles, no live restart).
     const linux = os === 'linux';
     const mac = os === 'darwin';
     const windows = os === 'windows';
     const reason = linux
-      ? 'Detached dsh headless carriers were exercised with a real session and usage reporting; the Cordis plugin implements same-session surface replacement and the handoff journal/apply/successor path is verified. spawn model/effort overrides are unsupported.'
+      ? 'Detached dsh headless carriers were exercised with a real session and usage reporting; the Cordis plugin implements same-session surface replacement and the handoff journal/apply/successor path is verified. The Web surface was exercised through the Web UI (capabilities/status/list/spawn/status-poll/stop and a same-session handoff). spawn model/effort overrides are unsupported.'
       : mac
-        ? 'macOS headless carrier and the Cordis same-session handoff were verified with the installed DSH and its existing credential path; detached spawn/status use the same carrier. spawn model/effort overrides are unsupported.'
-        : 'Native Windows headless spawn/status and the Cordis same-session handoff were verified with the installed DSH runtime and a new test profile. spawn model/effort overrides are unsupported.';
-    const carrier = linux || mac || windows ? 'supported' as const : 'not-tested' as const;
-    const handoffLevel = linux || mac || windows ? 'supported' as const : 'not-tested' as const;
-    const common = {
-      handoff: { availability: handoffLevel, modes: ['restart'] as ('compact' | 'restart')[], tmuxFallback: 'off' as const },
+        ? 'macOS headless handoff was exercised with a real provider from the DSH_HOME credential chain: the model invoked ai4ai_session itself, the successor turn ran in the same session with surface-replacement proof, and the detached carrier completed spawn/status/message×2/stop/error. The Web surface was exercised through the Web UI on an isolated profile (capabilities/status/list/spawn/message two turns in one session/stop/error). spawn model/effort overrides are unsupported.'
+        : 'Native Windows headless handoff, spawn/status/message×2/stop/error and the .cmd carrier were exercised with the DSH plugin-manager profile and the real JS entry (AI4AI_DSH_ENTRY); the installer refuses a .cmd entry but succeeds with the JS entry. The Web surface was exercised through the Web UI on an isolated profile (capabilities/status/list/spawn/message two turns in one session/stop/error). spawn model/effort overrides are unsupported.';
+    const carrier = 'supported' as const;
+    const headlessHandoff = 'supported' as const;
+    const webLevel = 'supported' as const;
+    const headless = {
+      handoff: { availability: headlessHandoff, modes: ['restart'] as ('compact' | 'restart')[] },
       spawn: { availability: carrier, maxConcurrent: 4 },
       status: { availability: carrier, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: carrier, percentSource: 'derived' as const },
-      ...(linux || mac ? { evidence: `matrix:dsh/${os}/headless/2026-11-18` } : {}),
+      evidence: `matrix:dsh/${os}/headless/2026-11-21`,
     };
+    const web = {
+      handoff: { availability: webLevel, modes: ['restart'] as ('compact' | 'restart')[] },
+      spawn: { availability: webLevel, maxConcurrent: 4 },
+      status: { availability: webLevel, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: webLevel, percentSource: 'native' as const },
+      evidence: `matrix:dsh/${os}/web/2026-11-21`,
+    };
+    const webReason = linux
+      ? 'The Linux Web surface was exercised through the Web UI: ai4ai_session capabilities/status/list/spawn/status-poll/stop completed, and a Web handoff completed in the same session with the old codeword absent from the replaced context. The live Web profile runs 0.0.5 and is healthy. spawn model/effort overrides are unsupported.'
+      : mac
+        ? 'The macOS Web surface was exercised through the Web UI on an isolated web profile: ai4ai_session capabilities/status/list/spawn/message/status-poll/stop completed, the message was accepted into the running executor and its second turn replied in the same session, and the unauthorized target returned a structured error. The live Web profile runs 0.0.5 and is healthy. spawn model/effort overrides are unsupported.'
+        : 'The native Windows Web surface was exercised through the Web UI on an isolated web profile: ai4ai_session capabilities/status/list/spawn/message/status-poll/stop completed, the message was queued into the running executor and its second turn replied in the same session, and the unauthorized target returned a structured error. The live Web profiles run 0.0.5 and are healthy. spawn model/effort overrides are unsupported.';
     return [
-      declaration({ harness: 'dsh', os, interface: 'headless', reason, ...common }),
-      declaration({ harness: 'dsh', os, interface: 'web', reason, ...common, status: { ...common.status, percentSource: 'native' as const } }),
+      declaration({ harness: 'dsh', os, interface: 'headless', reason, ...headless }),
+      declaration({ harness: 'dsh', os, interface: 'web', reason: webReason, ...web }),
     ];
   }
 

@@ -20,8 +20,8 @@ interface Runtime {
   active?: HandoffRecord;
   busy: boolean;
   pumping: boolean;
-  /** True while the plugin itself is running the native /clear reset. */
-  restarting: boolean;
+  /** Journal write started by the compact hook; the pump awaits it before delivery. */
+  replacement?: Promise<unknown> | undefined;
   turnId: string;
   expectedWindow: string;
   appliedHere: boolean;
@@ -137,9 +137,9 @@ async function currentSurface($: CoreEngineInterface): Promise<'tui' | 'headless
 
 async function transition($: CoreEngineInterface, current: Runtime, phase: string, reason: string, extra: Record<string, unknown> = {}, caller?: Binding): Promise<any> {
   if (!current.binding || !current.active) return undefined;
-  // The journal is keyed by the record's source session. After a restart the
-  // in-memory binding points at the successor, so transitions must use the
-  // source identity or the record would not be found.
+  // The journal is keyed by the record's source session. The in-place
+  // replacement keeps that session, but transitions still use the record's
+  // source identity so a later generation cannot be mistaken for it.
   const from = caller ?? (current.active.source as unknown as Binding) ?? current.binding;
   const out = await rpc($, current.node, {
     caller: from, action: 'transition', operationId: current.active.operationId,
@@ -185,49 +185,41 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
     try { s.expectedWindow = projection(await $.session.messages()); } catch { s.expectedWindow = ''; }
     if (s.active?.phase !== 'scheduled') return;
     const mode = s.active.mechanism ?? s.active.request.mode ?? 'restart';
-    if (mode === 'restart') {
-      // Native in-place reset: the built-in /clear starts a new session with
-      // empty context in the same process (the host pipe stays intact).
-      const before = await $.session.id();
-      const source = s.binding;
-      if (!source) return;
-      s.restarting = true;
-      try {
-        await $.command.run({ command: 'clear' });
-        let after = before;
-        for (let i = 0; i < 80 && after === before; i++) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-          after = await $.session.id();
-        }
-        if (after === before) {
-          await transition($, s, 'unknown', 'Native /clear did not produce a new session id; no task redelivery');
-          return;
-        }
-        let display = '';
-        try { display = JSON.stringify(await $.session.messages()); } catch { display = ''; }
-        const clearSeen = display.includes('/clear') || display.includes('local_command');
-        if (!clearSeen) dbg($, 'restart: /clear entry was not exposed by the plugin transcript view; the session id change is the native evidence');
-        const successor = { ...source, session: after, generation: s.active.marker };
-        await transition($, s, 'applied',
-          clearSeen
-            ? 'Native /clear reset the context in place; successor delivery pending'
-            : 'Native /clear changed the session id in place; successor delivery pending',
-          { successor, mechanism: 'restart' }, source);
-        s.binding = successor;
-        s.appliedHere = true;
-      } finally {
-        s.restarting = false;
-      }
-    } else {
-      await $.command.run({ command: 'compact', args: s.active.marker });
-      let api = '';
-      try { api = JSON.stringify(await $.session.messages({ as: 'api' })); } catch { api = ''; }
-      if (!s.appliedHere || (s.active.phase as string) !== 'applied' || (api !== '' && !api.includes(s.active.marker))) {
-        await transition($, s, 'unknown', 'Native replacement could not be proved; no task redelivery');
-        return;
-      }
-      if (s.binding) s.binding = { ...s.binding, generation: s.active.marker };
+    if (mode !== 'restart') {
+      // The native pump implements the zero-summary restart only. A compact
+      // request must be refused by the worker before it reaches this point.
+      await transition($, s, 'unknown', 'The native pump implements restart only; no replacement attempted');
+      return;
     }
+    const before = await $.session.id();
+    const source = s.binding;
+    if (!source) return;
+    s.appliedHere = false;
+    s.replacement = undefined;
+    // `compact` runs the session.compact hook, which supplies a replacement
+    // message window and prevents the core compaction (and its summarizer)
+    // from running. The hook must finish inside the host's 10s budget, so it
+    // returns the window immediately and journals the transition separately.
+    await $.command.run({ command: 'compact', args: s.active.marker });
+    if (s.replacement) await s.replacement;
+    // Explicit same-SID assertion: the replacement must not change the native
+    // session. A changed id is a defect, never a successful handoff.
+    const after = await $.session.id();
+    if (after !== before) {
+      await transition($, s, 'unknown', 'The native replacement changed the session id; the handoff was refused and the task was not delivered');
+      return;
+    }
+    if (!s.appliedHere || (s.active?.phase as string) !== 'applied') {
+      await transition($, s, 'unknown', 'Native replacement could not be proved; no task redelivery');
+      return;
+    }
+    let api = '';
+    try { api = JSON.stringify(await $.session.messages({ as: 'api' })); } catch { api = ''; }
+    if (api !== '' && !api.includes(s.active.marker)) {
+      await transition($, s, 'unknown', 'The replacement window does not contain the AI4AI binding; no task redelivery');
+      return;
+    }
+    if (s.binding) s.binding = { ...s.binding, generation: s.active.marker };
     const delivery = {
       text: `AI4AI handoff delivery ${s.active.marker}. Adopt the caller-supplied task in this fresh context. Carry out this task now:\n${s.active.request.task ?? ''}\nNative system/security instructions remain authoritative. Query ai4ai status if you need context or model details.`,
       operationId: s.active.operationId, marker: s.active.marker, invalid: false, adopted: false,
@@ -236,7 +228,12 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
     await $.prompt.submit({ text: delivery.text });
   } catch (error: any) {
     dbg($, 'pump failed: ' + String(error?.message ?? error));
-    try { await transition($, s, 'unknown', 'Native scheduling outcome unknown; no replay'); } catch { /* intent remains unreplayed */ }
+    const disabled = /DISABLE_COMPACT/i.test(String(error?.message ?? error));
+    try {
+      await transition($, s, 'failed', disabled
+        ? 'Compaction is switched off in this session (DISABLE_COMPACT); the in-place restart is unsupported'
+        : 'Native scheduling outcome unknown; no replay');
+    } catch { /* intent remains unreplayed */ }
   } finally {
     s.pumping = false;
   }
@@ -244,7 +241,7 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
 
 /** Native Claude Code mods: in-place handoff without a summarizer, daemon or history fork. */
 export const register: Register = on => {
-  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, restarting: false, turnId: '', expectedWindow: '', appliedHere: false };
+  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', expectedWindow: '', appliedHere: false };
   let tail: Promise<unknown> = Promise.resolve();
   const serial = <T>(fn: () => Promise<T>): Promise<T> => { const pending = tail.then(fn); tail = pending.catch(() => undefined); return pending; };
 
@@ -267,10 +264,9 @@ export const register: Register = on => {
       inputSchema: JSON.parse(await $.fs.read(`${$.plugin.root}/request-schema.json`)),
     });
     try {
-      // A native /clear restart re-enters session.start for the successor
-      // session; bindNative would look up a journal that belongs to the source
-      // session. Keep the in-memory restart binding instead.
-      if (!s.restarting && (!s.binding || await $.session.id() !== s.binding.session)) await serial(() => bindNative($, s));
+      // The in-place replacement keeps the same session, so an existing
+      // binding remains authoritative across a handoff.
+      if (!s.binding || await $.session.id() !== s.binding.session) await serial(() => bindNative($, s));
     } catch { /* Tool calls fail closed until a later successful bind. */ }
     $.clock.every(250, () => { void pump($, s); });
     return next(e);
@@ -318,15 +314,35 @@ export const register: Register = on => {
     return out;
   });
 
+  // The host skips a hook that throws or exceeds its budget and then runs the
+  // core compaction, which would summarize the context and break the
+  // zero-token guarantee. This handler therefore never performs slow work: it
+  // validates in memory, returns the replacement window immediately and starts
+  // the journal write in the background. The mods loader requires the hook to
+  // be an inline function at the `on(...)` call site, so the fail-closed
+  // try/catch lives here rather than in an attached `.catch`.
   on('session.compact', async ($: any, e: any, next: any) => {
     if (e.agentId || !e.instructions?.startsWith('ai4ai-context-')) return next(e);
-    return (async () => {
-      if (!s.binding || !s.active || s.active.phase !== 'scheduled' || e.instructions !== s.active.marker || s.busy || (s.expectedWindow !== '' && projection(e.messages) !== s.expectedWindow)) {
-        await transition($, s, 'unknown', 'Native compaction input changed or intent is not owned');
-        return { skip: 'AI4AI did not authorize this replacement; original native context retained' };
-      }
-      await transition($, s, 'applied', 'Native compact hook supplied a fresh task window; successor adoption pending');
+    try {
+      const refuse = (detail: string): { skip: string } => {
+        void transition($, s, 'unknown', `Native compaction input changed or intent is not owned: ${detail}`).catch(() => undefined);
+        return { skip: `AI4AI did not authorize this replacement; original native context retained (${detail})` };
+      };
+      if (!s.binding) return refuse('no native binding');
+      if (!s.active) return refuse('no active handoff record');
+      // Fault-injection seam used only by the release gate: a caller that
+      // deliberately uses this operation id exercises the fail-closed catch.
+      // It is inert for every other operation id.
+      if (s.active.operationId === 'ai4ai-hook-fault-throw') throw new Error('injected session.compact hook fault');
+      if (s.active.phase !== 'scheduled') return refuse(`handoff phase is ${String(s.active.phase)}`);
+      if (e.instructions !== s.active.marker) return refuse('marker does not match the owned intent');
+      if (s.busy) return refuse('the plugin is busy with another native turn');
+      let observed = '';
+      try { observed = projection(e.messages ?? []); }
+      catch { return refuse('the native window could not be read'); }
+      if (s.expectedWindow !== '' && observed !== s.expectedWindow) return refuse('the native window changed since scheduling');
       s.appliedHere = true;
+      s.replacement = transition($, s, 'applied', 'Native compact hook supplied a fresh task window; successor adoption pending');
       return {
         messages: [{
           role: 'user' as const,
@@ -334,24 +350,37 @@ export const register: Register = on => {
           toolUses: [],
         }],
       };
-    })().catch(() => ({ skip: 'AI4AI native gate failed closed; no replacement authorized' }));
+    } catch (error: any) {
+      s.appliedHere = false;
+      const detail = String(error?.message ?? error).slice(0, 300);
+      dbg($, 'session.compact gate failed closed: ' + detail);
+      return { skip: 'AI4AI native gate failed closed; no replacement authorized (' + detail + ')' };
+    }
   });
 
   on('prompt.submit', async ($: any, e: any, next: any) => {
     const own = e.origin.kind === 'plugin' && e.origin.name === $.plugin.name;
+    const isDelivery = own && String(e.text ?? '').startsWith('AI4AI handoff delivery ');
     const ownCompact = e.command?.name === 'compact' && e.command.args === s.active?.marker && s.pumping;
-    if (own && e.text.startsWith('AI4AI handoff delivery ')) {
-      const allow = await serial(async () => e.text === s.delivery?.text && admitted(s) && await $.session.id() === s.binding?.session);
-      if (!allow) return { drop: 'Superseded or uncertain AI4AI delivery; task not admitted' };
-    } else if (!ownCompact && !s.restarting && !s.pumping) await serial(async () => { if (s.active && s.active.phase === 'pending') await transition($, s, 'cancelled', 'Later user input retained; handoff not replayed'); });
+    try {
+      if (isDelivery) {
+        // Delivery admission must prove the replacement actually happened in
+        // this session; anything uncertain drops the task instead of injecting
+        // it into a stale context.
+        const allow = await serial(async () => e.text === s.delivery?.text && admitted(s) && await $.session.id() === s.binding?.session);
+        if (!allow) return { drop: 'Superseded or uncertain AI4AI delivery; task not admitted' };
+      } else if (!ownCompact && !s.pumping) await serial(async () => { if (s.active && s.active.phase === 'pending') await transition($, s, 'cancelled', 'Later user input retained; handoff not replayed'); });
+    } catch {
+      // Never fail open on the one path that injects handoff material.
+      if (isDelivery) return { drop: 'AI4AI delivery admission failed closed; task not admitted' };
+    }
     return next(e);
   });
 
   on('session.end', async ($: any, e: any, next: any) => {
-    // The /clear restart ends the source session on purpose; the successor
-    // session owns the handoff now, so the source must not mark it unknown.
+    // The in-place replacement keeps this session; an unfinished handoff at
+    // session end is genuinely uncertain and never replayed.
     await serial(async () => {
-      if (s.restarting || (s.active?.mechanism === 'restart' && s.delivery)) return;
       if (s.active && !['completed', 'cancelled', 'failed', 'unknown'].includes(s.active.phase)) await transition($, s, 'unknown', 'Native session ended; unfinished handoff is not resumed automatically');
     });
     return next(e);

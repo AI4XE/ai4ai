@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { AdapterContext, CarrierCommand, StatusDetails } from '../external.js';
+import type { AdapterContext, CarrierCommand, StatusDetails, NativeOutcome } from '../external.js';
 import { ExternalExecutorAdapter, contextFromUsage, lastJson } from '../external.js';
 import { openCodeSessionUsage } from '../../core/session-probe.js';
 import { probeOpenCodeConfig } from '../../core/config-probe.js';
@@ -85,22 +85,43 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
   readonly harness: HarnessId = 'opencode';
 
   capabilities(os: Os): CapabilityDeclaration[] {
+    // Linux and macOS were exercised in this release. macOS used the OpenCode
+    // 2.3.2 binary at ~/data/opencode-2.3.2, not the older 1.19.6 on PATH:
+    // handoff (pending→scheduled→applied→completed, same session) and the
+    // detached carrier (spawn/status/message×2/stop/error) both completed.
+    // The test used a free OpenCode Go model because the account's weekly
+    // quota was exhausted; the handoff mechanism is model-agnostic.
     const verified = os === 'linux' || os === 'darwin';
     const reason = os === 'linux'
       ? 'The native plugin replacement supplies a fresh window containing only the task material (restart) and was exercised on Linux with a real handoff (pending, scheduled, applied, completed) and a successor turn; the detached carrier and status mapping were also exercised.'
       : os === 'darwin'
-        ? 'The native plugin restart replacement and the detached carrier were exercised on macOS with runtime 2.3.2; the plugin requires the 2.x OpenCode plugin/session API.'
+        ? 'macOS was exercised with OpenCode 2.3.2 (not the older 1.19.6 on PATH): the native plugin handoff completed in the same session (pending→scheduled→applied→completed) with the old codeword absent from the replaced context, and the detached carrier completed spawn/status/message×2/stop/error. A free OpenCode Go model was used because the account weekly quota was exhausted; the mechanism is model-agnostic.'
         : 'In-harness plugin implements a restart-equivalent in-session handoff; detached opencode run processes implement spawn. Native Windows is out of scope (WSL counts as Linux).';
     const level = verified ? 'supported' as const : 'not-tested' as const;
-    const availability = level;
-    const make = (surface: 'tui' | 'headless') => declaration({
-      harness: 'opencode', os, interface: surface, reason,
-      handoff: { availability, modes: ['restart'] as ('compact' | 'restart')[], tmuxFallback: 'off' },
-      spawn: { availability, maxConcurrent: 4 },
-      status: { availability, model: availability, reasoningEffort: 'unsupported', context: verified ? 'limited' as const : 'not-tested' as const, percentSource: 'derived' },
-      ...(verified ? { evidence: `matrix:opencode/${os}/${surface}/2026-11-18` } : {}),
-    });
-    return [make('tui'), make('headless')];
+    // The native plugin runs inside an interactive session and its API exposes
+    // no surface signal, so it declares `tui` only rather than fabricating a
+    // headless identity. A detached `opencode run` executor cannot replace its
+    // context in place (the shared external adapter refuses), so headless
+    // handoff is declared unsupported instead of over-claiming.
+    const common = {
+      spawn: { availability: level, maxConcurrent: 4 },
+      status: { availability: level, model: level, reasoningEffort: 'unsupported' as const, context: verified ? 'limited' as const : 'not-tested' as const, percentSource: 'derived' as const },
+    };
+    return [
+      declaration({
+        harness: 'opencode', os, interface: 'tui', reason,
+        handoff: { availability: level, modes: ['restart'] as ('compact' | 'restart')[] },
+        ...common,
+        ...(verified ? { evidence: `matrix:opencode/${os}/tui/2026-11-21` } : {}),
+      }),
+      declaration({
+        harness: 'opencode', os, interface: 'headless',
+        reason: 'A detached opencode run executor cannot replace its own context in place; spawn and status use the same carrier. Use the interactive TUI for handoff.',
+        handoff: { availability: 'unsupported' as const, modes: [] },
+        ...common,
+        ...(verified ? { evidence: `matrix:opencode/${os}/headless/2026-11-21` } : {}),
+      }),
+    ];
   }
 
   /**
@@ -110,6 +131,21 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
    */
   protected persistedModel(request: Request): string | undefined {
     return request.model || process.env.AI4AI_OPENCODE_MODEL || undefined;
+  }
+
+  /**
+   * OpenCode's detached `run` has no reasoning-effort selector; the model is
+   * the only per-request override the carrier can apply.
+   */
+  async spawn(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    if (request.reasoningEffort !== undefined) {
+      return {
+        status: 'unsupported',
+        reason: 'opencode detached runs have no reasoning-effort selector; omit reasoningEffort and configure the model instead',
+        unavailable: ['spawn.reasoningEffort'],
+      };
+    }
+    return super.spawn(request, ctx);
   }
 
   protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {

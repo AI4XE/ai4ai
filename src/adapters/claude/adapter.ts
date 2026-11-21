@@ -37,18 +37,20 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
   readonly harness: HarnessId = 'claude-code';
 
   capabilities(os: Os): CapabilityDeclaration[] {
-    const verified = os === 'linux' || os === 'darwin';
-    const reason = os === 'linux'
-      ? 'The mods plugin loads and both native handoff modes completed in place: restart via the built-in /clear (new session, same process) and compact via the native safe point; detached carriers spawn, report status and survive the parent. Exercised on Linux.'
-      : os === 'darwin'
-        ? 'The mods plugin loads and the native in-place handoff completed on macOS; detached carriers spawn and report status with model and context. Exercised on macOS.'
+    const linux = os === 'linux';
+    const mac = os === 'darwin';
+    // macOS proves both the handoff and the detached carrier in this release.
+    const reason = linux
+      ? 'The mods plugin loads and the zero-summary restart replaces the context in place through the native compact hook while keeping the session id; a disabled-compaction session is reported unsupported. Detached carriers spawn, report status and survive the parent. Exercised on Linux.'
+      : mac
+        ? 'The mods plugin loads and the zero-summary in-place restart completed on macOS with the session id preserved (handoff verified). The detached carrier was exercised on macOS with a real two-turn executor: spawn, status, message queued into the same session (both turn markers in the executor log), stop, and the error paths (unauthorized target, message to a completed executor) all completed.'
         : 'The mods plugin and the detached carrier are implemented; native Windows is out of scope (WSL counts as Linux) and was not exercised.';
-    const level = verified ? 'supported' as const : 'not-tested' as const;
+    const carrier = linux || mac ? 'supported' as const : 'not-tested' as const;
     const common = {
-      handoff: { availability: level, modes: ['compact', 'restart'] as ('compact' | 'restart')[], tmuxFallback: 'off' as const },
-      spawn: { availability: level, maxConcurrent: 4 },
-      status: { availability: level, model: level, reasoningEffort: 'unsupported' as const, context: level, percentSource: 'derived' as const },
-      ...(verified ? { evidence: `matrix:claude-code/${os}/2026-11-18` } : {}),
+      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart'] as ('compact' | 'restart')[] },
+      spawn: { availability: carrier, maxConcurrent: 4 },
+      status: { availability: carrier, model: carrier, reasoningEffort: 'unsupported' as const, context: carrier, percentSource: 'derived' as const },
+      ...(linux || mac ? { evidence: `matrix:claude-code/${os}/2026-11-21` } : {}),
     };
     return [
       declaration({ harness: 'claude-code', os, interface: 'tui', reason, ...common }),

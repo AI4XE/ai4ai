@@ -20,8 +20,7 @@
           "spawn-isolation",
           "spawn-policy",
           "model-override",
-          "reasoning-effort-override",
-          "tmux-fallback"
+          "reasoning-effort-override"
         ]
       },
       "description": "Feature names this caller requires; the request fails when the harness does not declare them."

@@ -33,7 +33,11 @@ export interface DshContext {
 
 interface JournalRecord {
   version: 2; operationId: string; fingerprint: string; phase: 'intent' | 'applied' | 'cancelled' | 'failed' | 'blocked';
-  owner: Identity; boundary: number; task: string; proof?: { source: Identity; successor: Identity; mechanism: 'new-session'; nativeEvidence: string }; reason?: string;
+  owner: Identity; boundary: number; task: string;
+  proof?: { source: Identity; successor: Identity; mechanism: 'new-session' | 'surface-replacement' | 'native-compaction'; nativeEvidence: string };
+  /** Explicit proof mechanism; absent on records written before 0.0.5. */
+  proofMechanism?: 'surface-replacement' | 'native-compaction';
+  reason?: string;
   /** Exact request covered by the fingerprint; keeps later parsing independent of optional fields. */
   request?: { operation: 'handoff'; operationId: string; target: 'self'; task: string };
 }
@@ -54,8 +58,14 @@ function identity(agent: NativeAgent): Identity {
 
 function journal(events: readonly NativeEvent[], session: NativeSession): Located[] {
   const records: Located[] = [];
+  // After a surface replacement the applied record lives in the current
+  // window but may sit below `inheritedEventCount` (which describes history
+  // carried over from before the window). Surface nodes are the authoritative
+  // current window, so include them explicitly; otherwise a status/requery
+  // after a successful handoff would report "no handoff started".
+  const surfaceNodes = new Set<number>(session.surface.nodes);
   for (const event of events) {
-    if (event.seq < session.inheritedEventCount) continue;
+    if (event.seq < session.inheritedEventCount && !surfaceNodes.has(event.seq)) continue;
     if (event.type !== 'user/message' || event.data.source?.kind !== SOURCE) continue;
     const record = event.data.source.ai4ai;
     if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('Native operation journal is malformed');
@@ -68,6 +78,8 @@ function journal(events: readonly NativeEvent[], session: NativeSession): Locate
     const request = validateRequest(source);
     if (record.version !== 2 || !request.ok || !record.owner || record.owner.session !== session.id
       || record.fingerprint !== fingerprint(request.value) || !Number.isSafeInteger(record.boundary)
+      || (record.proofMechanism !== undefined && !['surface-replacement', 'native-compaction'].includes(record.proofMechanism))
+      || (record.proof !== undefined && !['new-session', 'surface-replacement', 'native-compaction'].includes(record.proof.mechanism))
       || !['intent', 'applied', 'cancelled', 'failed', 'blocked'].includes(record.phase)) {
       throw new Error('Native operation journal is incompatible; no transition authorized');
     }
@@ -249,8 +261,13 @@ export function apply(ctx: DshContext): () => void {
       if (lastJournal(fresh, session, record.operationId) !== pending[0]!.seq) return decision;
       const span = replacementSpan(session, fresh, record.boundary);
       const before = identity(agent);
-      const proof = { source: record.owner, successor: { ...before, generation: String(session.surface.contentGeneration + 1) }, mechanism: 'new-session' as const, nativeEvidence: `session:${session.id}:event:${session.seq}` };
-      const applied: JournalRecord = { ...record, phase: 'applied', proof, reason: 'Fresh context applied; successor binding recorded' };
+      // The surface replacement keeps the native session; only the generation
+      // advances. A changed session here would be a false same-SID success.
+      if (before.session !== record.owner.session) throw new Error('DSH handoff changed the native session id; no transition scheduled');
+      const successor = { ...before, session: record.owner.session, generation: String(session.surface.contentGeneration + 1) };
+      const proofMechanism = 'surface-replacement' as const;
+      const proof = { source: record.owner, successor, mechanism: proofMechanism, nativeEvidence: `session:${session.id}:event:${session.seq}` };
+      const applied: JournalRecord = { ...record, phase: 'applied', proof, proofMechanism, reason: 'Fresh context applied in the same session; successor binding recorded' };
       const continuation: NativeMessage = {
         id: randomUUID(), role: 'user',
         content: [{ type: 'text', text: `AI4AI handoff applied. Continue the caller-provided task in this fresh context. Native system instructions, permissions and policies still apply.\n\n${record.task}` }],

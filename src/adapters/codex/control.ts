@@ -18,6 +18,87 @@ export interface CodexThread {
   cwd?: string;
   updatedAt?: number;
   status?: { type?: string };
+  historyMode?: string;
+  model?: string;
+}
+
+export type ThreadResolution =
+  | { ok: true; thread: CodexThread; loaded: CodexThread[] }
+  | { ok: false; code: 'codex-thread-missing' | 'codex-thread-ambiguous' | 'codex-thread-mismatch'; reason: string; loaded: CodexThread[] };
+
+/** A thread that the app-server currently has loaded (idle or active). */
+export const isLoadedThread = (thread: CodexThread): boolean =>
+  typeof thread.status?.type === 'string' && thread.status.type !== 'notLoaded';
+
+/**
+ * Read every page of `thread/list`. A machine with many threads (180 locally)
+ * returns them paginated; checking only the first page silently mis-resolves
+ * the TUI's thread and can make a false same-SID proof.
+ */
+export async function listAllThreads(
+  daemon: CodexDaemon,
+  options: { cwd?: string; limit?: number; maxPages?: number } = {},
+): Promise<CodexThread[]> {
+  const limit = options.limit ?? 100;
+  const maxPages = options.maxPages ?? 200;
+  const seen = new Map<string, CodexThread>();
+  let cursor: string | null | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const params: Record<string, unknown> = { limit };
+    if (options.cwd) params.cwd = options.cwd;
+    if (cursor) params.cursor = cursor;
+    const listing = await daemon.call('thread/list', params, 30000) as { data?: CodexThread[]; nextCursor?: string | null };
+    for (const thread of listing?.data ?? []) if (typeof thread?.id === 'string') seen.set(thread.id, thread);
+    cursor = listing?.nextCursor ?? undefined;
+    if (!cursor) break;
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Resolve the native thread a TUI handoff may target.
+ *
+ * Order: an explicit `AI4AI_CODEX_THREAD`, otherwise exactly one loaded thread
+ * for this workspace across every page. Zero or several loaded threads are a
+ * structured failure; guessing by cwd/updatedAt would target a thread the user
+ * is not looking at and make the same-SID proof vacuous.
+ */
+export async function resolveTuiThread(
+  daemon: CodexDaemon,
+  workspace: string,
+  explicit?: string,
+): Promise<ThreadResolution> {
+  const absolute = path.resolve(workspace);
+  const all = await listAllThreads(daemon, explicit ? {} : { cwd: absolute });
+  const rows = all.filter(thread => typeof thread.cwd === 'string' && path.resolve(thread.cwd) === absolute);
+  const loaded = rows.filter(isLoadedThread);
+  if (explicit) {
+    const found = all.find(thread => thread.id === explicit);
+    if (!found) return { ok: false, code: 'codex-thread-missing', reason: `AI4AI_CODEX_THREAD ${explicit} is not present on the app-server`, loaded };
+    if (typeof found.cwd === 'string' && path.resolve(found.cwd) !== absolute) {
+      return { ok: false, code: 'codex-thread-mismatch', reason: `AI4AI_CODEX_THREAD ${explicit} belongs to another workspace`, loaded };
+    }
+    return { ok: true, thread: found, loaded };
+  }
+  if (loaded.length === 1) return { ok: true, thread: loaded[0]!, loaded };
+  if (loaded.length === 0) {
+    return { ok: false, code: 'codex-thread-missing', reason: 'No loaded Codex thread matches this workspace; set AI4AI_CODEX_THREAD explicitly', loaded };
+  }
+  return {
+    ok: false, code: 'codex-thread-ambiguous',
+    reason: `${loaded.length} loaded Codex threads match this workspace (${loaded.map(t => t.id).join(', ')}); set AI4AI_CODEX_THREAD to choose one`,
+    loaded,
+  };
+}
+
+/** Metadata-only thread status, cheap enough to poll without scanning pages. */
+export async function threadStatus(daemon: CodexDaemon, threadId: string): Promise<CodexThread | undefined> {
+  try {
+    const read = await daemon.call('thread/read', { threadId, includeTurns: false }, 15000) as { thread?: CodexThread };
+    return read?.thread;
+  } catch {
+    return undefined;
+  }
 }
 
 interface Pending { resolve: (value: any) => void; reject: (error: Error) => void }
@@ -227,14 +308,13 @@ export async function daemonSocket(codexBin = process.env.AI4AI_CODEX_BIN || 'co
   });
 }
 
-/** List threads on the daemon. */
+/** List every thread on the daemon (all pages). */
 export async function listThreads(): Promise<CodexThread[]> {
   const socket = await daemonSocket();
   if (!socket) return [];
   const daemon = await CodexDaemon.connect(socket);
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.4' } });
-    const listing = await daemon.call('thread/list', { limit: 50 });
-    return (listing?.data ?? []) as CodexThread[];
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.5' } });
+    return await listAllThreads(daemon);
   } finally { daemon.close(); }
 }

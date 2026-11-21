@@ -6,6 +6,7 @@ import { fingerprint, sameIdentity } from './fingerprint.js';
 import { lifecycleOfStatus, pidAlive, readStatus } from '../adapters/executors.js';
 import { sessionPointer } from './session-probe.js';
 import { checkPolicy, normalizePolicy, ROOT_POLICY } from './policy.js';
+import { guardHandoffOutcome } from './handoff.js';
 import { LockBusyError } from '../install/scope.js';
 import type { Ai4aiStore, ExecutorRecord, OperationRecord } from './store.js';
 import type { Identity } from '../contract/types.js';
@@ -125,6 +126,27 @@ async function executeInner(request: unknown, options: OperationsOptions): Promi
         durable: true, error: { code: 'idempotency-conflict', message: 'The operation id was already used with different input' },
       });
     }
+    // A pending handoff may have advanced in a native watcher or runner that
+    // cannot write the shared store itself. Ask the adapter for the current
+    // state instead of returning a stale pending result forever.
+    if (req.operation === 'handoff' && ['accepted', 'pending', 'applied'].includes(existing.status) && adapter.reconcileHandoff) {
+      try {
+        const reconciled = await adapter.reconcileHandoff(existing.request, ctx);
+        if (reconciled) {
+          const normalized = normalizeOutcome(existing.request, reconciled);
+          // The reconciled result is subject to the same contract check as a
+          // first response, including the same-session proof rule.
+          if (validateResult(normalized).ok) {
+            if (normalized.status !== existing.status) {
+              await store.completePending(existing.source, existing.request.operationId, normalized);
+            }
+            return normalized;
+          }
+        }
+      } catch {
+        // Keep the durable pending record; never invent progress.
+      }
+    }
     return existing.result;
   }
 
@@ -142,6 +164,13 @@ async function executeInner(request: unknown, options: OperationsOptions): Promi
   const declared = declarations.find(c => c.interface === identity.surface) ?? declarations[0];
   if (req.operation === 'handoff' && declared?.handoff.availability === 'unsupported') {
     return result(req, 'unsupported', `Adapter declares handoff unsupported on ${identity.surface}`, { unavailable: ['handoff'] });
+  }
+  // Capability declarations decide mode availability, not just overall handoff
+  // availability: an undeclared `compact` must be refused explicitly.
+  if (req.operation === 'handoff' && req.mode !== undefined && declared && !declared.handoff.modes.includes(req.mode)) {
+    return result(req, 'unsupported', `Adapter does not declare the ${req.mode} handoff mode on ${identity.surface}; omit mode for the zero-summary restart`, {
+      unavailable: [`handoff.${req.mode}`],
+    });
   }
   if (req.operation === 'spawn' && declared?.spawn.availability === 'unsupported') {
     return result(req, 'unsupported', `Adapter declares spawn unsupported on ${identity.surface}`, { unavailable: ['spawn'] });
@@ -192,7 +221,9 @@ async function executeInner(request: unknown, options: OperationsOptions): Promi
     outcome = { status: 'unknown', reason: `Native outcome is uncertain; reconcile before retrying: ${message}`, error: { code: 'native-unknown', message } };
   }
 
-  const normalized = normalizeOutcome(req, outcome);
+  // One finalization point for every adapter: a produced proof that changed
+  // the native session becomes a structured failure, never a success.
+  const normalized = normalizeOutcome(req, guardHandoffOutcome(outcome, {}));
   const checked = validateResult(normalized);
   if (!checked.ok) {
     return result(req, 'failed', 'Adapter produced a result that violates the contract; nothing was journaled', {

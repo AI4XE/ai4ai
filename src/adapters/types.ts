@@ -52,6 +52,13 @@ export interface Adapter {
   /** Declarations for every surface the adapter targets on this OS. */
   capabilities(os: Os): CapabilityDeclaration[];
   handoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
+  /**
+   * Re-query a pending handoff the adapter or its detached watcher owns.
+   * Returning `undefined` means "no newer observation"; a terminal outcome is
+   * written back in place so the same operationId eventually completes instead
+   * of returning a stale pending result forever.
+   */
+  reconcileHandoff?(request: Request, ctx: AdapterContext): Promise<NativeOutcome | undefined>;
   spawn(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
   status(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
   message(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;

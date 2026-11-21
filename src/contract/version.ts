@@ -2,7 +2,7 @@
 export const FEATURES = [
   'handoff', 'spawn', 'status', 'message', 'cancel', 'stop', 'list',
   'surface-preserve', 'surface-cross', 'spawn-isolation', 'spawn-policy',
-  'model-override', 'reasoning-effort-override', 'tmux-fallback',
+  'model-override', 'reasoning-effort-override',
 ] as const;
 
 export type Feature = typeof FEATURES[number];

@@ -12,7 +12,6 @@ export interface DeclarationInput {
     modelOverride?: Availability;
     reasoningEffortOverride?: Availability;
     crossSurface?: Availability;
-    tmuxFallback?: 'off' | 'experimental';
   };
   spawn?: { availability?: Availability; maxConcurrent?: number; isolation?: Availability };
   status?: { availability?: Availability; model?: Availability; reasoningEffort?: Availability; context?: Availability; percentSource?: 'native' | 'derived' | null };
@@ -50,7 +49,6 @@ export function declaration(input: DeclarationInput): CapabilityDeclaration {
       modelOverride: handoff.modelOverride ?? 'unsupported',
       reasoningEffortOverride: handoff.reasoningEffortOverride ?? 'unsupported',
       crossSurface: handoff.crossSurface ?? 'unsupported',
-      tmuxFallback: handoff.tmuxFallback ?? 'off',
     },
     spawn: {
       availability: spawn.availability ?? 'not-tested',

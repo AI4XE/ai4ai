@@ -2,6 +2,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { mkdir, lstat } from 'node:fs/promises';
 import { atomicJson, bytes, contained, digest, ownership, selectedRoot, withScopeLock } from '../install/scope.js';
+import { validateResult } from '../contract/validate.js';
+import { finalizeHandoff } from './handoff.js';
 import type { Identity, Policy, Request, Result } from '../contract/types.js';
 import type { HarnessId, Isolation, State } from '../contract/states.js';
 
@@ -151,12 +153,17 @@ export class Ai4aiStore {
 
   /**
    * Complete a pending operation in place. Durable operations are normally
-   * append-only; a detached native watcher (Codex TUI /new) is the one case
-   * where the same operation advances after its first result, so the pending
-   * record is replaced with the terminal one. Terminal records are never
+   * append-only; a detached native watcher is the one case where the same
+   * operation advances after its first result, so the pending record is
+   * replaced with the terminal one. The replacement is contract-checked
+   * (including the same-session proof rule) and terminal records are never
    * rewritten.
    */
   async completePending(identity: Identity, operationId: string, outcome: Result): Promise<boolean> {
+    const checked = validateResult(outcome);
+    if (!checked.ok) throw new StoreError(`Pending completion violates the contract: ${checked.issues.map(i => `${i.path}:${i.code}`).join(', ')}`);
+    const finalized = finalizeHandoff({ ...(outcome.proof ? { proof: outcome.proof } : {}) });
+    if (finalized.error) throw new StoreError(`Pending completion violates the handoff rule: ${finalized.error}`);
     return this.lock(async () => {
       const file = this.operationFile(identity);
       await contained(this.root, file);
@@ -166,6 +173,9 @@ export class Ai4aiStore {
       if (index < 0) return false;
       const existing = before.records[index]!;
       if (!['accepted', 'pending', 'applied'].includes(existing.status)) return false;
+      if (outcome.operationId !== operationId || outcome.operation !== existing.request.operation) {
+        throw new StoreError('Pending completion belongs to a different operation; record left pending');
+      }
       const records = before.records.slice();
       records[index] = { ...existing, status: outcome.status, reason: outcome.reason, result: outcome };
       const raw = await bytes(file);

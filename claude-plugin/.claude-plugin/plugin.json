@@ -1,5 +1,5 @@
 {
   "name": "ai4ai",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "AI Harness Extension Kit: self-handoff and detached executors for Claude Code"
 }

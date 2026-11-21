@@ -22,6 +22,8 @@ export interface OpenCodeRecord {
   reason: string;
   /** The native handoff replaces the window without a summary model call. */
   mechanism?: 'restart';
+  /** Explicit proof mechanism; absent on records written before 0.0.5. */
+  proofMechanism?: 'surface-replacement' | 'native-compaction' | 'new-session';
   successor?: Identity;
 }
 
@@ -37,7 +39,7 @@ export function openCodeResult(record: OpenCodeRecord, operation: Request['opera
     state: lifecycle.state,
     ...(lifecycle.handoff ? { handoff: lifecycle.handoff } : {}),
     ...(record.phase === 'completed' && record.successor
-      ? { proof: { source: record.source, successor: record.successor, mechanism: 'new-session' as const, nativeEvidence: record.compactID } }
+      ? { proof: { source: record.source, successor: record.successor, mechanism: record.proofMechanism ?? 'new-session', nativeEvidence: record.compactID } }
       : {}),
   });
 }
@@ -104,7 +106,7 @@ export class OpenCodeJournal {
         format: 2, operationId: request.operationId, fingerprint: fingerprint(request), request, source: identity,
         compactID: `msg_ai4ai_compact_${token}`, deliveryID: `msg_ai4ai_task_${token}`,
         sourceMessage: native?.messageID ?? '', sourceCall: native?.callID ?? '', phase: 'pending',
-        mechanism: 'restart',
+        mechanism: 'restart', proofMechanism: 'surface-replacement',
         reason: 'Finish the source turn; the native replacement supplies a fresh window containing only the task material',
       };
       await commit(record);
@@ -116,9 +118,13 @@ export class OpenCodeJournal {
     return this.transaction(identity, async (records, commit) => {
       const prior = this.latest(records, operationId);
       if (!prior || !from.includes(prior.phase)) throw new Error('Native operation changed; no replay or competing transition');
+      const successor = { ...prior.source, generation: prior.compactID };
+      // The replacement keeps the native session; a different session here
+      // would make the record a false success.
+      if (successor.session !== prior.source.session) throw new Error('OpenCode handoff successor changed the native session id; no transition recorded');
       const next: OpenCodeRecord = {
         ...prior, phase: to, reason,
-        ...(to === 'applied' || to === 'completed' ? { successor: { ...prior.source, generation: prior.compactID } } : {}),
+        ...(to === 'applied' || to === 'completed' ? { successor } : {}),
       };
       await commit(next);
       return next;

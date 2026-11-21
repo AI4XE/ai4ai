@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * Detached watcher for a Codex TUI restart when the TUI has no tmux pane.
+ * Detached watcher for a Codex TUI restart handoff.
  *
- * A bare terminal TUI still speaks to its local app-server daemon. ai4ai asks
- * the model to call the core `new_context` tool (an in-thread context reset
- * with no summary); this watcher observes that tool call, waits for the source
- * turn to end, and then starts the successor turn with only the caller
- * material. The TUI process, thread and host channel are never replaced and
- * no tmux is required.
+ * The handoff tool call runs inside the source turn, so the adapter cannot
+ * wait for that turn to end. This watcher owns the shared app-server daemon
+ * connection instead: it waits for the thread's idle safe point, archives the
+ * current turns best-effort, `thread/revert`s the same thread to its start
+ * (same thread id, no summarizer) and starts the material as the next turn in
+ * that thread. The TUI process, thread and host channel are never replaced.
  */
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import path from 'node:path';
-import { CodexDaemon, daemonSocket } from './control.js';
+import { CodexDaemon } from './control.js';
+import { applyRevertHandoff, type RpcTransport } from './native-handoff.js';
 import { Ai4aiStore } from '../../core/store.js';
 import { result } from '../../contract/validate.js';
+import { sameSessionProof } from '../../core/handoff.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 
 interface Payload {
@@ -24,18 +26,17 @@ interface Payload {
   marker: string;
   threadId: string;
   socket: string;
+  archiveDir: string;
   startedAt: string;
   timeoutMs: number;
 }
-
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 async function main(): Promise<void> {
   const file = process.argv[2];
   if (!file) throw new Error('payload path missing');
   const payload = JSON.parse(await readFile(file, 'utf8')) as Payload;
   const { identity, request, operationId, marker, threadId } = payload;
-  const journalDir = path.join(payload.home, '.ai4ai', 'codex', 'tui-restart');
+  const journalDir = path.join(payload.home, '.ai4ai', 'codex', 'tui-handoff');
   const journal = path.join(journalDir, `${operationId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
   const writeJournal = async (value: Record<string, unknown>): Promise<void> => {
     await mkdir(journalDir, { recursive: true, mode: 0o700 });
@@ -51,49 +52,57 @@ async function main(): Promise<void> {
   };
 
   const daemon = await CodexDaemon.connect(payload.socket);
-  let newContextSeen = false;
-  let turnDone = false;
-  const deadline = Date.now() + payload.timeoutMs;
-
-  daemon.onMessage(message => {
-    try {
-      const text = JSON.stringify(message);
-      if (text.includes('new_context')) newContextSeen = true;
-      if (message?.method === 'turn/completed' && message.params?.threadId === threadId) turnDone = true;
-    } catch { /* tolerate unknown shapes */ }
-  });
-
+  const transport: RpcTransport = {
+    call: (method, params, timeoutMs) => daemon.call(method, params, timeoutMs),
+    onMessage: listener => daemon.onMessage(listener),
+  };
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.4' } }, 10000);
-    await daemon.call('thread/resume', { threadId }, 10000);
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.5' } }, 10000);
+    const delivery = `AI4AI handoff delivery ${marker}. Adopt the caller-supplied task in this fresh context:\n${request.task ?? ''}\nNative system/security instructions remain authoritative.`;
+    const outcome = await applyRevertHandoff(transport, {
+      threadId,
+      deliveryText: delivery,
+      archiveDir: payload.archiveDir,
+      idleTimeoutMs: Math.min(payload.timeoutMs, 10 * 60 * 1000),
+      turnTimeoutMs: Math.min(payload.timeoutMs, 10 * 60 * 1000),
+    });
 
-    // Wait for the model to call the native `new_context` tool and for the
-    // source turn to finish. The successor turn must not start before the
-    // reset is requested, or the material would land in the old context.
-    while (Date.now() < deadline && !(newContextSeen && turnDone)) await sleep(500);
-
-    if (!newContextSeen) {
-      await writeJournal({ format: 1, operationId, marker, phase: 'failed', mechanism: 'restart', reason: 'The model did not call the native new_context tool; the material was not delivered', successor: null });
-      await complete(result({ operation: 'handoff', operationId }, 'failed', 'Codex restart needs the native new_context tool call; it was not observed, so the material was not delivered', {
-        durable: true, state: 'failed', unavailable: ['handoff.restart'],
-        error: { code: 'new-context-missing', message: 'new_context tool call not observed' },
+    const source: Identity = { ...identity, session: threadId, generation: 'codex-thread' };
+    if (!outcome.ok) {
+      const status = outcome.code === 'codex-legacy-thread' ? 'unsupported' as const : 'failed' as const;
+      await writeJournal({
+        format: 2, operationId, marker, phase: status, mechanism: 'restart', threadId,
+        proofMechanism: 'surface-replacement', archive: outcome.archive ?? null,
+        reason: outcome.reason, error: outcome.code ?? null,
+      });
+      await complete(result({ operation: 'handoff', operationId }, status, outcome.reason, {
+        durable: true, ...(status === 'failed' ? { state: 'failed' as const } : {}),
+        unavailable: [outcome.code === 'codex-legacy-thread' ? 'handoff.thread' : 'handoff.restart'],
+        error: { code: outcome.code ?? 'codex-handoff-failed', message: outcome.reason },
+        ...(outcome.archive?.path ? { notices: [{ code: 'handoff-archive', impact: 'none' as const, action_required: false as const, message: `Pre-handoff records: ${outcome.archive.path}` }] } : {}),
       }));
       return;
     }
 
-    const text = `AI4AI handoff delivery ${marker}. Adopt the caller-supplied task in this fresh context:\n${request.task ?? ''}\nNative system/security instructions remain authoritative.`;
-    const turn = await daemon.call('turn/start', { threadId, input: [{ type: 'text', text }] }, Math.min(payload.timeoutMs, 120000)) as { turn?: { id?: string } };
-    const successorTurnId = turn?.turn?.id;
-    const successor: Identity = { ...identity, session: threadId, generation: marker, agent: 'main' };
+    const generation = outcome.successorTurnId ?? 'codex-revert';
+    const proof = sameSessionProof(source, generation, 'surface-replacement', `codex-app-server:thread/${threadId}/revert+turn/${generation}`);
+    const phase = outcome.completed ? 'completed' as const : 'applied' as const;
     await writeJournal({
-      format: 1, operationId, marker, phase: 'completed', mechanism: 'restart',
-      nativeEvidence: 'codex-new-context+app-server-turn', successor,
-      successorTurnId,
-      reason: 'Native new_context reset the context in the same thread; the material was started as the next turn',
+      format: 2, operationId, marker, phase, mechanism: 'restart', threadId,
+      proofMechanism: 'surface-replacement', successor: proof.successor, proof,
+      successorTurnId: generation, archive: outcome.archive ?? null, reason: outcome.reason,
     });
-    await complete(result({ operation: 'handoff', operationId }, 'completed', 'Codex new_context reset the context in the same thread; the task material was delivered as the next turn', {
-      durable: true, state: 'completed', handoff: { phase: 'completed' }, sessionId: threadId,
-      proof: { source: identity, successor, mechanism: 'new-session', nativeEvidence: 'codex-new-context+app-server-turn' },
+    await complete(result({ operation: 'handoff', operationId }, phase, outcome.reason, {
+      durable: true,
+      state: outcome.completed ? 'completed' : 'running',
+      handoff: { phase },
+      sessionId: threadId,
+      proof,
+      ...(outcome.archive?.path
+        ? { notices: [{ code: 'handoff-archive', impact: 'none' as const, action_required: false as const, message: `Pre-handoff records: ${outcome.archive.path}` }] }
+        : outcome.archive?.notice
+          ? { notices: [{ code: 'handoff-archive-skipped', impact: 'none' as const, action_required: false as const, message: outcome.archive.notice }] }
+          : {}),
     }));
   } finally {
     daemon.close();
@@ -105,14 +114,17 @@ main().catch(async error => {
     const file = process.argv[2];
     if (file) {
       const payload = JSON.parse(await readFile(file, 'utf8')) as Payload;
-      const journalDir = path.join(payload.home, '.ai4ai', 'codex', 'tui-restart');
+      const journalDir = path.join(payload.home, '.ai4ai', 'codex', 'tui-handoff');
       await mkdir(journalDir, { recursive: true, mode: 0o700 });
-      await writeFile(path.join(journalDir, `${payload.operationId}.json`), JSON.stringify({
-        format: 1, operationId: payload.operationId, phase: 'failed', mechanism: 'restart', reason: String(error?.message ?? error),
+      await writeFile(path.join(journalDir, `${payload.operationId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`), JSON.stringify({
+        format: 2, operationId: payload.operationId, phase: 'failed', mechanism: 'restart',
+        proofMechanism: 'surface-replacement', threadId: payload.threadId,
+        reason: String(error?.message ?? error),
       }, null, 2) + '\n');
       const store = await Ai4aiStore.open(payload.home).catch(() => undefined);
-      await store?.completePending(payload.identity, payload.operationId, result({ operation: 'handoff', operationId: payload.operationId }, 'failed', 'Codex daemon restart failed: ' + String(error?.message ?? error), {
+      await store?.completePending(payload.identity, payload.operationId, result({ operation: 'handoff', operationId: payload.operationId }, 'failed', 'Codex daemon handoff failed: ' + String(error?.message ?? error), {
         durable: true, state: 'failed', unavailable: ['handoff.restart'],
+        error: { code: 'codex-handoff-failed', message: String(error?.message ?? error) },
       }));
     }
   } catch { /* best effort */ }

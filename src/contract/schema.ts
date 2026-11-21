@@ -1,7 +1,7 @@
 import { FEATURES } from './version.js';
 import {
   AVAILABILITY, CONTEXT_VERIFICATION, HANDOFF_MODES, HANDOFF_PHASES, HARNESSES, ISOLATION, LIFECYCLE_STATES,
-  AUTOCOMPACT_SOURCES, FIELD_STATE_KEYS, FIELD_STATE_VALUES, SOURCE_LABELS, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, STATES, SURFACES,
+  AUTOCOMPACT_SOURCES, FIELD_STATE_KEYS, FIELD_STATE_VALUES, LEGACY_PROOF_MECHANISM, PROOF_MECHANISMS, SOURCE_LABELS, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, STATES, SURFACES,
 } from './states.js';
 
 const id = { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' } as const;
@@ -147,9 +147,8 @@ const capabilitySchema = {
         modelOverride: { enum: [...AVAILABILITY] },
         reasoningEffortOverride: { enum: [...AVAILABILITY] },
         crossSurface: { enum: [...AVAILABILITY] },
-        tmuxFallback: { enum: ['off', 'experimental'] },
       },
-      required: ['availability', 'modes', 'modelOverride', 'reasoningEffortOverride', 'crossSurface', 'tmuxFallback'],
+      required: ['availability', 'modes', 'modelOverride', 'reasoningEffortOverride', 'crossSurface'],
     },
     spawn: {
       type: 'object', additionalProperties: false,
@@ -247,7 +246,7 @@ export const RESULT_SCHEMA = {
       properties: {
         source: IDENTITY_SCHEMA,
         successor: IDENTITY_SCHEMA,
-        mechanism: { enum: ['new-session', 'surface-replacement'] },
+        mechanism: { enum: [...PROOF_MECHANISMS, LEGACY_PROOF_MECHANISM] },
         nativeEvidence: shortText,
       },
       required: ['source', 'successor', 'mechanism', 'nativeEvidence'],

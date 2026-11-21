@@ -97,12 +97,18 @@ if (command.action === 'transition') {
   };
   const to = command.phase ?? 'unknown';
   if (!allowed[to]?.includes(latest.phase)) throw new Error(`Unexpected transition ${latest.phase} -> ${to}; no replay`);
+  const successor = command.successor ?? { ...latest.source, generation: latest.marker };
+  // A handoff never changes the native session identity; the plugin asserts
+  // this too, and the journal refuses a mismatched record rather than storing
+  // a false success.
+  if (successor.session !== latest.source.session) throw new Error('Handoff successor changed the native session id; no transition recorded');
   const next: ClaudeRecord = {
     ...latest, phase: to, reason: command.reason ?? to,
     ...(to === 'applied'
       ? {
-          successor: command.successor ?? { ...latest.source, generation: latest.marker },
-          mechanism: command.mechanism ?? latest.mechanism ?? 'compact',
+          successor,
+          mechanism: command.mechanism ?? latest.mechanism ?? 'restart',
+          proofMechanism: command.proofMechanism ?? latest.proofMechanism ?? 'surface-replacement',
         }
       : {}),
   };
@@ -130,9 +136,12 @@ if (request.operation === 'status' && (request.target === undefined || request.t
   });
   const pointer = await sessionPointer('claude-code', caller.workspace, caller.session).catch(() => null);
   const activity = await sessionActivity(pointer?.path ?? null);
+  const compactionDisabled = !!process.env.DISABLE_COMPACT && process.env.DISABLE_COMPACT !== '0';
   console.log(JSON.stringify({
     result: result(request, 'completed', 'Native session status', {
       durable: true,
+      // A session-level limit, reported honestly without blocking status.
+      ...(compactionDisabled ? { notices: [{ code: 'claude-compaction-disabled', impact: 'none' as const, action_required: false as const, message: 'Compaction is switched off in this session (DISABLE_COMPACT); the in-place restart handoff is unsupported here.' }] } : {}),
       // The session is alive while it serves this call; handoff progress is
       // reported separately, and quiescence is inferred from lastActivityAt.
       state: 'running',
@@ -178,8 +187,21 @@ if (request.operation === 'handoff' && request.target === 'self') {
     process.exit(0);
   }
   if (active) { console.log(JSON.stringify({ result: result(request, 'failed', 'Another handoff is unresolved; reconcile it before requesting a transition') })); process.exit(0); }
+  // Compaction can be switched off per session; the restart path needs it, so
+  // report the limitation up front instead of failing midway.
+  if (process.env.DISABLE_COMPACT && process.env.DISABLE_COMPACT !== '0') {
+    console.log(JSON.stringify({ result: result(request, 'unsupported', 'Compaction is switched off in this session (DISABLE_COMPACT); the in-place restart handoff needs it', { unavailable: ['handoff.restart'], error: { code: 'claude-compaction-disabled', message: 'DISABLE_COMPACT is set for this session' } }) }));
+    process.exit(0);
+  }
+  // This version declares restart only. `compact` means a native summary,
+  // which Claude does not implement here; refuse it instead of silently
+  // running the zero-summary replacement under a compact label.
+  if (request.mode === 'compact') {
+    console.log(JSON.stringify({ result: result(request, 'unsupported', 'Claude Code handoff implements restart only in this version; native compaction plus task delivery is not available', { unavailable: ['handoff.compact'] }) }));
+    process.exit(0);
+  }
   const mechanism = handoffMode(request.mode);
-  if (mechanism === 'restart' && !request.task) {
+  if (!request.task) {
     console.log(JSON.stringify({ result: result(request, 'unsupported', 'A restart handoff needs task material: the new context contains only that material', { unavailable: ['handoff.task'] }) }));
     process.exit(0);
   }
@@ -187,9 +209,8 @@ if (request.operation === 'handoff' && request.target === 'self') {
   const record: ClaudeRecord = {
     format: 2, operationId: request.operationId, fingerprint: fingerprint(request), request, source: caller, marker, phase: 'pending',
     mechanism,
-    reason: mechanism === 'restart'
-      ? 'Finish this turn; the native /clear reset replaces this context with the caller task material'
-      : 'Finish this turn; the native safe point will replace the context with the caller task material',
+    proofMechanism: 'surface-replacement',
+    reason: 'Finish this turn; the native compact hook replaces this context in place with the caller task material (no summary model is called)',
   };
   await journal.transaction(caller, async (_rows, commit) => commit(record));
   console.log(JSON.stringify({ result: response(record), record }));

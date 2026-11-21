@@ -7,15 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { AdapterContext, CarrierCommand, StatusDetails, NativeOutcome } from '../external.js';
 import { ExternalExecutorAdapter, contextFromUsage } from '../external.js';
-import type { CapabilityDeclaration } from '../../contract/types.js';
-import type { Request } from '../../contract/types.js';
+import type { AdoptionProof, CapabilityDeclaration, Identity, Request } from '../../contract/types.js';
 import { handoffMode, handoffOutcome } from '../../contract/states.js';
-import type { HarnessId, Os } from '../../contract/states.js';
+import type { HarnessId, Os, StoredProofMechanism } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
-import { executorDir, type LogLine, type ExecutorStatus } from '../executors.js';
+import { executorDir, pidAlive, type LogLine, type ExecutorStatus } from '../executors.js';
 import { declaration } from '../declarations.js';
-import { paneForProcess, paneForWorkspace, tmuxAvailable } from '../../tmux/backend.js';
-import { CodexDaemon, daemonSocket, listThreads, type CodexThread } from './control.js';
+import { CodexDaemon, daemonSocket, resolveTuiThread, type CodexThread } from './control.js';
+import { legacyProofMechanism, sameSessionProof } from '../../core/handoff.js';
 import { codexSessionUsage } from '../../core/session-probe.js';
 import { envValue, probeCodexConfig } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
@@ -25,9 +24,10 @@ import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../
  *
  * Carriers are per-executor `codex app-server` processes driven by
  * `runner.js`; the protocol is upstream-experimental. Same-window handoff uses
- * the local app-server daemon that the interactive TUI already runs: compact the
- * live thread, then start the successor turn in the same thread. tmux remains an
- * experimental fallback for sessions without a reachable daemon.
+ * the local app-server daemon that the interactive TUI already runs: revert the
+ * live thread to its start, then start the material turn in the same thread.
+ * There is no tmux/new-thread fallback: a session without a reachable daemon
+ * returns a structured `codex-no-daemon` boundary.
  */
 
 /** Resolve a harness binary against the caller's PATH so detached carriers do not depend on the supervisor PATH. */
@@ -77,22 +77,48 @@ export class CodexAdapter extends ExternalExecutorAdapter {
   capabilities(os: Os): CapabilityDeclaration[] {
     const linux = os === 'linux';
     const mac = os === 'darwin';
+    // macOS authentication is the opencode-go provider via OPENCODE_API_KEY,
+    // not `codex login`. Codex 0.170.0 was exercised on macOS: go/no-go
+    // (thread/revert, old secret UNKNOWN, no compact), a headless restart
+    // handoff and a TUI restart handoff all completed in the same thread. The
+    // native compact opt-in was not exercised on macOS, so it is not claimed
+    // there.
     const reason = linux
-      ? 'Linux headless spawn/status and restart handoff (new app-server thread + material) were verified with a real app-server process; TUI restart uses the pane\'s native /new command in tmux or the native new_context tool on a bare TUI; compact remains available. The app-server protocol is upstream-experimental.'
+      ? 'Linux headless spawn/status and the same-thread restart handoff were verified with a real app-server: thread/revert to the thread start, then the material turn in the same thread id with no summary call. TUI restart uses the shared daemon and the same revert; compact is the explicit native-summary opt-in. The app-server protocol is upstream-experimental.'
       : mac
-        ? 'macOS headless spawn/status and restart handoff (new app-server thread + material) run in the same app-server process; TUI restart uses /new in tmux or the native new_context tool on a bare TUI, with compact available explicitly. The app-server protocol is upstream-experimental.'
+        ? 'macOS was exercised with Codex 0.170.0 using the opencode-go provider from the environment (not `codex login`): thread/revert preserved the thread, the headless handoff and the TUI handoff both completed in the same thread, and the old codeword was not in the replaced live context. Native compact was not exercised on macOS, so only restart is claimed. The app-server protocol is upstream-experimental.'
         : 'Codex is supported via WSL on Windows; native Windows harness integration is out of scope and was not exercised.';
     const level = linux || mac ? 'supported' as const : 'not-tested' as const;
+    const modes = (linux ? ['restart', 'compact'] : ['restart']) as ('compact' | 'restart')[];
     const common = {
-      handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], tmuxFallback: 'experimental' as const },
+      handoff: { availability: level, modes },
       spawn: { availability: level, maxConcurrent: 4 },
       status: { availability: level, model: 'not-tested' as const, reasoningEffort: 'unsupported' as const, context: level, percentSource: 'derived' as const },
-      ...(linux || mac ? { evidence: `matrix:codex/${os}/2026-11-18` } : {}),
+      ...(linux || mac ? { evidence: `matrix:codex/${os}/2026-11-21` } : {}),
     };
     return [
-      declaration({ harness: 'codex', os, interface: 'headless', reason, experimental: ['app-server', 'tmux-fallback'], ...common }),
-      declaration({ harness: 'codex', os, interface: 'tui', reason, experimental: ['app-server', 'tmux-fallback'], ...common }),
+      declaration({ harness: 'codex', os, interface: 'headless', reason, experimental: ['app-server'], ...common }),
+      declaration({ harness: 'codex', os, interface: 'tui', reason, experimental: ['app-server'], ...common }),
     ];
+  }
+
+  /**
+   * A detached Codex executor inherits the profile model and reasoning effort:
+   * the runner starts a thread without per-request overrides. Refuse them
+   * loudly instead of accepting values that would never reach the harness.
+   */
+  async spawn(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    const unavailable: string[] = [];
+    if (request.model !== undefined) unavailable.push('spawn.model');
+    if (request.reasoningEffort !== undefined) unavailable.push('spawn.reasoningEffort');
+    if (unavailable.length) {
+      return {
+        status: 'unsupported',
+        reason: `codex detached executors inherit the profile model and reasoning effort; overrides are not applied (${unavailable.join(', ')}); configure the Codex profile instead and omit them`,
+        unavailable,
+      };
+    }
+    return super.spawn(request, ctx);
   }
 
   protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {
@@ -127,18 +153,18 @@ export class CodexAdapter extends ExternalExecutorAdapter {
   /**
    * Same-window handoff through the local app-server daemon.
    *
-   * The daemon owns the TUI's live thread. Compacting it and starting the
-   * successor turn through the daemon changes what the user sees in the same
-   * window: a compaction marker followed by the handoff task as the next turn.
-   * When no daemon or live thread is reachable, the experimental tmux fallback
-   * is attempted once.
+   * The daemon owns the TUI's live thread. Reverting it and starting the
+   * material turn through the daemon changes what the user sees in the same
+   * window: a reset history followed by the handoff task as the next turn.
+   * When no daemon or live thread is reachable, the call fails as the
+   * structured `codex-no-daemon` host boundary; no new thread is created.
    */
   async handoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     if (request.target !== 'self') {
       return { status: 'unsupported', reason: 'Codex handoff targets the caller self only; detached executors cannot replace their context in place', unavailable: ['handoff.executor'] };
     }
     if (request.surface !== undefined && request.surface !== 'preserve') {
-      return { status: 'unsupported', reason: 'Codex handoff preserves the TUI surface; cross-surface handoff is not implemented', unavailable: ['handoff.crossSurface'] };
+      return { status: 'unsupported', reason: 'Codex handoff preserves the surface; cross-surface handoff is not implemented', unavailable: ['handoff.crossSurface'] };
     }
     const mode = handoffMode(request.mode);
     // A detached Codex executor is itself an app-server thread. It owns its
@@ -147,135 +173,125 @@ export class CodexAdapter extends ExternalExecutorAdapter {
     if (ctx.identity.surface === 'headless' || ctx.executorId !== undefined) {
       return headlessSelfHandoff(request, ctx, mode);
     }
-    if (mode === 'restart') return this.tuiRestart(request, ctx);
-    const socket = await daemonSocket(process.env.AI4AI_CODEX_BIN || 'codex');
-    if (socket) {
-      let daemon: CodexDaemon | undefined;
-      try { daemon = await CodexDaemon.connect(socket); } catch { daemon = undefined; }
-      if (daemon) {
-        let mutated = false;
-        try {
-          return await nativeHandoff(daemon, request, ctx, () => { mutated = true; });
-        } catch (error) {
-          if (error instanceof NoLiveThread) {
-            // Nothing native was changed; there is no safe fallback for compact.
-          } else {
-            return {
-              status: mutated ? 'unknown' : 'failed',
-              reason: `Codex native handoff ${mutated ? 'started but could not be confirmed' : 'failed'}: ${error instanceof Error ? error.message : 'unknown error'}`,
-              durable: mutated,
-              state: mutated ? 'unknown' : 'failed',
-              unavailable: ['handoff.native'],
-              error: { code: 'codex-native-handoff', message: error instanceof Error ? error.message : 'unknown error' },
-            };
-          }
-        } finally { daemon.close(); }
-      }
-    }
-    return {
-      status: 'unsupported',
-      reason: 'No live Codex app-server daemon or TUI thread was found for a compact handoff; restart is the default and uses the native /new path',
-      unavailable: ['handoff.native'],
-    };
+    return mode === 'compact' ? this.tuiCompact(request, ctx) : this.tuiRestart(request, ctx);
   }
 
   /**
-   * Native TUI restart. The visible terminal is the only surface the user
-   * sees, so ai4ai drives that terminal's own `/new` command (a documented
-   * harness action) and then delivers the material as the next turn. The
-   * source turn is still running when this call is made, so a detached watcher
-   * applies the reset at the turn boundary. The process, pane and host channel
-   * are never replaced.
+   * Re-query a pending handoff written by the headless runner or the detached
+   * TUI watcher. Without this, the same operationId would return the original
+   * pending result forever even after the native side completed.
+   */
+  async reconcileHandoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome | undefined> {
+    return reconcileCodexHandoff(request, ctx);
+  }
+
+  /**
+   * Native TUI restart. The TUI's shared app-server daemon owns the live
+   * thread; a detached watcher waits for the safe point, archives best-effort,
+   * reverts the thread to its start and starts the material turn in the same
+   * thread. No tmux, no `/new`, no new thread.
    */
   private async tuiRestart(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     if (!request.task) {
       return { status: 'unsupported', reason: 'A restart handoff needs task material; the new context contains only that material', unavailable: ['handoff.task'] };
     }
-    const attributed = !(await tmuxAvailable()) ? undefined
-      : (process.env.AI4AI_TMUX_PANE || process.env.TMUX_PANE)
-        ? { paneId: process.env.AI4AI_TMUX_PANE || process.env.TMUX_PANE }
-        : await paneForProcess(process.pid).then(pane => pane ? { paneId: pane.paneId } : undefined)
-          ?? await paneForWorkspace('codex', ctx.identity.workspace).then(pane => pane ? { paneId: pane.paneId } : undefined);
-    if (!attributed?.paneId) return this.daemonRestart(request, ctx);
-    const marker = `ai4ai-context-${randomUUID()}`;
-    const directory = path.join(ctx.home, '.ai4ai', 'codex', 'tui-restart');
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const payloadFile = path.join(directory, `${request.operationId.replace(/[^A-Za-z0-9._-]/g, '_')}.payload.json`);
-    const payload = {
-      home: ctx.home, identity: ctx.identity, request, operationId: request.operationId, marker,
-      paneId: attributed.paneId, startedAt: new Date().toISOString(),
-      timeoutMs: Math.min(Math.max(request.timeoutMs ?? 10 * 60 * 1000, 1000), 30 * 60 * 1000),
-    };
-    await writeFile(payloadFile, JSON.stringify(payload, null, 2) + '\n');
-    const watcher = fileURLToPath(new URL('./tui-restart-watch.js', import.meta.url));
-    const child = spawn(process.execPath, [watcher, payloadFile], { detached: true, stdio: 'ignore', env: process.env });
-    child.unref();
-    return {
-      status: 'pending',
-      reason: 'The native TUI /new restart and material delivery are scheduled at the turn boundary; the successor thread is recorded in the journal',
-      durable: true, state: 'running', handoff: { phase: 'pending' },
-      notices: [{
-        code: 'codex-tui-restart', impact: 'none', action_required: false,
-        message: 'Finish the current turn; the watcher sends /new and the material in the same pane.',
-      }],
-      verification: { model: 'unknown', context: 'reported' },
-    };
-  }
-
-  /**
-   * tmux-independent TUI restart. A bare terminal TUI still speaks to its
-   * local app-server daemon. ai4ai asks the model to call the core
-   * `new_context` tool (an in-thread reset without a summary) and a detached
-   * watcher starts the material turn once the reset is observed. Same thread,
-   * same process, no tmux and no process replacement.
-   */
-  private async daemonRestart(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     const socket = await daemonSocket(process.env.AI4AI_CODEX_BIN || 'codex');
     if (!socket) {
       return {
-        status: 'unknown',
-        reason: 'The Codex TUI exposes no reachable app-server daemon (embedded server) and no tmux pane; ai4ai has no native input channel to reset it in place',
+        status: 'unsupported',
+        reason: 'The Codex TUI exposes no reachable app-server daemon (embedded server or --no-daemon); ai4ai has no native control channel to replace its context in place',
         unavailable: ['handoff.restart'],
         error: { code: 'codex-no-daemon', message: 'No reachable app-server daemon' },
       };
     }
-    const threads = await listThreads().catch(() => [] as CodexThread[]);
-    const workspace = path.resolve(ctx.identity.workspace);
-    const candidates = threads
-      .filter(thread => typeof thread.cwd === 'string' && path.resolve(thread.cwd) === workspace && typeof thread.id === 'string')
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-    const threadId = candidates[0]?.id;
-    if (!threadId) {
+    let daemon: CodexDaemon | undefined;
+    try { daemon = await CodexDaemon.connect(socket); } catch { daemon = undefined; }
+    if (!daemon) {
       return {
-        status: 'unknown',
-        reason: 'No live app-server thread matches this Codex TUI workspace; restart needs the thread the TUI is showing',
-        unavailable: ['handoff.thread'],
-        error: { code: 'codex-tui-no-thread', message: 'No matching live thread' },
+        status: 'unsupported',
+        reason: 'The Codex app-server daemon did not accept a control connection; the handoff cannot be driven without changing the session',
+        unavailable: ['handoff.restart'],
+        error: { code: 'codex-no-daemon', message: 'Daemon connection failed' },
       };
     }
-    const marker = `ai4ai-context-${randomUUID()}`;
-    const directory = path.join(ctx.home, '.ai4ai', 'codex', 'tui-restart');
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const payloadFile = path.join(directory, `${request.operationId.replace(/[^A-Za-z0-9._-]/g, '_')}.daemon.json`);
-    const payload = {
-      home: ctx.home, identity: ctx.identity, request, operationId: request.operationId, marker, threadId, socket,
-      startedAt: new Date().toISOString(),
-      timeoutMs: Math.min(Math.max(request.timeoutMs ?? 10 * 60 * 1000, 1000), 30 * 60 * 1000),
-    };
-    await writeFile(payloadFile, JSON.stringify(payload, null, 2) + '\n');
-    const watcher = fileURLToPath(new URL('./tui-daemon-watch.js', import.meta.url));
-    const child = spawn(process.execPath, [watcher, payloadFile], { detached: true, stdio: 'ignore', env: process.env });
-    child.unref();
-    return {
-      status: 'pending',
-      reason: 'The native new_context reset is requested; the successor material runs in the same thread after the source turn',
-      durable: true, state: 'running', handoff: { phase: 'pending' },
-      notices: [{
-        code: 'codex-new-context', impact: 'none', action_required: false,
-        message: 'Call the new_context tool now, then end this turn; the material is delivered in the fresh context.',
-      }],
-      verification: { model: 'unknown', context: 'reported' },
-    };
+    try {
+      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.5' } });
+      const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
+      if (!resolution.ok) {
+        return {
+          status: 'unsupported',
+          reason: resolution.reason,
+          unavailable: ['handoff.thread'],
+          error: { code: resolution.code, message: resolution.reason },
+        };
+      }
+      const threadId = resolution.thread.id;
+      const marker = `ai4ai-context-${randomUUID()}`;
+      const directory = path.join(ctx.home, '.ai4ai', 'codex', 'tui-handoff');
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const payloadFile = path.join(directory, `${request.operationId.replace(/[^A-Za-z0-9._-]/g, '_')}.payload.json`);
+      const payload = {
+        home: ctx.home, identity: ctx.identity, request, operationId: request.operationId, marker, threadId, socket,
+        archiveDir: path.join(ctx.home, '.ai4ai', 'handoff-archive', threadId, new Date().toISOString().replace(/[:.]/g, '-')),
+        startedAt: new Date().toISOString(),
+        timeoutMs: Math.min(Math.max(request.timeoutMs ?? 10 * 60 * 1000, 1000), 30 * 60 * 1000),
+      };
+      await writeFile(payloadFile, JSON.stringify(payload, null, 2) + '\n');
+      const watcher = fileURLToPath(new URL('./tui-daemon-watch.js', import.meta.url));
+      const child = spawn(process.execPath, [watcher, payloadFile], { detached: true, stdio: 'ignore', env: process.env });
+      child.unref();
+      return {
+        status: 'pending',
+        reason: `The same-thread restart is scheduled at the turn boundary on thread ${threadId}: thread/revert to the thread start, then the material turn`,
+        durable: true, state: 'running', handoff: { phase: 'pending' }, sessionId: threadId,
+        notices: [{
+          code: 'codex-tui-handoff', impact: 'none', action_required: false,
+          message: 'Finish the current turn; the watcher reverts the same thread and delivers the material there.',
+        }],
+        verification: { model: 'unknown', context: 'reported' },
+      };
+    } finally { daemon.close(); }
+  }
+
+  /**
+   * Explicit compact opt-in for the TUI: the harness's native compaction runs
+   * (and may spend summary tokens), then the material is the next turn in the
+   * same thread. Proof uses the native thread id for both source and successor.
+   */
+  private async tuiCompact(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    if (!request.task) {
+      return { status: 'unsupported', reason: 'A compact handoff needs task material to deliver after the native summary', unavailable: ['handoff.task'] };
+    }
+    const socket = await daemonSocket(process.env.AI4AI_CODEX_BIN || 'codex');
+    if (!socket) {
+      return {
+        status: 'unsupported',
+        reason: 'No reachable Codex app-server daemon for the native compact handoff',
+        unavailable: ['handoff.compact'],
+        error: { code: 'codex-no-daemon', message: 'No reachable app-server daemon' },
+      };
+    }
+    let daemon: CodexDaemon | undefined;
+    try { daemon = await CodexDaemon.connect(socket); } catch { daemon = undefined; }
+    if (!daemon) {
+      return { status: 'unsupported', reason: 'The Codex app-server daemon did not accept a control connection', unavailable: ['handoff.compact'], error: { code: 'codex-no-daemon', message: 'Daemon connection failed' } };
+    }
+    let mutated = false;
+    try {
+      return await nativeCompactHandoff(daemon, request, ctx, () => { mutated = true; });
+    } catch (error) {
+      if (error instanceof NoLiveThread) {
+        return { status: 'unsupported', reason: error.message, unavailable: ['handoff.thread'], error: { code: 'codex-thread-unresolved', message: error.message } };
+      }
+      return {
+        status: mutated ? 'unknown' : 'failed',
+        reason: `Codex compact handoff ${mutated ? 'started but could not be confirmed' : 'failed'}: ${error instanceof Error ? error.message : 'unknown error'}`,
+        durable: mutated,
+        state: mutated ? 'unknown' : 'failed',
+        unavailable: ['handoff.native'],
+        error: { code: 'codex-native-handoff', message: error instanceof Error ? error.message : 'unknown error' },
+      };
+    } finally { daemon.close(); }
   }
 
   protected async statusDetails(record: ExecutorRecord, status: ExecutorStatus, _log: LogLine[], ctx: AdapterContext): Promise<StatusDetails> {
@@ -307,10 +323,10 @@ function executorDirectory(ctx: AdapterContext): string | undefined {
  * Headless self-handoff intent.
  *
  * The detached runner owns the executor's app-server process and thread
- * connection; a separate CLI process cannot drive that stdio channel.
- * The executor therefore records a durable intent and finishes its turn, and
- * the runner applies it at the turn boundary: compact the executor's own
- * thread, then start the successor turn in the same thread with the task.
+ * connection; a separate CLI process cannot drive that stdio channel. The
+ * executor records a durable intent and finishes its turn, and the runner
+ * applies it at the turn boundary: `thread/revert` to the thread start (same
+ * thread id, no summary) and then the material turn in that thread.
  */
 async function headlessSelfHandoff(request: Request, ctx: AdapterContext, mode: 'restart' | 'compact'): Promise<NativeOutcome> {
   const directory = executorDirectory(ctx);
@@ -328,18 +344,7 @@ async function headlessSelfHandoff(request: Request, ctx: AdapterContext, mode: 
   const file = path.join(directory, HANDOFF_FILE);
   const existing = await readJson(file);
   if (existing && existing.operationId === request.operationId) {
-    const phase = String(existing.phase ?? 'intent');
-    const lifecycle = handoffOutcome(phase, { appliedIsTerminal: true });
-    if (phase === 'completed' || phase === 'applied') {
-      return {
-        status: 'completed', reason: 'The detached runner already applied this handoff', durable: true,
-        state: lifecycle.state, ...(lifecycle.handoff ? { handoff: lifecycle.handoff } : {}), sessionId: threadId,
-      };
-    }
-    return {
-      status: 'pending', reason: `The detached runner is applying this handoff (${phase})`, durable: true,
-      state: lifecycle.state, ...(lifecycle.handoff ? { handoff: lifecycle.handoff } : {}), sessionId: threadId,
-    };
+    return handoffRecordOutcome(existing, threadId, mode);
   }
   if (existing && !['completed', 'applied', 'failed', 'cancelled'].includes(String(existing.phase))) {
     return {
@@ -347,9 +352,10 @@ async function headlessSelfHandoff(request: Request, ctx: AdapterContext, mode: 
       error: { code: 'handoff-busy', message: `Pending operation ${String(existing.operationId)}` },
     };
   }
+  const proofMechanism = mode === 'restart' ? 'surface-replacement' : 'native-compaction';
   const record = {
     format: 2, kind: 'handoff', operationId: request.operationId, request, source: ctx.identity,
-    executorId: ctx.executorId ?? process.env.AI4AI_EXECUTOR_ID, threadId, mode, mechanism: mode,
+    executorId: ctx.executorId ?? process.env.AI4AI_EXECUTOR_ID, threadId, mode, mechanism: mode, proofMechanism,
     phase: 'intent', createdAt: new Date().toISOString(),
   };
   const temporary = `${file}.${process.pid}.tmp`;
@@ -358,7 +364,7 @@ async function headlessSelfHandoff(request: Request, ctx: AdapterContext, mode: 
   return {
     status: 'pending',
     reason: mode === 'restart'
-      ? 'The detached runner owns this app-server process; it starts a new thread and delivers the material when the current turn completes'
+      ? 'The detached runner owns this thread; at the turn boundary it reverts the same thread to its start (no summary) and delivers the material'
       : 'The detached runner owns this app-server thread; it compacts the thread and starts the successor turn when the current turn completes',
     durable: true, state: 'running', handoff: { phase: 'pending' }, sessionId: threadId,
     notices: [{
@@ -369,43 +375,128 @@ async function headlessSelfHandoff(request: Request, ctx: AdapterContext, mode: 
   };
 }
 
+/** Native thread identity for proof: the thread id, never the CLI carrier. */
+function nativeCodexSource(record: any, threadId: string): Identity {
+  const source = record?.source ?? { harness: 'codex', workspace: '', surface: 'headless', session: threadId, generation: 'codex-thread', agent: 'main' };
+  // The CLI carrier's session is `cli-<uuid>`; proof must name the native
+  // thread, not that carrier.
+  return { ...source, session: threadId, generation: 'codex-thread' } as Identity;
+}
+
+/** Proof for a durable codex handoff record, including pre-0.0.5 records. */
+function handoffRecordProof(record: any, threadId: string, fallbackMode: 'restart' | 'compact'): AdoptionProof {
+  const source = nativeCodexSource(record, threadId);
+  const stored = record.proofMechanism as StoredProofMechanism | undefined;
+  const mode = record.mode === 'compact' ? 'compact' : fallbackMode;
+  const mechanism: StoredProofMechanism = stored ?? legacyProofMechanism(mode);
+  const successorThread = String(record.successorThreadId ?? record.successorSessionId ?? threadId);
+  const generation = String(record.successorTurnId ?? record.appliedAt ?? successorThread);
+  const evidence = `codex-app-server:thread/${threadId}/revert+turn/${generation}`;
+  if (mechanism === 'new-session') {
+    // A legacy restart really did change the thread; keep the historical
+    // evidence instead of relabelling it as a same-session replacement.
+    return { source, successor: { ...source, session: successorThread, generation }, mechanism, nativeEvidence: evidence };
+  }
+  return sameSessionProof(source, generation, mechanism, evidence);
+}
+
+/** Map a durable headless record onto a contract outcome, proof included. */
+function handoffRecordOutcome(record: any, threadId: string, fallbackMode: 'restart' | 'compact' = 'restart'): NativeOutcome {
+  const phase = String(record.phase ?? 'intent');
+  const lifecycle = handoffOutcome(phase, { appliedIsTerminal: true });
+  const base = {
+    durable: true, sessionId: threadId,
+    state: lifecycle.state,
+    ...(lifecycle.handoff ? { handoff: lifecycle.handoff } : {}),
+  };
+  if (phase === 'completed' || phase === 'applied') {
+    return {
+      ...base,
+      status: phase === 'completed' ? 'completed' : 'applied',
+      reason: String(record.reason ?? (phase === 'completed' ? 'The detached runner applied this handoff' : 'The detached runner applied this handoff; the successor turn is still running')),
+      proof: handoffRecordProof(record, threadId, fallbackMode),
+    };
+  }
+  if (phase === 'failed') {
+    return { ...base, status: 'failed', reason: String(record.reason ?? record.error ?? 'The detached runner failed to apply this handoff'), durable: false, error: { code: 'codex-handoff-failed', message: String(record.error ?? 'headless handoff failed') } };
+  }
+  if (phase === 'cancelled') return { ...base, status: 'cancelled', reason: 'The handoff was cancelled' };
+  return { ...base, status: 'pending', reason: `The detached runner is applying this handoff (${phase})` };
+}
+
+/**
+ * Reconcile a pending handoff from the runner's `handoff.json` or the TUI
+ * watcher journal. An `intent` whose executor is gone becomes failed instead
+ * of pending forever.
+ */
+async function reconcileCodexHandoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome | undefined> {
+  const directory = executorDirectory(ctx);
+  if (directory) {
+    const record = await readJson(path.join(directory, HANDOFF_FILE));
+    if (record && record.operationId === request.operationId) {
+      const phase = String(record.phase ?? 'intent');
+      if (['intent', 'applying', 'applied'].includes(phase)) {
+        const status = await readJson(path.join(directory, 'status.json'));
+        const pid = status?.pid;
+        if (typeof pid === 'number' && !pidAlive(pid)) {
+          return {
+            status: 'failed', durable: false, state: 'failed',
+            reason: 'The detached executor no longer exists before applying the handoff; start a new handoff if the task still matters',
+            error: { code: 'handoff-executor-gone', message: `Executor pid ${pid} is gone with the handoff still ${phase}` },
+          };
+        }
+      }
+      const threadId = String(record.threadId ?? '');
+      if (threadId) return handoffRecordOutcome(record, threadId, record.mode === 'compact' ? 'compact' : 'restart');
+    }
+  }
+  const journalFile = path.join(ctx.home, '.ai4ai', 'codex', 'tui-handoff', `${request.operationId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+  const journal = await readJson(journalFile);
+  if (journal && journal.operationId === request.operationId) {
+    const phase = String(journal.phase ?? 'pending');
+    const threadId = String(journal.threadId ?? journal.successor?.session ?? ctx.identity.session);
+    if (phase === 'completed' || phase === 'applied') {
+      const successor = journal.successor ?? { ...ctx.identity, session: threadId };
+      const mechanism: StoredProofMechanism = journal.proofMechanism ?? legacyProofMechanism('restart');
+      return {
+        status: phase === 'completed' ? 'completed' : 'applied', durable: true, sessionId: threadId,
+        state: phase === 'completed' ? 'completed' : 'running',
+        handoff: { phase: phase === 'completed' ? 'completed' : 'applied' },
+        reason: String(journal.reason ?? 'The TUI watcher applied the handoff'),
+        proof: mechanism === 'new-session'
+          ? { source: ctx.identity, successor, mechanism, nativeEvidence: String(journal.nativeEvidence ?? 'codex-tui:legacy') }
+          : sameSessionProof(nativeCodexSource({ source: ctx.identity }, threadId), String(journal.successorTurnId ?? 'codex-revert'), mechanism, String(journal.nativeEvidence ?? 'codex-tui:revert')),
+      };
+    }
+    if (phase === 'failed') {
+      return { status: 'failed', durable: false, state: 'failed', reason: String(journal.reason ?? 'The TUI watcher failed to apply the handoff'), error: { code: 'codex-handoff-failed', message: String(journal.reason ?? 'TUI handoff failed') } };
+    }
+    return { status: 'pending', durable: true, state: 'running', handoff: { phase: 'pending' }, sessionId: threadId, reason: `The TUI watcher is applying this handoff (${phase})` };
+  }
+  return undefined;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Compact the live TUI thread and run the handoff task as its next turn.
- * `markMutated` is called before the first native mutation so the caller can
- * report an unknown state instead of retrying through another channel.
+ * Explicit compact opt-in for the live TUI thread: the native compaction runs,
+ * then the material is the next turn in the same thread. `markMutated` is
+ * called before the first native mutation so the caller can report an unknown
+ * state instead of retrying through another channel.
  */
-async function nativeHandoff(
+async function nativeCompactHandoff(
   daemon: CodexDaemon,
   request: Request,
   ctx: AdapterContext,
   markMutated: () => void,
 ): Promise<NativeOutcome> {
-  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.4' } });
-  let threadId = process.env.AI4AI_CODEX_THREAD;
-  let model: string | null = null;
-  if (!threadId) {
-    const listing = await daemon.call('thread/list', { limit: 50 });
-    const rows = (listing?.data ?? []) as (CodexThread & { model?: string })[];
-    const workspace = path.resolve(ctx.identity.workspace);
-    const candidates = rows
-      .filter(thread => typeof thread.cwd === 'string' && path.resolve(thread.cwd) === workspace)
-      .filter(thread => thread.status?.type !== 'notLoaded')
-      .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
-    threadId = candidates[0]?.id;
-    model = candidates[0]?.model ?? null;
-    if (!threadId) {
-      throw new NoLiveThread('No live Codex TUI thread is attached to the local app-server daemon for this workspace');
-    }
-  }
-  const thread = threadId!;
+  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.5' } });
+  const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
+  if (!resolution.ok) throw new NoLiveThread(resolution.reason);
+  const thread = resolution.thread.id;
+  const model = resolution.thread.model ?? null;
   await daemon.call('thread/resume', { threadId: thread, excludeTurns: true });
-  if (!model) {
-    const listing = await daemon.call('thread/list', { limit: 50 });
-    const row = (listing?.data ?? []).find((entry: CodexThread) => entry.id === thread) as { model?: string } | undefined;
-    model = row?.model ?? null;
-  }
+  const source = nativeCodexSource({ source: ctx.identity }, thread);
 
   const compactTimeout = Math.min(120000, request.timeoutMs ?? 120000);
   const taskTimeout = Math.min(300000, request.timeoutMs ?? 180000);
@@ -431,9 +522,8 @@ async function nativeHandoff(
     const waitIdle = async (timeoutMs: number): Promise<boolean> => {
       const deadline = Date.now() + timeoutMs;
       for (;;) {
-        const listing = await daemon.call('thread/list', { limit: 50 });
-        const row = (listing?.data ?? []).find((entry: CodexThread) => entry.id === thread);
-        if (row && row.status?.type === 'idle') return true;
+        const read = await daemon.call('thread/read', { threadId: thread, includeTurns: false }, 15000).catch(() => undefined);
+        if (read?.thread?.status?.type === 'idle') return true;
         if (Date.now() >= deadline) return false;
         await sleep(250);
       }
@@ -470,7 +560,6 @@ async function nativeHandoff(
       message.method === 'item/completed' && message.params?.threadId === thread
       && message.params?.item?.type === 'agentMessage')?.params?.item?.text as string | undefined;
     const context = contextFromUsage(usage?.last?.inputTokens ?? null, usage?.modelContextWindow ?? null);
-    const successor = { ...ctx.identity, generation: turnId ?? 'codex-compacted' };
     return {
       status: completed ? 'completed' : 'applied',
       reason: completed
@@ -486,7 +575,9 @@ async function nativeHandoff(
       verification: { model: model ? 'reported' : 'unknown', context: context.percentSource === 'derived' ? 'derived' : 'reported' },
       context,
       unavailable: model ? ['context.window'] : ['model'],
-      proof: { source: ctx.identity, successor, mechanism: 'surface-replacement', nativeEvidence: `codex-app-server:thread/${thread}/compact+turn/${turnId ?? 'unknown'}` },
+      // The native thread id is the source and successor session; only the
+      // generation (turn) advances.
+      proof: sameSessionProof(source, turnId ?? 'codex-compacted', 'native-compaction', `codex-app-server:thread/${thread}/compact+turn/${turnId ?? 'unknown'}`),
       notices: [{
         code: 'codex-tui-handoff', impact: 'none', action_required: false,
         message: 'The compaction marker and the handoff task appear in the same TUI; the daemon protocol is upstream-experimental.',

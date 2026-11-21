@@ -6,6 +6,8 @@ import { result, validateRequest } from '../../contract/validate.js';
 import { handoffOutcome } from '../../contract/states.js';
 import { fingerprint } from '../../core/fingerprint.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
+import type { StoredProofMechanism } from '../../contract/states.js';
+import { legacyProofMechanism } from '../../core/handoff.js';
 
 export type ClaudePhase = 'pending' | 'scheduled' | 'applied' | 'completed' | 'cancelled' | 'failed' | 'unknown';
 
@@ -20,6 +22,12 @@ export interface ClaudeRecord {
   reason: string;
   /** Native context replacement strategy recorded for this handoff. */
   mechanism?: 'restart' | 'compact';
+  /**
+   * Explicit proof mechanism. New records always set it. Records written
+   * before 0.0.5 lack it; their proof is derived from `mechanism` under the
+   * historical rules and is exempt from the same-session gate.
+   */
+  proofMechanism?: StoredProofMechanism;
   successor?: Identity;
 }
 
@@ -35,6 +43,7 @@ export interface ClaudeCommand {
   /** Native successor identity after a restart (new session id) or compact generation. */
   successor?: Identity;
   mechanism?: 'restart' | 'compact';
+  proofMechanism?: StoredProofMechanism;
   usage?: { window?: number | null; used?: number | null; percent?: number | null; model?: string | null; reasoningEffort?: string | null };
 }
 
@@ -54,7 +63,9 @@ function response(record: ClaudeRecord, operation: Request['operation'] = 'hando
       ? {
           proof: {
             source: record.source, successor: record.successor,
-            mechanism: (record.mechanism === 'restart' ? 'new-session' : 'surface-replacement') as 'new-session' | 'surface-replacement',
+            // New records carry the explicit field; old records keep the
+            // mechanism they historically implied and stay legacy-exempt.
+            mechanism: record.proofMechanism ?? legacyProofMechanism(record.mechanism),
             nativeEvidence: record.marker,
           },
         }

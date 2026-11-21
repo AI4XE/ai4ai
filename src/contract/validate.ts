@@ -1,7 +1,7 @@
 import { FEATURES } from './version.js';
 import {
   AVAILABILITY, AUTOCOMPACT_SOURCES, CONTEXT_VERIFICATION, FIELD_STATE_KEYS, HANDOFF_MODES, HANDOFF_PHASES, HARNESSES, ISOLATION,
-  LIFECYCLE_STATES, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, SOURCE_LABELS, STATES, SURFACES,
+  LEGACY_PROOF_MECHANISM, LIFECYCLE_STATES, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, PROOF_MECHANISMS, SOURCE_LABELS, STATES, SURFACES,
 } from './states.js';
 import type {
   CapabilityDeclaration, ContextInfo, Identity, Issue, Notice, Request, Result,
@@ -150,7 +150,6 @@ export function validateCapability(value: unknown): Validation<CapabilityDeclara
     if (!member(value.handoff.availability, AVAILABILITY)) issues.push(problem('handoff.availability', 'schema', 'Unknown availability'));
     if (!Array.isArray(value.handoff.modes) || value.handoff.modes.some(m => !member(m, HANDOFF_MODES))) issues.push(problem('handoff.modes', 'schema', 'Unknown mode list'));
     for (const key of ['modelOverride', 'reasoningEffortOverride', 'crossSurface'] as const) if (!member(value.handoff[key], AVAILABILITY)) issues.push(problem(`handoff.${key}`, 'schema', 'Unknown availability'));
-    if (!member(value.handoff.tmuxFallback, ['off', 'experimental'])) issues.push(problem('handoff.tmuxFallback', 'schema', 'Unknown tmux fallback declaration'));
   } else issues.push(problem('handoff', 'required', 'Expected handoff capabilities'));
   if (object(value.spawn)) {
     if (!member(value.spawn.availability, AVAILABILITY)) issues.push(problem('spawn.availability', 'schema', 'Unknown availability'));
@@ -267,13 +266,24 @@ export function validateResult(value: unknown): Validation<Result> {
   // A completed handoff must carry durable trusted adoption proof; a status
   // query completion is much weaker and needs none.
   if (value.status === 'completed' && value.operation === 'handoff' && (value.durable !== true || value.proof === undefined)) issues.push(problem('proof', 'required', 'Completed handoff requires durable adoption proof'));
-  if (value.status === 'completed' && value.operation === 'handoff' && object(value.proof)) {
-    const source = validateIdentity(value.proof.source);
-    const successor = validateIdentity(value.proof.successor);
-    if (!source.ok) issues.push(...source.issues.map(p => ({ ...p, path: `proof.source.${p.path}` })));
-    if (!successor.ok) issues.push(...successor.issues.map(p => ({ ...p, path: `proof.successor.${p.path}` })));
-    if (!member(value.proof.mechanism, ['new-session', 'surface-replacement'])) issues.push(problem('proof.mechanism', 'schema', 'Unknown handoff mechanism'));
-    if (!text(value.proof.nativeEvidence, 4096)) issues.push(problem('proof.nativeEvidence', 'schema', 'Expected native adoption evidence'));
+  // Any result carrying adoption proof is checked, not only `completed`: an
+  // `applied` result also claims the context was replaced. A current mechanism
+  // must keep the native session identity (a handoff never changes the SID);
+  // `new-session` is accepted only as legacy evidence written by older releases.
+  if (value.proof !== undefined) {
+    if (!object(value.proof)) issues.push(problem('proof', 'schema', 'Expected adoption proof'));
+    else {
+      const source = validateIdentity(value.proof.source);
+      const successor = validateIdentity(value.proof.successor);
+      if (!source.ok) issues.push(...source.issues.map(p => ({ ...p, path: `proof.source.${p.path}` })));
+      if (!successor.ok) issues.push(...successor.issues.map(p => ({ ...p, path: `proof.successor.${p.path}` })));
+      if (!member(value.proof.mechanism, [...PROOF_MECHANISMS, LEGACY_PROOF_MECHANISM])) issues.push(problem('proof.mechanism', 'schema', 'Unknown handoff mechanism'));
+      if (!text(value.proof.nativeEvidence, 4096)) issues.push(problem('proof.nativeEvidence', 'schema', 'Expected native adoption evidence'));
+      if (member(value.proof.mechanism, PROOF_MECHANISMS) && source.ok && successor.ok
+        && source.value.session !== successor.value.session) {
+        issues.push(problem('proof.successor.session', 'same-session', 'A handoff must preserve the native session identity; use spawn for a new session'));
+      }
+    }
   }
   return done<Result>(value, issues);
 }

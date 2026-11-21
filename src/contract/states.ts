@@ -67,6 +67,18 @@ export const HANDOFF_MODES = ['compact', 'restart'] as const;
 export type HandoffMode = typeof HANDOFF_MODES[number];
 
 /**
+ * Proof mechanisms a current adapter may produce. `surface-replacement` is the
+ * zero-summary, same-session restart; `native-compaction` is the explicit
+ * compact opt-in where the harness summarized history. `new-session` is a
+ * legacy read-only value: historical journals may contain it, but no adapter
+ * produces it because a handoff must never change the session identity.
+ */
+export const PROOF_MECHANISMS = ['surface-replacement', 'native-compaction'] as const;
+export type ProofMechanism = typeof PROOF_MECHANISMS[number];
+export const LEGACY_PROOF_MECHANISM = 'new-session' as const;
+export type StoredProofMechanism = ProofMechanism | typeof LEGACY_PROOF_MECHANISM;
+
+/**
  * `restart` is the default handoff mode: the new context contains only the
  * caller-supplied material, with no harness summary. `compact` remains an
  * explicit opt-in for users who want history compaction plus new material.
