@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, rename, writeFile, appendFile, open } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile, open } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ExecutorRecord } from '../core/store.js';
@@ -18,6 +19,10 @@ export interface LaunchSpec {
   cwd: string;
   taskFile: string;
   sessionRegex?: string;
+  /** The adapter pre-built the complete cmd.exe command line. */
+  windowsVerbatimArguments?: boolean;
+  /** Protocol spoken by the supervisor launched here (2 = per-turn resume). */
+  supervisorProtocol?: number;
 }
 
 export interface ExecutorStatus {
@@ -32,6 +37,10 @@ export interface ExecutorStatus {
   /** Written by the supervisor on child output/events; never self-reported. */
   lastActivityAt?: string;
   lastActivitySource?: 'native';
+  /** The supervisor's own pid; the child harness pid is `pid`. */
+  supervisorPid?: number;
+  /** Supervisor protocol version; v0.0.3 supervisors omit it. */
+  protocol?: number;
 }
 
 export interface LogLine { ts: string; stream: string; line: string }
@@ -116,8 +125,41 @@ export async function readLog(home: string, executorId: string, lines = 200): Pr
   } catch { return []; }
 }
 
-export async function enqueueTurn(home: string, executorId: string, turn: { inputFile?: string; extraArgs?: string[] }): Promise<void> {
-  await appendFile(path.join(executorDir(home, executorId), 'inbox.jsonl'), JSON.stringify(turn) + '\n');
+export interface QueuedTurn {
+  inputFile?: string;
+  command?: string;
+  args?: string[];
+  windowsVerbatimArguments?: boolean;
+  extraArgs?: string[];
+}
+
+/**
+ * Publish one message as its own inbox file using O_EXCL.
+ *
+ * One file per message means concurrent enqueues never read-modify-write the
+ * same object, and the supervisor claims a message with an atomic rename. The
+ * timestamp prefix preserves arrival order; the uuid suffix makes the name
+ * unique under concurrent writers.
+ */
+export async function enqueueTurn(home: string, executorId: string, turn: QueuedTurn): Promise<string> {
+  const directory = path.join(executorDir(home, executorId), 'inbox');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const name = `${String(Date.now()).padStart(13, '0')}-${randomUUID()}.json`;
+  const handle = await open(path.join(directory, name), 'wx', 0o600);
+  try { await handle.writeFile(JSON.stringify(turn) + '\n'); }
+  finally { await handle.close(); }
+  return name;
+}
+
+/** Where a queued message currently sits: still pending, claimed, or consumed. */
+export async function turnPlacement(home: string, executorId: string, name: string): Promise<'pending' | 'claimed' | 'consumed'> {
+  const directory = executorDir(home, executorId);
+  const exists = async (file: string): Promise<boolean> => {
+    try { await open(file, 'r').then(handle => handle.close()); return true; } catch { return false; }
+  };
+  if (await exists(path.join(directory, 'inbox', name))) return 'pending';
+  if (await exists(path.join(directory, 'inbox', 'claimed', name))) return 'claimed';
+  return 'consumed';
 }
 
 export async function requestStop(home: string, executorId: string): Promise<void> {
@@ -151,6 +193,8 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
     cwd: spec.cwd,
     inputFile: 'task.prompt',
     ...(spec.sessionRegex ? { sessionRegex: spec.sessionRegex } : {}),
+    ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    supervisorProtocol: spec.supervisorProtocol ?? 2,
   });
   // The task file the supervisor feeds on stdin is the plain prompt.
   await writeFile(path.join(directory, 'task.prompt'), task);

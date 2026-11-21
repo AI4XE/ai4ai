@@ -1,6 +1,13 @@
 import type { Register, CoreEngineInterface, SessionMessage } from 'claude-code';
 import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
-import { resolveBindingFile } from '../../install/binding.js';
+
+/**
+ * The Claude hooks module is evaluated in a sandbox that allows relative
+ * imports and `claude-code` only. `install/binding.ts` imports `node:path`, so
+ * it must not be imported here; `resolveBinding` below is an import-free
+ * equivalent that reads candidates through the host `$.fs` API and lets the
+ * worker re-validate whatever it selects.
+ */
 
 interface Binding { harness: string; workspace: string; surface: 'tui' | 'headless'; session: string; generation: string; agent: string }
 interface HandoffRecord { operationId: string; marker: string; phase: string; mechanism?: 'restart' | 'compact'; request: { task?: string; mode?: 'restart' | 'compact' }; source: Binding }
@@ -24,6 +31,79 @@ interface Runtime {
 
 const tool = 'mcp__ai4ai__session';
 const dbg = ($: any, message: string): void => { try { $.ui.log('ai4ai debug: ' + message, { to: 'debug' }); } catch { /* debug only */ } };
+
+interface BindingFile {
+  product?: unknown; format?: unknown; home?: unknown; workspace?: unknown;
+  ownerToken?: unknown; node?: unknown; scope?: unknown;
+}
+interface NativeBinding { home: string; workspace: string; ownerToken: string; node?: string }
+
+// Import-free path helpers for the hooks sandbox (see the import comment).
+const trimTrailing = (value: string): string => value.replace(/[\\/]+$/, '');
+const absolutePath = (value: unknown): value is string => typeof value === 'string'
+  && (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\'));
+const normalizedPath = (value: string): string => {
+  const trimmed = trimTrailing(value).replace(/\\/g, '/');
+  // Windows paths compare case-insensitively; POSIX paths do not.
+  return /^[A-Za-z]:/.test(trimmed) || trimmed.startsWith('//') ? trimmed.toLowerCase() : trimmed;
+};
+const containsWorkspace = (root: string, candidate: string): boolean => {
+  const owner = normalizedPath(root);
+  const target = normalizedPath(candidate);
+  return target === owner || target.startsWith(owner.endsWith('/') ? owner : `${owner}/`);
+};
+const parentPath = (value: string): string => {
+  const trimmed = trimTrailing(value);
+  const index = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  if (index < 0) return trimmed;
+  if (index === 0) return '/';
+  if (index === 2 && /^[A-Za-z]:/.test(trimmed)) return trimmed.slice(0, 3);
+  return trimmed.slice(0, index);
+};
+const joinPath = (directory: string, name: string): string => {
+  const trimmed = trimTrailing(directory);
+  const separator = trimmed.includes('\\') && !trimmed.includes('/') ? '\\' : '/';
+  return `${trimmed}${separator}${name}`;
+};
+
+/** Read one binding candidate through the host API; malformed/foreign records are skipped. */
+async function readBinding($: any, file: string): Promise<NativeBinding | undefined> {
+  let raw: unknown;
+  try { raw = await $.fs.read(file); } catch { return undefined; }
+  if (typeof raw !== 'string') return undefined;
+  let value: BindingFile;
+  try { value = JSON.parse(raw) as BindingFile; } catch { return undefined; }
+  if (!value || value.product !== 'ai4ai' || value.format !== 2 || !absolutePath(value.home) || !absolutePath(value.workspace)
+    || typeof value.ownerToken !== 'string' || value.ownerToken.length === 0) return undefined;
+  return {
+    home: value.home, workspace: value.workspace, ownerToken: value.ownerToken,
+    ...(typeof value.node === 'string' && absolutePath(value.node) ? { node: value.node } : {}),
+  };
+}
+
+/**
+ * Import-free binding resolution: the nearest workspace-local binding whose
+ * recorded workspace contains the caller wins; the plugin-root binding is a
+ * compatible fallback. The worker validates ownership again when used.
+ */
+async function resolveBinding($: any): Promise<{ binding: NativeBinding; path: string } | undefined> {
+  const workspace = await $.session.cwd();
+  if (typeof workspace !== 'string' || !absolutePath(workspace)) return undefined;
+  const candidates: string[] = [];
+  let current = workspace;
+  for (let depth = 0; depth < 16; depth += 1) {
+    candidates.push(joinPath(current, '.ai4ai/binding.json'));
+    const parent = parentPath(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  candidates.push(joinPath($.plugin.root, 'binding.json'));
+  for (const file of candidates) {
+    const binding = await readBinding($, file);
+    if (binding && containsWorkspace(binding.workspace, workspace)) return { binding, path: file };
+  }
+  return undefined;
+}
 const projection = (rows: readonly SessionMessage[]): string => JSON.stringify(rows.map((message: SessionMessage) => ({
   role: message.role, text: message.text, toolUses: message.toolUses, toolResults: message.toolResults ?? [],
 })));
@@ -172,11 +252,7 @@ export const register: Register = on => {
     // A plugin cache can be shared by several workspaces. The workspace-local
     // binding always wins; the plugin-root copy is only a compatible fallback.
     try {
-      const resolved = await resolveBindingFile({
-        workspace: await $.session.cwd(),
-        pluginRoot: $.plugin.root,
-        read: async (file: string) => { try { return await $.fs.read(file); } catch { return undefined; } },
-      });
+      const resolved = await resolveBinding($);
       if (resolved) {
         s.bindingPath = resolved.path;
         s.node = resolved.binding.node || process.execPath;

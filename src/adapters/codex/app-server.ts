@@ -82,7 +82,7 @@ export class CodexAppServer {
     this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
   }
 
-  async initialize(clientName = 'ai4ai', version = '0.0.3'): Promise<unknown> {
+  async initialize(clientName = 'ai4ai', version = '0.0.4'): Promise<unknown> {
     const result = await this.request('initialize', { clientInfo: { name: clientName, version } });
     this.notify('initialized');
     return result;

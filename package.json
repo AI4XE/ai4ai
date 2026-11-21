@@ -1,6 +1,6 @@
 {
   "name": "ai4ai",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "AI Harness Extension Kit: portable self-handoff and detached executors across AI coding harnesses",
   "type": "module",
   "license": "MIT",

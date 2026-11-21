@@ -36,6 +36,10 @@ export interface ExecutorRecord {
   policy: Required<Policy>;
   isolation: Isolation;
   sessionId?: string;
+  /** Effective model at spawn time, restored on resumed turns. */
+  model?: string;
+  /** Effective reasoning effort at spawn time, restored on resumed turns. */
+  reasoningEffort?: string;
   state: string;
   createdAt: string;
   carrier: CarrierInfo;
@@ -60,6 +64,8 @@ function validExecutor(value: unknown): value is ExecutorRecord {
   const r = value as ExecutorRecord | null;
   return !!r && r.format === 2 && r.kind === 'executor' && typeof r.executorId === 'string' && ID.test(r.executorId)
     && typeof r.parent?.session === 'string' && typeof r.harness === 'string' && typeof r.state === 'string'
+    && (r.model === undefined || typeof r.model === 'string')
+    && (r.reasoningEffort === undefined || typeof r.reasoningEffort === 'string')
     && typeof r.createdAt === 'string' && !!r.carrier && r.carrier.detached === true && Array.isArray(r.carrier.command);
 }
 

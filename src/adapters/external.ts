@@ -11,7 +11,7 @@ import type { ExecutorRecord } from '../core/store.js';
 import { normalizePolicy } from '../core/policy.js';
 import { newExecutorId, ownedBy } from '../core/operations.js';
 import {
-  enqueueTurn, executorDir, launch, lifecycleOfStatus, pidAlive, readLog, readStatus, requestStop,
+  enqueueTurn, executorDir, launch, lifecycleOfStatus, pidAlive, readLog, readStatus, requestStop, turnPlacement,
   type ExecutorStatus, type LogLine,
 } from './executors.js';
 import { sessionActivity, sessionPointer } from '../core/session-probe.js';
@@ -22,6 +22,8 @@ export interface CarrierCommand {
   env?: Record<string, string>;
   envExclude?: string[];
   sessionRegex?: string;
+  /** Windows only: the adapter already formed the complete cmd.exe payload. */
+  windowsVerbatimArguments?: boolean;
 }
 
 export interface StatusDetails {
@@ -52,6 +54,17 @@ export abstract class ExternalExecutorAdapter implements Adapter {
   /** Adapter-specific context/model/reasoning-effort extraction from the carrier output. */
   protected statusDetails(_record: ExecutorRecord, _status: ExecutorStatus, _log: LogLine[], _ctx: AdapterContext): StatusDetails | Promise<StatusDetails> { return {}; }
 
+  /**
+   * Model a resumed turn must keep: the explicit request override, or the
+   * effective value the carrier would use (environment/settings). Persisted at
+   * spawn time so a follow-up turn started by a supervisor whose caller lacked
+   * that environment still selects the same model.
+   */
+  protected persistedModel(request: Request, _ctx: AdapterContext): string | undefined | Promise<string | undefined> { return request.model; }
+
+  /** Reasoning effort the resumed turn must keep (same rationale as persistedModel). */
+  protected persistedReasoningEffort(request: Request, _ctx: AdapterContext): string | undefined | Promise<string | undefined> { return request.reasoningEffort; }
+
   protected async writeTask(ctx: AdapterContext, executorId: string, name: string, text: string): Promise<string> {
     const directory = executorDir(ctx.home, executorId);
     await mkdir(directory, { recursive: true });
@@ -76,17 +89,24 @@ export abstract class ExternalExecutorAdapter implements Adapter {
       for (const executorId of ids) {
         const carrier = await this.carrier(request, ctx, executorId);
         const taskFile = await this.writeTask(ctx, executorId, 'spawn.prompt', request.task ?? '');
+        const model = await this.persistedModel(request, ctx);
+        const reasoningEffort = await this.persistedReasoningEffort(request, ctx);
         const record: ExecutorRecord = {
           format: 2, kind: 'executor', executorId, parent: ctx.identity, harness: this.harness,
           surface: 'headless', policy: normalizePolicy(request.policy), isolation: request.isolation ?? 'inherit',
           state: 'running', createdAt: new Date().toISOString(),
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
           carrier: { detached: true, command: [carrier.command, ...carrier.args] },
         };
         created.push(record);
         await ctx.store.addExecutors([record]);
         await launch({
           executorId, harness: this.harness, home: ctx.home, command: carrier.command, args: carrier.args,
-          ...(carrier.env ? { env: carrier.env } : {}), ...(carrier.envExclude ? { envExclude: carrier.envExclude } : {}), cwd: ctx.identity.workspace, taskFile,
+          ...(carrier.env ? { env: carrier.env } : {}), ...(carrier.envExclude ? { envExclude: carrier.envExclude } : {}),
+          ...(carrier.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+          supervisorProtocol: 2,
+          cwd: ctx.identity.workspace, taskFile,
           ...(carrier.sessionRegex ? { sessionRegex: carrier.sessionRegex } : {}),
         });
       }
@@ -160,28 +180,123 @@ export abstract class ExternalExecutorAdapter implements Adapter {
     };
   }
 
+  /**
+   * Deliver a follow-up turn to an owned executor.
+   *
+   * Only a running executor with a live protocol-2 supervisor is served: the
+   * turn is queued for that supervisor and resumes the same native session.
+   * Idle/exited executors fail structurally instead of silently starting a new
+   * session (which would lose the previous context).
+   */
   async message(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     const record = await this.executorFor(request, ctx);
     if (!record) return { status: 'unauthorized', reason: 'Target is not owned by this caller' };
     const observed = await this.observe(record, ctx);
-    if (observed.state === 'cancelled') return { status: 'failed', reason: 'Executor was stopped; a new message does not resume it silently' };
-    if (observed.state === 'running') {
-      const file = await this.writeTask(ctx, record.executorId, `message-${request.operationId}.prompt`, request.task ?? '');
-      await enqueueTurn(ctx.home, record.executorId, { inputFile: path.basename(file) });
-      return { status: 'accepted', reason: 'Message queued for the executor next turn', durable: true, state: 'running' };
+    // Same lifecycle vocabulary as status/list (one raw status -> one state).
+    if (observed.state !== 'running') {
+      return {
+        status: 'failed',
+        reason: `Executor is ${observed.state}; a message is only queued for a running executor. Start a new executor instead.`,
+        durable: true,
+        state: observed.state,
+        error: { code: 'message-executor-not-running', message: `Executor state is ${observed.state}` },
+      };
     }
-    // Idle executor: continue its native session in a fresh detached turn. The
-    // carrier owns the resume flags so a platform never receives two
-    // conflicting session selectors (for example two `--session` values).
-    const sessionId = observed.status.sessionId;
+    if (!pidAlive(observed.status.supervisorPid)) {
+      return {
+        status: 'failed',
+        reason: 'The detached supervisor is not alive; start a new executor instead of messaging a stale record',
+        durable: true,
+        state: 'running',
+        error: { code: 'message-executor-not-running', message: 'Supervisor is not alive' },
+      };
+    }
+    if ((observed.status.protocol ?? 1) < 2) {
+      // v0.0.3 supervisors ignore per-turn command/args and would silently start
+      // a new session. Refuse instead of losing context.
+      return {
+        status: 'failed',
+        reason: 'This executor was started by an older supervisor that cannot resume its native session; start a new executor',
+        durable: true,
+        state: 'running',
+        error: { code: 'message-executor-protocol-too-old', message: `Supervisor protocol ${observed.status.protocol ?? 1} < 2` },
+      };
+    }
+    const sessionId = await this.awaitSessionId(ctx.home, record, observed.status);
+    if (!sessionId) {
+      return {
+        status: 'failed',
+        reason: 'The executor has not reported a native session id yet; the message was not queued (a session-less turn would lose context)',
+        durable: true,
+        state: 'running',
+        error: { code: 'message-session-unknown', message: 'No session id observed within the bounded wait' },
+      };
+    }
     const file = await this.writeTask(ctx, record.executorId, `message-${request.operationId}.prompt`, request.task ?? '');
-    const carrier = await this.carrier(request, ctx, record.executorId, sessionId);
-    await launch({
-      executorId: record.executorId, harness: this.harness, home: ctx.home, command: carrier.command,
-      args: carrier.args, ...(carrier.env ? { env: carrier.env } : {}), ...(carrier.envExclude ? { envExclude: carrier.envExclude } : {}), cwd: ctx.identity.workspace, taskFile: file,
-      ...(carrier.sessionRegex ? { sessionRegex: carrier.sessionRegex } : {}),
+    // The message schema forbids model/effort; merge the values recorded at
+    // spawn so the resumed turn keeps the original route.
+    const resume: Request = {
+      ...request,
+      ...(record.model ? { model: record.model } : {}),
+      ...(record.reasoningEffort ? { reasoningEffort: record.reasoningEffort } : {}),
+    };
+    let carrier: CarrierCommand;
+    try {
+      carrier = await this.carrier(resume, ctx, record.executorId, sessionId);
+    } catch (error) {
+      const code = (error as { code?: unknown })?.code;
+      return {
+        status: 'failed',
+        reason: `Could not build a resume command for the existing session; the executor was left untouched: ${error instanceof Error ? error.message : 'unknown error'}`,
+        durable: true,
+        state: 'running',
+        error: {
+          code: typeof code === 'string' ? code : 'message-resume-failed',
+          message: error instanceof Error ? error.message : 'unknown error',
+        },
+      };
+    }
+    const queued = await enqueueTurn(ctx.home, record.executorId, {
+      inputFile: path.basename(file),
+      command: carrier.command,
+      args: carrier.args,
+      ...(carrier.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
-    return { status: 'accepted', reason: sessionId ? 'Follow-up turn started in the existing native session' : 'Follow-up turn started in a fresh native session', durable: true, state: 'running' };
+    // Recheck after publication: the supervisor may have exited in between.
+    // This is a best-effort narrowing of a file-based TOCTOU window, not a
+    // claim that none exists.
+    const after = await readStatus(ctx.home, record.executorId);
+    const placement = await turnPlacement(ctx.home, record.executorId, queued);
+    if (!pidAlive(after?.supervisorPid)) {
+      return {
+        status: 'failed',
+        reason: `The supervisor exited after the message was queued (${placement === 'pending' ? 'message file remains queued' : 'message was already claimed or consumed'})`,
+        durable: true,
+        state: 'running',
+        error: { code: 'message-supervisor-exited', message: `Supervisor exited; queue placement: ${placement}` },
+      };
+    }
+    return {
+      status: 'accepted',
+      reason: placement === 'pending'
+        ? 'Message queued for the executor next turn in its existing native session'
+        : 'Message was already claimed by the executor for its next turn in its existing native session',
+      durable: true,
+      state: 'running',
+      sessionId,
+    };
+  }
+
+  /** Bounded wait for the carrier's session id; never guesses or reuses first-turn args. */
+  private async awaitSessionId(home: string, record: ExecutorRecord, status: ExecutorStatus, timeoutMs = 2000): Promise<string | undefined> {
+    let sessionId = status.sessionId ?? record.sessionId;
+    const deadline = Date.now() + timeoutMs;
+    while (!sessionId && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const raw = await readStatus(home, record.executorId);
+      sessionId = raw?.sessionId ?? sessionId;
+    }
+    return sessionId;
   }
 
   async cancel(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {

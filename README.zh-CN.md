@@ -45,4 +45,10 @@ Claude Code / OpenCode / DSH 注册后直接使用工具；Codex 用 CLI：
 npx ai4ai session --operation status --harness codex
 ```
 
+### DeepSeek Harness Web
+
+1. 在 DSH Web 打开 **Plugins** → **Add plugin**，选择 `ai4ai`。
+2. **启用**该插件。
+3. 按平时的方式重启 DSH 服务，然后刷新页面。
+
 契约与细节见 [docs/contract.md](docs/contract.md)。MIT。

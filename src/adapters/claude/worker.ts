@@ -12,7 +12,7 @@ import { handoffMode, handoffOutcome } from '../../contract/states.js';
 import { fingerprint } from '../../core/fingerprint.js';
 import { activeRecord } from '../../core/journal.js';
 import { Ai4aiStore } from '../../core/store.js';
-import { execute } from '../../core/operations.js';
+import { currentOs, execute } from '../../core/operations.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 import { ClaudeJournal, response, type ClaudeCommand, type ClaudeRecord } from './journal.js';
 import { ClaudeAdapter } from './adapter.js';
@@ -155,7 +155,7 @@ if (request.operation === 'status' && (request.target === undefined || request.t
 }
 
 if (request.operation === 'capabilities') {
-  console.log(JSON.stringify({ result: result(request, 'completed', 'Claude adapter capabilities are declared by the installed plugin', { durable: false }) }));
+  console.log(JSON.stringify({ result: result(request, 'completed', 'Claude adapter capabilities are declared by the installed plugin', { durable: false, capabilities: new ClaudeAdapter().capabilities(currentOs()) }) }));
   process.exit(0);
 }
 

@@ -8,7 +8,7 @@
  * Reattachment is purely file-based, which is what makes the lifecycle detached.
  */
 import { createWriteStream, readFileSync } from 'node:fs';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -40,12 +40,18 @@ interface Spec {
   cwd: string;
   inputFile?: string;
   sessionRegex?: string;
+  windowsVerbatimArguments?: boolean;
+  supervisorProtocol?: number;
 }
-interface Turn { inputFile?: string; extraArgs?: string[] }
+interface Turn { inputFile?: string; extraArgs?: string[]; command?: string; args?: string[]; windowsVerbatimArguments?: boolean }
 interface Status {
   state: string; startedAt: string; turns: number; pid?: number;
   sessionId?: string; exitCode?: number | null; signal?: string | null; endedAt?: string;
   lastActivityAt?: string; lastActivitySource?: 'native';
+  /** The supervisor's own pid (the child harness pid is `pid`). */
+  supervisorPid?: number;
+  /** Protocol 2 supports per-turn command/args resume overrides. */
+  protocol?: number;
 }
 
 /**
@@ -69,11 +75,11 @@ const touchActivity = (force = false): void => {
   }
 };
 
-await mkdir(directory, { recursive: true });
-let status: Status = { state: 'starting', startedAt: new Date().toISOString(), turns: 0 };
-await atomic('status.json', status);
-
 const spec = JSON.parse(await readFile(file('spec.json'), 'utf8')) as Spec;
+await mkdir(directory, { recursive: true });
+const protocol = typeof spec.supervisorProtocol === 'number' && Number.isSafeInteger(spec.supervisorProtocol) ? spec.supervisorProtocol : 1;
+let status: Status = { state: 'starting', startedAt: new Date().toISOString(), turns: 0, supervisorPid: process.pid, protocol };
+await atomic('status.json', status);
 const log = createWriteStream(file('log.ndjson'), { flags: 'a' });
 const record = (stream: string, text: string): void => {
   for (const line of String(text).split(/\r?\n/)) {
@@ -90,10 +96,21 @@ const observeSession = (line: string): void => {
   }
 };
 
-function runTurn(command: string, args: string[], inputFile: string | undefined): Promise<{ code: number | null; signal: string | null; stopping: boolean }> {
+/** Windows: end the whole tree so killing cmd.exe does not orphan node. */
+function terminateTree(child: ReturnType<typeof spawn>): void {
+  if (process.platform === 'win32' && child.pid) {
+    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    killer.on('error', () => { try { child.kill(); } catch { /* already gone */ } });
+    return;
+  }
+  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+}
+
+function runTurn(command: string, args: string[], inputFile: string | undefined, verbatim = false): Promise<{ code: number | null; signal: string | null; stopping: boolean }> {
   return new Promise(resolve => {
     const child = spawn(command, args, {
       cwd: spec.cwd, env: { ...process.env, ...(spec.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true,
+      ...(verbatim ? { windowsVerbatimArguments: true } : {}),
     });
     status = { ...status, state: 'running', ...(child.pid ? { pid: child.pid } : {}), turns: (status.turns ?? 0) + 1 };
     void persist();
@@ -103,8 +120,8 @@ function runTurn(command: string, args: string[], inputFile: string | undefined)
       stopping = true;
       status = { ...status, state: 'stopping' };
       void persist();
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 10000).unref();
+      terminateTree(child);
+      setTimeout(() => terminateTree(child), 10000).unref();
     }, 400);
     timer.unref?.();
     child.stdout.on('data', data => {
@@ -128,18 +145,42 @@ function runTurn(command: string, args: string[], inputFile: string | undefined)
   });
 }
 
+/**
+ * Claim the oldest queued message with an atomic rename.
+ *
+ * Enqueue writes one O_EXCL file per message, so no read-modify-write is
+ * shared. `rename` is the claim: exactly one consumer can move a given name,
+ * and a claimed file is left in `inbox/claimed` until it has been read.
+ */
 async function nextQueuedTurn(): Promise<Turn | undefined> {
-  try {
-    const lines = (await readFile(file('inbox.jsonl'), 'utf8')).split('\n').filter(Boolean);
-    if (!lines.length) return undefined;
-    const next = JSON.parse(lines[0]!) as Turn;
-    await writeFile(file('inbox.jsonl'), lines.slice(1).join('\n') + (lines.length > 1 ? '\n' : ''));
-    return next;
-  } catch { return undefined; }
+  const inbox = file('inbox');
+  const claimed = path.join(inbox, 'claimed');
+  let entries;
+  try { entries = await readdir(inbox, { withFileTypes: true }); }
+  catch { return undefined; }
+  const names = entries.filter(entry => entry.isFile() && entry.name.endsWith('.json')).map(entry => entry.name).sort();
+  for (const name of names) {
+    const source = path.join(inbox, name);
+    const target = path.join(claimed, name);
+    try {
+      await mkdir(claimed, { recursive: true });
+      await rename(source, target);
+    } catch { continue; }
+    try {
+      const value = JSON.parse(await readFile(target, 'utf8')) as Turn;
+      await rm(target, { force: true });
+      return value;
+    } catch { return undefined; }
+  }
+  return undefined;
 }
 
 let exitCode = 0;
-let turn: Turn = { ...(spec.inputFile ? { inputFile: spec.inputFile } : {}), extraArgs: [] };
+let turn: Turn = {
+  ...(spec.inputFile ? { inputFile: spec.inputFile } : {}),
+  extraArgs: [],
+  ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+};
 for (;;) {
   if (stopRequested()) {
     // A stop before the next turn starts: there is no child to reap, so the
@@ -147,7 +188,10 @@ for (;;) {
     status = { ...status, state: 'stopped', exitCode: null, signal: null, endedAt: new Date().toISOString() };
     break;
   }
-  const result = await runTurn(spec.command, [...(spec.args ?? []), ...(turn.extraArgs ?? [])], turn.inputFile);
+  const command = turn.command ?? spec.command;
+  const args = [...(turn.args ?? spec.args ?? []), ...(turn.args ? [] : turn.extraArgs ?? [])];
+  const verbatim = turn.windowsVerbatimArguments ?? spec.windowsVerbatimArguments === true;
+  const result = await runTurn(command, args, turn.inputFile, verbatim);
   if (result.stopping) {
     // The supervisor killed the child on request; record how it terminated so
     // status can report a real signal/exit code instead of a bare `stopped`.

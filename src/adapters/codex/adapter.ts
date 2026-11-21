@@ -382,7 +382,7 @@ async function nativeHandoff(
   ctx: AdapterContext,
   markMutated: () => void,
 ): Promise<NativeOutcome> {
-  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.3' } });
+  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.4' } });
   let threadId = process.env.AI4AI_CODEX_THREAD;
   let model: string | null = null;
   if (!threadId) {

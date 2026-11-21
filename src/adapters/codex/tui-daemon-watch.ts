@@ -64,7 +64,7 @@ async function main(): Promise<void> {
   });
 
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.3' } }, 10000);
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.4' } }, 10000);
     await daemon.call('thread/resume', { threadId }, 10000);
 
     // Wait for the model to call the native `new_context` tool and for the

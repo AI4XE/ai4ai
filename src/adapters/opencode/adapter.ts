@@ -7,7 +7,7 @@ import { ExternalExecutorAdapter, contextFromUsage, lastJson } from '../external
 import { openCodeSessionUsage } from '../../core/session-probe.js';
 import { probeOpenCodeConfig } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens } from '../../core/ladder.js';
-import type { CapabilityDeclaration } from '../../contract/types.js';
+import type { CapabilityDeclaration, Request } from '../../contract/types.js';
 import type { HarnessId, Os } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
 import type { LogLine, ExecutorStatus } from '../executors.js';
@@ -101,6 +101,15 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
       ...(verified ? { evidence: `matrix:opencode/${os}/${surface}/2026-11-18` } : {}),
     });
     return [make('tui'), make('headless')];
+  }
+
+  /**
+   * The carrier selects `request.model || AI4AI_OPENCODE_MODEL`; persist that
+   * effective value so a resumed turn keeps the same model even when the
+   * supervisor's environment differs from the spawning caller's.
+   */
+  protected persistedModel(request: Request): string | undefined {
+    return request.model || process.env.AI4AI_OPENCODE_MODEL || undefined;
   }
 
   protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {

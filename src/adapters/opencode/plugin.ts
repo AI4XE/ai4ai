@@ -10,7 +10,7 @@ import { REQUEST_SCHEMA } from '../../contract/schema.js';
 import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
 import { Ai4aiStore } from '../../core/store.js';
 import { activeRecord } from '../../core/journal.js';
-import { execute } from '../../core/operations.js';
+import { currentOs, execute } from '../../core/operations.js';
 import { openCodeSessionUsage, sessionActivity, sessionPointer } from '../../core/session-probe.js';
 import { probeOpenCodeConfig } from '../../core/config-probe.js';
 import { firstVerified } from '../../core/ladder.js';
@@ -177,7 +177,7 @@ export default Plugin.define({
             if (['spawn', 'message', 'list'].includes(request.operation) || (request.target !== undefined && request.target !== 'self')) {
               return { content: JSON.stringify(await external(request, caller)) };
             }
-            if (request.operation === 'capabilities') return { content: JSON.stringify(result(request, 'completed', 'OpenCode plugin declares the ai4ai session capabilities', { durable: false })) };
+            if (request.operation === 'capabilities') return { content: JSON.stringify(result(request, 'completed', 'OpenCode plugin declares the ai4ai session capabilities', { durable: false, capabilities: new OpenCodeAdapter().capabilities(currentOs()) })) };
             if (request.operation === 'cancel' || request.operation === 'stop') {
               const records = await journal.rows(caller);
               const prior = [...records].reverse().find(record => !terminal(record));

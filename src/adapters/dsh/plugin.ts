@@ -4,12 +4,13 @@ import { handoffOutcome } from '../../contract/states.js';
 import { REQUEST_SCHEMA } from '../../contract/schema.js';
 import { fingerprint, sameIdentity } from '../../core/fingerprint.js';
 import { Ai4aiStore } from '../../core/store.js';
-import { execute } from '../../core/operations.js';
+import { currentOs, execute } from '../../core/operations.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 import { DshAdapter } from './adapter.js';
 import { TOOL_DESCRIPTION, normalizeToolRequest } from '../../contract/tool.js';
 import { reconcileDshStatus, resolveDshStatus, type DshNativeStatus } from './status.js';
 import { sessionActivity, sessionPointer } from '../../core/session-probe.js';
+import { effectiveDshSelection, foldDshSelection } from '../../core/dsh-selection.js';
 
 interface NativeMessage { id: string; role: string; content: { type: string; text?: string; id?: string; toolCallId?: string }[]; toolCallId?: string; isError?: boolean; source?: { kind: string; ai4ai?: JournalRecord } }
 interface NativeEvent { seq: number; type: string; data: NativeMessage & { name?: string; message?: NativeMessage; isError?: boolean }; sourceEventSeqs?: number[] }
@@ -143,7 +144,12 @@ export function apply(ctx: DshContext): () => void {
         exec.signal.throwIfAborted();
         const session = agent.session;
         const caller = identity(agent);
-        if (request.operation === 'capabilities') return result(request, 'completed', 'DSH adapter capabilities are declared by the packaged adapter', { durable: false });
+        if (request.operation === 'capabilities') {
+          return result(request, 'completed', 'DSH adapter capabilities are declared by the packaged adapter', {
+            durable: false,
+            capabilities: new DshAdapter().capabilities(currentOs()),
+          });
+        }
         const events = await snapshot(session);
         const records = journal(events, session);
         const stored = latest(records, request.operationId);
@@ -153,18 +159,17 @@ export function apply(ctx: DshContext): () => void {
         }
         if (request.operation === 'status') {
           const native: DshNativeStatus = {};
+          // Model and effort use the official projections fold, exactly like
+          // the external adapter's persisted-session path.
+          const selection = effectiveDshSelection(foldDshSelection(events.map(event => ({ type: event.type, data: event.data }))));
+          if (selection) {
+            native.model = selection.model;
+            native.reasoningEffort = selection.reasoningEffort;
+          }
           for (const event of events) {
             const data = event.data && typeof event.data === 'object' ? event.data as Record<string, any> : {};
             if (event.type === 'request/context') {
-              if (typeof data.model === 'string') native.model = data.model;
               if (typeof data.contextWindow === 'number') native.window = data.contextWindow;
-            } else if (event.type === 'request/header') {
-              const config = data.header?.config && typeof data.header.config === 'object' ? data.header.config : {};
-              if (typeof config.model === 'string') native.model = native.model ?? config.model;
-              if (typeof config.reasoningEffort === 'string') native.reasoningEffort = config.reasoningEffort;
-            } else if (event.type === 'model/selection') {
-              if (typeof data.model === 'string') native.model = data.model;
-              if (typeof data.reasoningEffort === 'string') native.reasoningEffort = data.reasoningEffort;
             } else if (event.type === 'assistant/message' && data.usage && typeof data.usage === 'object') {
               const usage = data.usage as Record<string, unknown>;
               const input = typeof usage.inputTokens === 'number' ? usage.inputTokens : null;
@@ -177,7 +182,7 @@ export function apply(ctx: DshContext): () => void {
           const details = await resolveDshStatus(agent.session.header.cwd ?? caller.workspace, session.id, native, process.env.DSH_HOME);
           const base = stored
             ? receipt(request, stored.record, await durable(session))
-            : result(request, 'completed', 'No handoff operation owned by this session', { durable: true, state: 'running' });
+            : result(request, 'completed', 'No handoff has been started for this session', { durable: true, state: 'running' });
           const pointer = await sessionPointer('dsh', agent.session.header.cwd ?? caller.workspace, session.id, (process.env.DSH_HOME ? { dshHome: process.env.DSH_HOME } : {})).catch(() => null);
           const activity = await sessionActivity(pointer?.path ?? null);
           const reconciled = reconcileDshStatus(base, details);

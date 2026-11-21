@@ -3,6 +3,7 @@ import { open, readFile, readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { dshSelectionValues } from './dsh-selection.js';
 
 /**
  * Read-only probes of persisted harness session stores, used by the per-field
@@ -168,25 +169,21 @@ export async function dshSessionUsage(workspace: string, sessionId?: string, dsh
       const declared = rows.find(row => row.type === 'session' && (typeof row.sessionId === 'string' || typeof row.id === 'string'));
       const declaredId = declared ? safeText(declared.sessionId ?? declared.id) : null;
       if (declaredId !== null && declaredId !== id) continue; // identity mismatch: never read another session
+      // Model and effort come from the official DSH projection only: a literal
+      // replica of `modelSelectionProjectionDefinition` (pending ?? lastUsed).
+      // Title/compaction/context events are excluded, so a title request's
+      // effort can never overwrite the request header (AI4AI-DSH-013).
+      const selection = dshSelectionValues(rows.map(row => ({
+        type: row.type,
+        data: row.data && typeof row.data === 'object' ? row.data : row,
+      })));
+      const model = selection.model;
+      const reasoningEffort = selection.reasoningEffort;
       let used: number | null = null;
-      let model: string | null = null;
       let window: number | null = null;
-      let reasoningEffort: string | null = null;
       for (const row of rows) {
         // DSH persists typed events under `data`; tolerate older flat shapes.
         const data = row.data && typeof row.data === 'object' ? row.data as Record<string, unknown> : row;
-        const header = data.header && typeof data.header === 'object' ? data.header as Record<string, any> : undefined;
-        const headerConfig = header?.config && typeof header.config === 'object' ? header.config as Record<string, unknown> : undefined;
-        const route = data.route && typeof data.route === 'object' ? data.route as Record<string, any> : undefined;
-        const source = data.source && typeof data.source === 'object' ? data.source as Record<string, any> : undefined;
-        if (typeof data.model === 'string') model = data.model;
-        else if (typeof headerConfig?.model === 'string') model = headerConfig.model;
-        else if (typeof route?.model === 'string') model = route.model;
-        else if (typeof source?.model?.model === 'string') model = source.model.model;
-        else if (typeof row.model === 'string') model = row.model;
-        if (typeof data.reasoningEffort === 'string') reasoningEffort = data.reasoningEffort;
-        else if (typeof headerConfig?.reasoningEffort === 'string') reasoningEffort = headerConfig.reasoningEffort;
-        else if (typeof source?.effort === 'string') reasoningEffort = source.effort;
         const usage = data.usage && typeof data.usage === 'object' ? data.usage as Record<string, unknown>
           : row.usage && typeof row.usage === 'object' ? row.usage as Record<string, unknown> : undefined;
         if (usage && typeof usage.inputTokens === 'number') {

@@ -46,6 +46,20 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 `completed` means the target confirmed stopped, `pending` means the stop was requested,
 `unknown` means no confirmation was obtained.
 
+## Handoff phases, successors and idempotency
+
+- `handoff.phase` is a set of reportable states, not a mandatory sequence. An implementation
+  is not required to visit every value in order, and `scheduled` is optional: an adapter may
+  report `pending` -> `applied` -> `completed` directly when its native safe point is atomic.
+- `successor` is a complete Identity: `harness`, `workspace`, `surface`, `session`,
+  `generation` and `agent`. An implementation may reuse the same `session` and increment
+  `generation` (for example when a harness replaces the context in place); the remaining
+  fields must still be reported truthfully. `session` + `generation` alone is not a
+  successor identity.
+- The first `handoff` call may return `pending` because the native transition completes at a
+  safe point. Re-querying with the same `operationId` is idempotent and returns the
+  progressed (eventually `completed`) result; it must not start a second transition.
+
 ## Request fields
 
 - `operation`: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `capabilities`.

@@ -5,7 +5,8 @@ import type { AdapterContext, CarrierCommand, StatusDetails } from '../external.
 import { ExternalExecutorAdapter, lastJson } from '../external.js';
 import { resolveClaudeStatus } from './status.js';
 import { verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
-import type { CapabilityDeclaration } from '../../contract/types.js';
+import { envValue, probeClaudeSettings } from '../../core/config-probe.js';
+import type { CapabilityDeclaration, Request } from '../../contract/types.js';
 import type { HarnessId, Os } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
 import type { LogLine, ExecutorStatus } from '../executors.js';
@@ -53,6 +54,27 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
       declaration({ harness: 'claude-code', os, interface: 'tui', reason, ...common }),
       declaration({ harness: 'claude-code', os, interface: 'headless', reason, ...common }),
     ];
+  }
+
+  /**
+   * Persist the model a resumed turn must keep. The carrier passes `--model`
+   * only when the request has one, so the effective value can come from the
+   * settings `env` block (which overrides the inherited process environment)
+   * or the process environment.
+   */
+  protected async persistedModel(request: Request, ctx: AdapterContext): Promise<string | undefined> {
+    if (request.model) return request.model;
+    const settings = await probeClaudeSettings(ctx.identity.workspace, undefined, ['ANTHROPIC_MODEL']).catch(() => null);
+    return settings?.env[0]?.value ?? envValue('ANTHROPIC_MODEL') ?? undefined;
+  }
+
+  /** `CLAUDE_CODE_EFFORT_LEVEL` overrides the settings `effortLevel`. */
+  protected async persistedReasoningEffort(request: Request, ctx: AdapterContext): Promise<string | undefined> {
+    if (request.reasoningEffort) return request.reasoningEffort;
+    const env = envValue('CLAUDE_CODE_EFFORT_LEVEL');
+    if (env) return env;
+    const settings = await probeClaudeSettings(ctx.identity.workspace, undefined, []).catch(() => null);
+    return settings?.effortLevel?.value ?? undefined;
   }
 
   protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {

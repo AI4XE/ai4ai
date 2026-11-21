@@ -45,4 +45,10 @@ Claude Code / OpenCode / DSH expose the tools after registration; Codex uses the
 npx ai4ai session --operation status --harness codex
 ```
 
+### DeepSeek Harness Web
+
+1. In DSH Web, open **Plugins** → **Add plugin** and choose `ai4ai`.
+2. **Enable** the plugin.
+3. Restart the DSH service the way you normally start it, then refresh the page.
+
 Contract and details: [docs/contract.md](docs/contract.md). MIT.
