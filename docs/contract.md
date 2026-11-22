@@ -62,6 +62,12 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 - The first `handoff` call may return `pending` because the native transition completes at a
   safe point. Re-querying with the same `operationId` is idempotent and returns the
   progressed (eventually `completed`) result; it must not start a second transition.
+- A handoff is atomic once accepted: real user input that arrives while it is `pending`,
+  `scheduled` or `applied` does not cancel it. Adapters retain that input and deliver it in
+  the fresh context, after the handoff task and in arrival order; consecutive messages may be
+  merged into one replay. Only an explicit abort/cancel or a mechanism failure (marker,
+  phase or session identity mismatch) terminates a handoff, and an aborted handoff discards
+  its retained input instead of replaying it later.
 
 ## Request fields
 

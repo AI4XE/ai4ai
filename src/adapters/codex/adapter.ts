@@ -215,7 +215,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
       };
     }
     try {
-      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.5' } });
+      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.6' } });
       const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
       if (!resolution.ok) {
         return {
@@ -490,7 +490,7 @@ async function nativeCompactHandoff(
   ctx: AdapterContext,
   markMutated: () => void,
 ): Promise<NativeOutcome> {
-  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.5' } });
+  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.6' } });
   const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
   if (!resolution.ok) throw new NoLiveThread(resolution.reason);
   const thread = resolution.thread.id;

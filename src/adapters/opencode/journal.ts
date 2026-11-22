@@ -4,6 +4,7 @@ import { atomicJson, bytes, contained, digest, ownership, withScopeLock } from '
 import { result } from '../../contract/validate.js';
 import { handoffOutcome } from '../../contract/states.js';
 import { fingerprint } from '../../core/fingerprint.js';
+import { activeRecord } from '../../core/journal.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 
 export type OpenCodePhase = 'pending' | 'scheduled' | 'applied' | 'completed' | 'cancelled' | 'failed' | 'unknown';
@@ -99,7 +100,9 @@ export class OpenCodeJournal {
       if (request.operation !== 'handoff') return { result: result(request, 'unsupported', 'This OpenCode plugin implements in-session handoff only; use the external CLI for executors') };
       if (request.target !== 'self') return { result: result(request, 'unsupported', 'Only self-handoff is implemented in the in-session plugin') };
       if (request.mode === 'compact') return { result: result(request, 'unsupported', 'OpenCode handoff replaces the window with only the task material; a history summary (compact) is not implemented') };
-      const active = records.find(record => !['completed', 'cancelled', 'failed', 'unknown'].includes(record.phase));
+      // Revisions accumulate in the ledger: only the latest revision of an
+      // operation id decides whether a handoff is still unresolved.
+      const active = activeRecord(records, record => ['completed', 'cancelled', 'failed', 'unknown'].includes(record.phase));
       if (active) return { result: result(request, 'failed', 'Another handoff is unresolved; reconcile it first') };
       const token = crypto.randomUUID().replaceAll('-', '');
       const record: OpenCodeRecord = {

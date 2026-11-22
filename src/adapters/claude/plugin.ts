@@ -1,5 +1,6 @@
-import type { Register, CoreEngineInterface, SessionMessage } from 'claude-code';
+import type { Register, CoreEngineInterface } from 'claude-code';
 import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
+import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
 
 /**
  * The Claude hooks module is evaluated in a sandbox that allows relative
@@ -23,10 +24,12 @@ interface Runtime {
   /** Journal write started by the compact hook; the pump awaits it before delivery. */
   replacement?: Promise<unknown> | undefined;
   turnId: string;
-  expectedWindow: string;
   appliedHere: boolean;
   delivery?: { text: string; operationId: string; marker: string; invalid: boolean; adopted: boolean };
+  /** Native turn that admitted the delivery; its completion replays retained input. */
   admissionTurn?: string;
+  /** Real user input retained while the handoff window is open. */
+  retained: RetainedInput;
 }
 
 const tool = 'mcp__ai4ai__session';
@@ -104,9 +107,11 @@ async function resolveBinding($: any): Promise<{ binding: NativeBinding; path: s
   }
   return undefined;
 }
-const projection = (rows: readonly SessionMessage[]): string => JSON.stringify(rows.map((message: SessionMessage) => ({
-  role: message.role, text: message.text, toolUses: message.toolUses, toolResults: message.toolResults ?? [],
-})));
+/** The handoff window: accepted but not yet completed. */
+const HANDOFF_WINDOW = ['pending', 'scheduled', 'applied'];
+const TERMINAL = ['cancelled', 'failed', 'unknown'];
+const RETAINED_SCOPE = 'handoff';
+const inHandoffWindow = (s: Runtime): boolean => !!s.active && HANDOFF_WINDOW.includes(String(s.active.phase));
 
 async function rpc($: CoreEngineInterface, node: string, payload: object, bindingPath?: string): Promise<any> {
   let marker: string | undefined;
@@ -120,7 +125,12 @@ async function rpc($: CoreEngineInterface, node: string, payload: object, bindin
       ? /^AI4AI native context binding: (ai4ai-context-[a-f0-9-]{36})\nFresh execution context\..*$/s.exec(text)?.[1]
       : undefined;
   } catch { /* the transcript is unavailable in some lifecycle phases */ }
-  return rpcWith($, node, { ...payload, ...(marker ? { marker } : {}) }, bindingPath);
+  // The transcript marker is generation authority for calls that have none of
+  // their own (binding/inspect/request). A transition already carries the
+  // target record's marker; overriding it with the current window's marker
+  // would reject every handoff after the first one.
+  const authority = marker && (payload as { marker?: unknown }).marker === undefined ? { marker } : {};
+  return rpcWith($, node, { ...payload, ...authority }, bindingPath);
 }
 
 async function rpcWith($: CoreEngineInterface, node: string, payload: Record<string, unknown>, bindingPath?: string): Promise<any> {
@@ -145,7 +155,12 @@ async function transition($: CoreEngineInterface, current: Runtime, phase: strin
     caller: from, action: 'transition', operationId: current.active.operationId,
     marker: current.active.marker, phase, reason, ...extra,
   }, current.bindingPath);
-  if (out.record) current.active = out.record;
+  if (out.record) {
+    current.active = out.record;
+    // A cancelled, failed or uncertain handoff terminates the window; retained
+    // input belongs to the abandoned transition and is never replayed later.
+    if (TERMINAL.includes(String(out.record.phase))) current.retained.clear(RETAINED_SCOPE);
+  }
   return out;
 }
 async function bindNative($: CoreEngineInterface, s: Runtime): Promise<void> {
@@ -176,13 +191,28 @@ function admitted(s: Runtime): boolean {
     || (s.active?.phase === 'applied' && s.active.operationId === s.delivery.operationId && s.binding?.generation === s.delivery.marker));
 }
 
+/**
+ * Replay input retained during the handoff. The queue is drained before the
+ * submit so one message is never delivered twice; a submit failure is logged
+ * and not retried, because the host may already have accepted it.
+ */
+async function replayRetained($: CoreEngineInterface, s: Runtime): Promise<void> {
+  const entries = s.retained.take(RETAINED_SCOPE);
+  if (entries.length === 0) return;
+  const text = `AI4AI retained user input from during the handoff. Act on it now.\n${mergeRetained(entries)}`;
+  try {
+    await $.prompt.submit({ text });
+  } catch (error: any) {
+    dbg($, 'retained input replay failed: ' + String(error?.message ?? error));
+  }
+}
+
 
 /** Schedule the native context replacement and deliver the task; callable from a hook. */
 async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
   if (s.busy || s.pumping || s.active?.phase !== 'scheduled') return;
   s.pumping = true;
   try {
-    try { s.expectedWindow = projection(await $.session.messages()); } catch { s.expectedWindow = ''; }
     if (s.active?.phase !== 'scheduled') return;
     const mode = s.active.mechanism ?? s.active.request.mode ?? 'restart';
     if (mode !== 'restart') {
@@ -241,7 +271,7 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
 
 /** Native Claude Code mods: in-place handoff without a summarizer, daemon or history fork. */
 export const register: Register = on => {
-  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', expectedWindow: '', appliedHere: false };
+  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', appliedHere: false, retained: new RetainedInput() };
   let tail: Promise<unknown> = Promise.resolve();
   const serial = <T>(fn: () => Promise<T>): Promise<T> => { const pending = tail.then(fn); tail = pending.catch(() => undefined); return pending; };
 
@@ -287,8 +317,6 @@ export const register: Register = on => {
           s.binding = { ...s.binding!, generation: s.delivery.marker };
           await transition($, s, 'completed', 'Successor adopted the replaced context; handoff complete');
         }
-      } else if (s.active && !['completed', 'cancelled', 'failed', 'unknown'].includes(s.active.phase)) {
-        await transition($, s, 'cancelled', 'A different native turn started before successor admission; delivery was not executed');
       }
     });
     return next(e);
@@ -297,6 +325,7 @@ export const register: Register = on => {
   on('turn.complete', async ($: any, e: any, next: any) => {
     const out = await next(e);
     let pumpNow = false;
+    let replayNow = false;
     if (!e.agentId) await serial(async () => {
       dbg($, `turn.complete reason=${String(e.reason)} aborted=${String(e.isAborted)} phase=${String(s.active?.phase)}`);
       if (s.active?.phase === 'pending') {
@@ -306,11 +335,21 @@ export const register: Register = on => {
           pumpNow = true;
         }
       }
+      if (s.admissionTurn !== undefined && s.admissionTurn === e.turnId) {
+        // Adoption is complete. An aborted successor turn is an explicit stop:
+        // its retained input is discarded instead of silently driving a new turn.
+        delete s.admissionTurn;
+        if (e.isAborted || e.reason !== 'answer') s.retained.clear(RETAINED_SCOPE);
+        else replayNow = s.retained.count(RETAINED_SCOPE) > 0;
+      }
       s.busy = false;
     });
     // The native compact triggers our session.compact hook; never hold the
     // serial queue while it runs or the two wait on each other.
     if (pumpNow) await pump($, s);
+    // The replay starts a new native turn; the host resolves the submit when
+    // that turn starts, so the hook must not wait on it.
+    else if (replayNow) void replayRetained($, s);
     return out;
   });
 
@@ -337,10 +376,6 @@ export const register: Register = on => {
       if (s.active.phase !== 'scheduled') return refuse(`handoff phase is ${String(s.active.phase)}`);
       if (e.instructions !== s.active.marker) return refuse('marker does not match the owned intent');
       if (s.busy) return refuse('the plugin is busy with another native turn');
-      let observed = '';
-      try { observed = projection(e.messages ?? []); }
-      catch { return refuse('the native window could not be read'); }
-      if (s.expectedWindow !== '' && observed !== s.expectedWindow) return refuse('the native window changed since scheduling');
       s.appliedHere = true;
       s.replacement = transition($, s, 'applied', 'Native compact hook supplied a fresh task window; successor adoption pending');
       return {
@@ -359,7 +394,8 @@ export const register: Register = on => {
   });
 
   on('prompt.submit', async ($: any, e: any, next: any) => {
-    const own = e.origin.kind === 'plugin' && e.origin.name === $.plugin.name;
+    const origin = e.origin ?? {};
+    const own = origin.kind === 'plugin' && origin.name === $.plugin.name;
     const isDelivery = own && String(e.text ?? '').startsWith('AI4AI handoff delivery ');
     const ownCompact = e.command?.name === 'compact' && e.command.args === s.active?.marker && s.pumping;
     try {
@@ -369,7 +405,15 @@ export const register: Register = on => {
         // it into a stale context.
         const allow = await serial(async () => e.text === s.delivery?.text && admitted(s) && await $.session.id() === s.binding?.session);
         if (!allow) return { drop: 'Superseded or uncertain AI4AI delivery; task not admitted' };
-      } else if (!ownCompact && !s.pumping) await serial(async () => { if (s.active && s.active.phase === 'pending') await transition($, s, 'cancelled', 'Later user input retained; handoff not replayed'); });
+      } else if (!own && !ownCompact) {
+        // A handoff is atomic once accepted: real user input never cancels it.
+        // Hold the prompt back and deliver it in the fresh context instead.
+        const retained = await serial(async () => {
+          if (!inHandoffWindow(s)) return false;
+          return s.retained.retain(RETAINED_SCOPE, e.text);
+        });
+        if (retained) return { drop: 'AI4AI handoff is in progress; the input was retained and will be delivered in the fresh context' };
+      }
     } catch {
       // Never fail open on the one path that injects handoff material.
       if (isDelivery) return { drop: 'AI4AI delivery admission failed closed; task not admitted' };
@@ -410,7 +454,12 @@ export const register: Register = on => {
       })();
       if (!s.binding) throw new Error('AI4AI native binding is unavailable');
       const out = await rpc($, s.node, { caller: s.binding, instance: s.instance, action: 'request', request, ...usage }, s.bindingPath);
-      if (out.record) s.active = out.record;
+      if (out.record) {
+        s.active = out.record;
+        // An explicit cancel/stop or a failed request ends the window; retained
+        // input is discarded with the abandoned transition.
+        if (TERMINAL.includes(String(out.record.phase))) s.retained.clear(RETAINED_SCOPE);
+      }
       dbg($, `tool result state=${String(out.result?.status)} record=${String(out.record?.phase)}`);
       return { result: JSON.stringify(out.result) };
     }).catch((error: any) => ({ result: JSON.stringify({ operation: e.operation, operationId: e.operationId, status: 'unknown', reason: 'AI4AI native handler failed: ' + String(error?.message ?? error).slice(0, 600), durable: false, modelVerification: 'unknown', verification: { model: 'unknown', context: 'reported' }, context: { window: null, used: null, percent: null, percentSource: null }, unavailable: [], notices: [] }) }));
