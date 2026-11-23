@@ -13,7 +13,7 @@ import { sessionActivity, sessionPointer } from '../../core/session-probe.js';
 import { effectiveDshSelection, foldDshSelection } from '../../core/dsh-selection.js';
 
 interface NativeMessage { id: string; role: string; content: { type: string; text?: string; id?: string; toolCallId?: string }[]; toolCallId?: string; isError?: boolean; source?: { kind: string; ai4ai?: JournalRecord } }
-interface NativeEvent { seq: number; type: string; data: NativeMessage & { name?: string; message?: NativeMessage; isError?: boolean }; sourceEventSeqs?: number[] }
+interface NativeEvent { seq: number; type: string; time?: number; data: NativeMessage & { name?: string; message?: NativeMessage; isError?: boolean }; sourceEventSeqs?: number[] }
 interface NativeSession {
   id: string; seq: number; inheritedEventCount: number;
   header: { cwd?: string; delegationDepth?: number };
@@ -47,6 +47,54 @@ const TOOL = 'ai4ai_session';
 const SOURCE = 'ai4ai-coordination';
 const rootAgent = (agent: NativeAgent): boolean => typeof agent.session.header.cwd === 'string' && agent.session.header.cwd.length > 0
   && agent.id === agent.session.id && [agent.session.header.delegationDepth ?? 0, agent.options.subagentDepth ?? 0].every(depth => depth === 0);
+
+/** The DSH profile this process is running (`dsh web ...`, `dsh headless ...`). */
+function currentDshProfile(): 'web' | 'headless' | 'tui' | undefined {
+  const surface = process.env.DSH_SURFACE;
+  if (surface === 'web' || surface === 'headless' || surface === 'tui') return surface;
+  const args = process.argv.slice(2);
+  for (let index = 0; index < args.length; index++) {
+    const value = args[index]!;
+    if (value === '--profile') {
+      const next = args[index + 1];
+      if (next === 'web' || next === 'headless' || next === 'tui') return next;
+      continue;
+    }
+    if (value === 'web' || value === 'headless' || value === 'tui') return value;
+  }
+  return undefined;
+}
+
+interface TurnSummary { turns: number; lastTurnOutcome: 'completed' | 'failed' | 'cancelled' | null; lastTurnAt: string | null; turnStartedAt: string | null }
+
+/**
+ * The native session already records `turn/start` and `turn/end`; a self status
+ * therefore has a real turn count instead of reporting the field unavailable.
+ */
+export function turnSummary(events: readonly NativeEvent[]): TurnSummary {
+  let turns = 0;
+  let lastTurnOutcome: TurnSummary['lastTurnOutcome'] = null;
+  let lastTurnAt: string | null = null;
+  let lastEndSeq = -1;
+  let turnStartedAt: string | null = null;
+  for (const event of events) {
+    if (event.type === 'turn/end') {
+      turns++;
+      lastEndSeq = event.seq;
+      const data = event.data as unknown as { reason?: { kind?: string } };
+      const kind = data?.reason?.kind;
+      lastTurnOutcome = kind === 'completed' ? 'completed' : kind === 'failed' ? 'failed' : kind === 'cancelled' || kind === 'canceled' ? 'cancelled' : null;
+      if (typeof event.time === 'number') lastTurnAt = new Date(event.time).toISOString();
+    } else if (event.type === 'turn/start') {
+      turnStartedAt = typeof event.time === 'number' ? new Date(event.time).toISOString() : null;
+    }
+  }
+  if (lastEndSeq >= 0 && events.length > 0) {
+    const lastStart = [...events].reverse().find(event => event.type === 'turn/start');
+    turnStartedAt = lastStart && lastStart.seq > lastEndSeq ? (typeof lastStart.time === 'number' ? new Date(lastStart.time).toISOString() : null) : null;
+  }
+  return { turns, lastTurnOutcome, lastTurnAt, turnStartedAt };
+}
 
 function identity(agent: NativeAgent): Identity {
   return {
@@ -89,6 +137,17 @@ function journal(events: readonly NativeEvent[], session: NativeSession): Locate
 }
 
 const latest = (records: readonly Located[], id: string): Located | undefined => records.findLast(entry => entry.record.operationId === id);
+
+/**
+ * INFRA-085 C: an `intent` blocks a new handoff only while it is the latest
+ * revision of its operation. Historical intents superseded by applied,
+ * cancelled or failed revisions must never block forever.
+ */
+export function hasUnresolvedIntent(records: readonly { record: Pick<JournalRecord, 'operationId' | 'phase'> }[]): boolean {
+  const latestByOperation = new Map<string, string>();
+  for (const entry of records) latestByOperation.set(entry.record.operationId, entry.record.phase);
+  return [...latestByOperation.values()].some(phase => phase === 'intent');
+}
 
 function receipt(request: Request, record: JournalRecord, durable: boolean): Result {
   const status = record.phase === 'intent' ? 'pending' : record.phase === 'blocked' ? 'unknown' : record.phase === 'applied' ? (durable ? 'completed' : 'applied') : record.phase;
@@ -165,7 +224,7 @@ export function apply(ctx: DshContext): () => void {
         const events = await snapshot(session);
         const records = journal(events, session);
         const stored = latest(records, request.operationId);
-        if (request.operation === 'spawn' || request.operation === 'list' || request.operation === 'message' || (request.target !== undefined && request.target !== 'self')) {
+        if (request.operation === 'spawn' || request.operation === 'list' || request.operation === 'message' || request.operation === 'finish' || (request.target !== undefined && request.target !== 'self')) {
           const store = await Ai4aiStore.open(process.env.DSH_HOME ?? process.cwd());
           return execute(request, { home: process.env.DSH_HOME ?? process.cwd(), identity: caller, adapter: new DshAdapter(), store, ...(process.env.AI4AI_EXECUTOR_ID ? { executorId: process.env.AI4AI_EXECUTOR_ID } : {}) });
         }
@@ -191,7 +250,9 @@ export function apply(ctx: DshContext): () => void {
               }
             }
           }
-          const details = await resolveDshStatus(agent.session.header.cwd ?? caller.workspace, session.id, native, process.env.DSH_HOME);
+          const profile = currentDshProfile();
+          const details = await resolveDshStatus(agent.session.header.cwd ?? caller.workspace, session.id, native, process.env.DSH_HOME, profile ? { profile } : {});
+          const turns = turnSummary(events);
           const base = stored
             ? receipt(request, stored.record, await durable(session))
             : result(request, 'completed', 'No handoff has been started for this session', { durable: true, state: 'running' });
@@ -210,6 +271,13 @@ export function apply(ctx: DshContext): () => void {
             verification: { model: details.modelVerification, context: details.context.percentSource === 'native' ? 'native' : 'derived' },
             context: details.context,
             ...(details.autoCompact ? { autoCompact: details.autoCompact } : {}),
+            ...(details.runtimeVersion ? { runtimeVersion: details.runtimeVersion } : {}),
+            processState: 'alive',
+            turns: turns.turns,
+            queuedTurns: 0,
+            lastTurnOutcome: turns.lastTurnOutcome,
+            ...(turns.lastTurnAt ? { lastTurnAt: turns.lastTurnAt } : {}),
+            ...(turns.turnStartedAt ? { turnStartedAt: turns.turnStartedAt } : {}),
             ...reconciled,
           };
         }
@@ -224,7 +292,7 @@ export function apply(ctx: DshContext): () => void {
         if (request.operation !== 'handoff' || request.target !== 'self') return result(request, 'unsupported', 'This DSH plugin implements task-seeded self-handoff; use the external control plane for executors');
         if (request.mode === 'compact') return result(request, 'unsupported', 'DSH handoff replaces the context with only the task material; a history summary (compact) is not implemented');
         if (stored) return receipt(request, stored.record, await durable(session));
-        if (records.some(entry => entry.record.phase === 'intent')) return result(request, 'failed', 'Another handoff is unresolved; reconcile it before requesting a transition');
+        if (hasUnresolvedIntent(records)) return result(request, 'failed', 'Another handoff is unresolved; reconcile it before requesting a transition');
         // The fingerprint covers the canonical handoff request, and the exact
         // object is stored so the pre-step parser can reproduce it byte for
         // byte regardless of optional fields on the original request.

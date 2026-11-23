@@ -1,6 +1,6 @@
 /** Operations accepted by the contract. `stop` is an alias of `cancel`. */
 export const OPERATIONS = [
-  'handoff', 'spawn', 'status', 'message', 'cancel', 'stop', 'list', 'capabilities',
+  'handoff', 'spawn', 'status', 'message', 'cancel', 'stop', 'finish', 'list', 'capabilities',
 ] as const;
 export type Operation = typeof OPERATIONS[number];
 
@@ -19,12 +19,45 @@ export type State = typeof STATES[number];
 export const TERMINAL_STATES: readonly State[] = ['completed', 'cancelled', 'unsupported', 'unauthorized', 'forbidden', 'failed'];
 
 /**
- * Lifecycle vocabulary shared by a session and its executors. `state` always
- * uses these values; quiescence is described by `lastActivityAt`, never by a
- * separate `idle` state.
+ * Lifecycle vocabulary shared by a session and its executors. `idle` is a
+ * first-class, non-terminal state: the supervisor and (for resident carriers)
+ * the harness process are alive, no turn is running, and queued turns may
+ * exist. It is never a completion signal; use `finish` to complete an executor
+ * and `stop` to cancel it.
  */
-export const LIFECYCLE_STATES = ['running', 'completed', 'failed', 'cancelled', 'unknown'] as const;
+export const LIFECYCLE_STATES = ['running', 'idle', 'completed', 'failed', 'cancelled', 'unknown'] as const;
 export type LifecycleState = typeof LIFECYCLE_STATES[number];
+
+/** Process liveness, independent of the lifecycle state. */
+export const PROCESS_STATES = ['alive', 'orphaned', 'dead', 'unknown'] as const;
+export type ProcessState = typeof PROCESS_STATES[number];
+
+/** Persistence model requested for a spawned executor. */
+export const PERSISTENCE_MODES = ['one-shot', 'persistent'] as const;
+export type PersistenceMode = typeof PERSISTENCE_MODES[number];
+export const DEFAULT_PERSISTENCE: PersistenceMode = 'one-shot';
+
+/** Surfaces a spawn carrier can use. */
+export const SPAWN_SURFACES = ['headless', 'web'] as const;
+export type SpawnSurface = typeof SPAWN_SURFACES[number];
+
+/** Permission modes a carrier can accept; interactive modes are refused. */
+export const PERMISSION_MODES = ['bypassPermissions', 'dontAsk'] as const;
+export type PermissionMode = typeof PERMISSION_MODES[number];
+
+/** Event observation level a harness declares. */
+export const EVENT_LEVELS = ['normalized', 'raw', 'unsupported'] as const;
+export type EventLevel = typeof EVENT_LEVELS[number];
+
+/** Normalized event kinds (event v1). */
+export const EVENT_KINDS = ['message', 'tool', 'result', 'error', 'progress', 'system', 'unmapped'] as const;
+export type EventKind = typeof EVENT_KINDS[number];
+export const EVENT_ROLES = ['user', 'assistant', 'system', 'tool'] as const;
+export type EventRole = typeof EVENT_ROLES[number];
+
+/** Outcome of one executor turn, reported by the supervisor ledger. */
+export const TURN_OUTCOMES = ['completed', 'failed', 'cancelled'] as const;
+export type TurnOutcome = typeof TURN_OUTCOMES[number];
 
 /** Native handoff phases exposed separately from the lifecycle state. */
 export const HANDOFF_PHASES = ['pending', 'scheduled', 'applied', 'completed'] as const;
@@ -103,9 +136,12 @@ export const PERCENT_SOURCE = ['native', 'derived'] as const;
 export type PercentSource = typeof PERCENT_SOURCE[number];
 
 /** Closed vocabulary for per-field state reporting. */
-export const FIELD_STATE_KEYS = ['model', 'reasoningEffort', 'context.window', 'context.used', 'context.percent', 'context.autoCompact'] as const;
+export const FIELD_STATE_KEYS = [
+  'model', 'reasoningEffort', 'context.window', 'context.used', 'context.percent',
+  'context.autoCompact',
+] as const;
 export type FieldStateKey = typeof FIELD_STATE_KEYS[number];
-export const FIELD_STATE_VALUES = ['unsupported', 'unavailable', 'unknown'] as const;
+export const FIELD_STATE_VALUES = ['unsupported', 'unavailable', 'unknown', 'disabled'] as const;
 
 /**
  * Provenance labels for a value obtained through the source ladder.
@@ -115,7 +151,7 @@ export const FIELD_STATE_VALUES = ['unsupported', 'unavailable', 'unknown'] as c
  */
 export const SOURCE_LABELS = ['native', 'session', 'env', 'config', 'config:project', 'config:user', 'derived', 'unknown'] as const;
 export type SourceLabel = typeof SOURCE_LABELS[number];
-export const AUTOCOMPACT_SOURCES = ['native', 'session', 'env', 'config', 'config:project', 'config:user', 'unknown'] as const;
+export const AUTOCOMPACT_SOURCES = ['native', 'session', 'env', 'config', 'config:project', 'config:user', 'default', 'unknown'] as const;
 export type AutoCompactSource = typeof AUTOCOMPACT_SOURCES[number];
 export type FieldStateValue = typeof FIELD_STATE_VALUES[number];
 

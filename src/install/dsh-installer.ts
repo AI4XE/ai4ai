@@ -24,6 +24,17 @@ export interface InstallResult {
   state: 'installed' | 'already-installed' | 'uninstalled' | 'already-uninstalled' | 'unknown' | 'failed';
   reason: string;
   discoveryRequired: boolean;
+  target?: string;
+}
+export interface DshProfileInspection {
+  profile: string;
+  state: 'installed' | 'partial' | 'absent';
+  declared: boolean;
+  bundled: boolean;
+  module: boolean;
+  owned: boolean;
+  version?: string;
+  reason?: string;
 }
 interface FileEntry { file: string; sha256: string }
 interface Snapshot { id: string; version: string; files: FileEntry[]; directory: string }
@@ -47,7 +58,7 @@ interface ProfilePackage {
 }
 class NativeLaunchError extends Error {}
 const OTHER_DEPENDENCIES = ['devDependencies', 'optionalDependencies', 'peerDependencies'] as const;
-const response = (state: InstallResult['state'], reason: string, discoveryRequired = false): InstallResult => ({ state, reason, discoveryRequired });
+const response = (state: InstallResult['state'], reason: string, discoveryRequired = false, target?: string): InstallResult => ({ state, reason, discoveryRequired, ...(target ? { target } : {}) });
 function profileName(value: string): void {
   if (value === 'node_modules' || !/^[\p{L}\p{N}][\p{L}\p{N}_. -]{0,63}$/u.test(value) || /[. ]$/.test(value) || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(value)) throw new Error('Invalid native profile name');
 }
@@ -282,16 +293,26 @@ export async function installDsh(options: InstallOptions): Promise<InstallResult
   const home = await selectedRoot(options.home);
   await guardProfileDestinations(home, options.profile);
   const owned = await ownership(home);
-  return withScopeLock(owned.root, owned.owner, async () => {
-    const parent = path.join(owned.root, 'dsh');
-    await contained(owned.root, parent); await mkdir(parent, { recursive: true, mode: 0o700 });
-    const root = path.join(parent, options.profile);
-    await contained(owned.root, root);
-    let created = false;
-    try { await mkdir(root, { mode: 0o700 }); created = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  // The scope lock is taken per DSH profile: `install()` may already hold the
+  // installation-home lock (for example when the managed home IS DSH_HOME), and
+  // two profiles are independent destinations that do not need to serialize.
+  const parent = path.join(owned.root, 'dsh');
+  await contained(owned.root, parent); await mkdir(parent, { recursive: true, mode: 0o700 });
+  const root = path.join(parent, options.profile);
+  await contained(owned.root, root);
+  const target = path.join(home, 'profiles', options.profile);
+  const preexisting = existsSync(root);
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  return withScopeLock(root, owned.owner, async () => {
     const manifest = path.join(root, 'installation.json');
-    if (created) await atomicJson(owned.root, manifest, { product: 'ai4ai', format: 1, token: owned.owner.token, harness: 'dsh', profile: options.profile, phase: 'absent' }, undefined);
     let raw = await bytes(manifest);
+    if (!raw) {
+      // An existing profile directory without an ownership baseline is foreign
+      // state, not ours to initialize.
+      if (preexisting) throw new Error('Missing profile ownership baseline');
+      await atomicJson(owned.root, manifest, { product: 'ai4ai', format: 1, token: owned.owner.token, harness: 'dsh', profile: options.profile, phase: 'absent' }, undefined);
+      raw = await bytes(manifest);
+    }
     if (!raw) throw new Error('Missing profile ownership baseline');
     let state = JSON.parse(raw.toString()) as Installation;
     if (state.product !== 'ai4ai' || state.format !== 1 || state.token !== owned.owner.token || state.harness !== 'dsh' || state.profile !== options.profile || !['absent', 'installed', 'mutating'].includes(state.phase)) throw new Error('Foreign or incompatible installation manifest');
@@ -302,6 +323,7 @@ export async function installDsh(options: InstallOptions): Promise<InstallResult
       // Unknown child delivery is reconciled, not automatically repeated.
       if (state.nativeExit === 0 && state.action === 'install' && state.pending && await installed(home, options.profile, state.pending)) {
         await save({ product: 'ai4ai', format: 1, token: owned.owner.token, harness: 'dsh', profile: options.profile, phase: 'installed', active: state.pending });
+        return response('installed', 'Reconciled a completed native installation', true, target);
       } else if (state.nativeExit === 0 && state.action === 'uninstall') {
         const after = await profilePackage(home, options.profile);
         if (after.dependencies?.ai4ai !== undefined || after.dsh?.profile?.bundles?.includes('ai4ai')) return response('unknown', 'Native removal is not reconciled; no retry performed');
@@ -339,7 +361,7 @@ export async function installDsh(options: InstallOptions): Promise<InstallResult
     const source = path.resolve(options.packageRoot ?? fileURLToPath(new URL('../../', import.meta.url)));
     const item = await snapshot(root, source, owned.owner.token);
     const next: Registration = { ...item, spec: `file:${item.directory.split(path.sep).join('/')}` };
-    if (state.active?.id === next.id && state.phase === 'installed') return response('already-installed', 'Owned native registration and installed bytes already match', true);
+    if (state.active?.id === next.id && state.phase === 'installed') return response('already-installed', 'Owned native registration and installed bytes already match', true, target);
     const previous = state;
     await save({ ...state, phase: 'mutating', action: 'install', pending: next });
     let outcome: NativeMutationResult;
@@ -352,7 +374,7 @@ export async function installDsh(options: InstallOptions): Promise<InstallResult
     await save({ ...state, pending: applied, nativeExit: exit, ...(outcome.diagnostics ? { nativeDiagnostics: outcome.diagnostics } : {}) });
     if (exit === 0 && await installed(home, options.profile, applied)) {
       await save({ product: 'ai4ai', format: 1, token: owned.owner.token, harness: 'dsh', profile: options.profile, phase: 'installed', active: applied });
-      return response('installed', 'Native package and bundle registered; restart normally and verify model-visible discovery', true);
+      return response('installed', 'Native package and bundle registered; restart normally and verify model-visible discovery', true, target);
     }
     if (exit !== null && previous.active && await installed(home, options.profile, previous.active)) { await save(previous); return response('failed', 'Native update failed; previous owned payload is verified intact'); }
     if (exit !== null && exit !== 0 && !previous.active) {
@@ -367,4 +389,56 @@ export async function installDsh(options: InstallOptions): Promise<InstallResult
     }
     return response('unknown', `Native install outcome is unresolved (exit=${exit}); no repeat, cleanup or rollback performed`);
   });
+}
+
+/** Read a JSON object without throwing on missing/damaged files or package-manager links. */
+async function jsonObject(file: string): Promise<Record<string, any> | undefined> {
+  try {
+    // Inspection is read-only: following the profile's package-manager links is
+    // required here (pnpm links node_modules/ai4ai), unlike mutation guards.
+    const value = JSON.parse(await readFile(file, 'utf8')) as unknown;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    return value as Record<string, any>;
+  } catch { return undefined; }
+}
+
+/**
+ * Read-only coverage of ai4ai in DSH profiles. `installed` means the profile
+ * declares the plugin, bundles it, carries the native module and matches an
+ * owned installation record; anything in between is `partial` and must be
+ * reported so a half-installed DSH is never mistaken for a complete one.
+ */
+export async function inspectDshProfiles(home: string, profiles: readonly string[]): Promise<DshProfileInspection[]> {
+  const root = path.resolve(home);
+  const output: DshProfileInspection[] = [];
+  for (const profile of profiles) {
+    const directory = path.join(root, 'profiles', profile);
+    const pkg = await jsonObject(path.join(directory, 'package.json'));
+    if (!pkg) {
+      output.push({ profile, state: 'absent', declared: false, bundled: false, module: false, owned: false, reason: 'profile is not initialized' });
+      continue;
+    }
+    const declared = ['dependencies', ...OTHER_DEPENDENCIES].some(field => (pkg[field] as Record<string, unknown> | undefined)?.ai4ai !== undefined);
+    const bundled = Array.isArray(pkg.dsh?.profile?.bundles) && (pkg.dsh.profile.bundles as unknown[]).includes('ai4ai');
+    const modulePkg = await jsonObject(path.join(directory, 'node_modules', 'ai4ai', 'package.json'));
+    const version = typeof modulePkg?.version === 'string' ? modulePkg.version : undefined;
+    const manifest = await jsonObject(path.join(root, '.ai4ai', 'dsh', profile, 'installation.json'));
+    const owned = manifest?.product === 'ai4ai' && manifest?.phase === 'installed'
+      && typeof manifest?.active?.version === 'string' && manifest.active.version === version;
+    if (declared && bundled && modulePkg && owned) {
+      output.push({ profile, state: 'installed', declared, bundled, module: true, owned, ...(version ? { version } : {}) });
+      continue;
+    }
+    if (!declared && !bundled && !modulePkg) {
+      output.push({ profile, state: 'absent', declared, bundled, module: false, owned: false, reason: 'profile has no ai4ai registration' });
+      continue;
+    }
+    const reasons: string[] = [];
+    if (!declared) reasons.push('not listed in the profile dependencies');
+    if (!bundled) reasons.push('not listed in dsh.profile.bundles');
+    if (!modulePkg) reasons.push('the native module is missing');
+    if (!owned) reasons.push('the owned installation record is missing or stale');
+    output.push({ profile, state: 'partial', declared, bundled, module: Boolean(modulePkg), owned, ...(version ? { version } : {}), reason: reasons.join('; ') });
+  }
+  return output;
 }

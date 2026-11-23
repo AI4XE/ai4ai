@@ -126,6 +126,16 @@ export class DshAdapter extends ExternalExecutorAdapter {
    */
   async spawn(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     const unavailable: string[] = [];
+    if (request.spawn?.profile !== undefined || request.spawn?.surface === 'web') {
+      // `dsh <profile>` selects the app: a headless carrier cannot use the web
+      // profile, and the web app has no headless task protocol (INFRA-084).
+      // Refuse instead of silently booting the wrong profile.
+      return {
+        status: 'unsupported',
+        reason: 'DSH detached carriers boot the headless profile only; spawn.profile and the web surface are not implemented (dual-profile installation is the documented fallback)',
+        unavailable: ['spawn.profile', 'spawn.surface.web'],
+      };
+    }
     if (request.model !== undefined) unavailable.push('spawn.model');
     if (request.reasoningEffort !== undefined) unavailable.push('spawn.reasoningEffort');
     if (unavailable.length) {
@@ -165,36 +175,50 @@ export class DshAdapter extends ExternalExecutorAdapter {
     // Windows use the DSH_HOME credential chain (OPENCODE_API_KEY) rather than
     // a clean profile without credentials. On Windows the installer needs the
     // real JS entry (AI4AI_DSH_ENTRY) because a .cmd entry is refused, but the
-    // carrier also accepts a .cmd wrapper. The Web surface was exercised through
-    // the Web UI on all three platforms (isolated profiles, no live restart).
+    // carrier also accepts a .cmd wrapper. The Web interface was exercised as an
+    // orchestration host on isolated dual-profile homes (never the live 3091).
     const linux = os === 'linux';
     const mac = os === 'darwin';
     const windows = os === 'windows';
     const reason = linux
-      ? 'Detached dsh headless carriers were exercised with a real session and usage reporting; the Cordis plugin implements same-session surface replacement and the handoff journal/apply/successor path is verified. The Web surface was exercised through the Web UI (capabilities/status/list/spawn/status-poll/stop and a same-session handoff). spawn model/effort overrides are unsupported.'
+      ? 'Detached dsh headless carriers were exercised with a real session and usage reporting; the Cordis plugin implements same-session surface replacement and the handoff journal/apply/successor path is verified. The Web interface was exercised as an orchestration host on an isolated dual-profile home: self status/handoff in the web session, then ai4ai spawn/status/message/stop of a detached headless executor. spawn model/effort overrides are unsupported.'
       : mac
-        ? 'macOS headless handoff was exercised with a real provider from the DSH_HOME credential chain: the model invoked ai4ai_session itself, the successor turn ran in the same session with surface-replacement proof, and the detached carrier completed spawn/status/message×2/stop/error. The Web surface was exercised through the Web UI on an isolated profile (capabilities/status/list/spawn/message two turns in one session/stop/error). spawn model/effort overrides are unsupported.'
-        : 'Native Windows headless handoff, spawn/status/message×2/stop/error and the .cmd carrier were exercised with the DSH plugin-manager profile and the real JS entry (AI4AI_DSH_ENTRY); the installer refuses a .cmd entry but succeeds with the JS entry. The Web surface was exercised through the Web UI on an isolated profile (capabilities/status/list/spawn/message two turns in one session/stop/error). spawn model/effort overrides are unsupported.';
+        ? 'macOS headless handoff was exercised with a real provider from the DSH_HOME credential chain: the model invoked ai4ai_session itself, the successor turn ran in the same session with surface-replacement proof, and the detached carrier completed spawn/status/message×2/stop/error. The Web interface was exercised as an orchestration host on an isolated dual-profile home: self status/handoff in the web session, then ai4ai spawn/status/message/stop of a detached headless executor. spawn model/effort overrides are unsupported.'
+        : 'Native Windows headless handoff, spawn/status/message×2/stop/error and the .cmd carrier were exercised with the DSH plugin-manager profile and the real JS entry (AI4AI_DSH_ENTRY); the installer refuses a .cmd entry but succeeds with the JS entry. The Web interface was exercised as an orchestration host on an isolated dual-profile home: self status/handoff in the web session, then ai4ai spawn/status/message/stop of a detached headless executor. spawn model/effort overrides are unsupported.';
     const carrier = 'supported' as const;
     const headlessHandoff = 'supported' as const;
     const webLevel = 'supported' as const;
     const headless = {
       handoff: { availability: headlessHandoff, modes: ['restart'] as ('compact' | 'restart')[] },
-      spawn: { availability: carrier, maxConcurrent: 4 },
+      spawn: {
+        availability: carrier, maxConcurrent: 4,
+        persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
+        surfaces: ['headless'] as ('headless' | 'web')[],
+        permissionModes: [] as ('bypassPermissions' | 'dontAsk')[],
+        mcpFilter: 'not-tested' as const,
+      },
+      events: 'normalized' as const,
       status: { availability: carrier, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: carrier, percentSource: 'derived' as const },
-      evidence: `matrix:dsh/${os}/headless/2026-11-21`,
+      evidence: `matrix:dsh/${os}/headless/2026-11-22`,
     };
     const web = {
       handoff: { availability: webLevel, modes: ['restart'] as ('compact' | 'restart')[] },
-      spawn: { availability: webLevel, maxConcurrent: 4 },
-      status: { availability: webLevel, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: webLevel, percentSource: 'native' as const },
-      evidence: `matrix:dsh/${os}/web/2026-11-21`,
+      spawn: {
+        availability: webLevel, maxConcurrent: 4,
+        persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
+        surfaces: ['headless'] as ('headless' | 'web')[],
+        permissionModes: [] as ('bypassPermissions' | 'dontAsk')[],
+        mcpFilter: 'not-tested' as const,
+      },
+      events: 'normalized' as const,
+      status: { availability: webLevel, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: webLevel, percentSource: 'derived' as const },
+      evidence: `matrix:dsh/${os}/web/2026-11-23`,
     };
     const webReason = linux
-      ? 'The Linux Web surface was exercised through the Web UI: ai4ai_session capabilities/status/list/spawn/status-poll/stop completed, and a Web handoff completed in the same session with the old codeword absent from the replaced context. The live Web profile runs 0.0.5 and is healthy. spawn model/effort overrides are unsupported.'
+      ? 'The Linux Web interface is an orchestration host, not an executor carrier: ai4ai_session self status/handoff completed inside the web session, and the adapted Parallax team flow ran from that session through ai4ai spawn -> persistent headless executors (dual-profile install), a forced rotation (stop, spawn, message), finish and the completion receipt. spawn.surface "web" stays structurally unsupported; detached carriers boot the headless profile. spawn model/effort overrides are unsupported.'
       : mac
-        ? 'The macOS Web surface was exercised through the Web UI on an isolated web profile: ai4ai_session capabilities/status/list/spawn/message/status-poll/stop completed, the message was accepted into the running executor and its second turn replied in the same session, and the unauthorized target returned a structured error. The live Web profile runs 0.0.5 and is healthy. spawn model/effort overrides are unsupported.'
-        : 'The native Windows Web surface was exercised through the Web UI on an isolated web profile: ai4ai_session capabilities/status/list/spawn/message/status-poll/stop completed, the message was queued into the running executor and its second turn replied in the same session, and the unauthorized target returned a structured error. The live Web profiles run 0.0.5 and are healthy. spawn model/effort overrides are unsupported.';
+        ? 'The macOS Web interface is an orchestration host, not an executor carrier: self status/handoff completed inside the web session, and the adapted Parallax solo and team flows ran from that session through ai4ai spawn -> headless executors (dual-profile install) with message, stop/finish and the receipts. spawn.surface "web" stays structurally unsupported. spawn model/effort overrides are unsupported.'
+        : 'The native Windows Web interface is an orchestration host, not an executor carrier: self status/handoff completed inside the web session, and the adapted Parallax solo and team flows ran from that session through ai4ai spawn -> headless executors (dual-profile install) with message, stop/finish and the receipts. spawn.surface "web" stays structurally unsupported. spawn model/effort overrides are unsupported.';
     return [
       declaration({ harness: 'dsh', os, interface: 'headless', reason, ...headless }),
       declaration({ harness: 'dsh', os, interface: 'web', reason: webReason, ...web }),
@@ -245,13 +269,17 @@ export class DshAdapter extends ExternalExecutorAdapter {
       ? ['cacheReadTokens', 'cacheWriteTokens', 'cacheCreationTokens'].reduce((sum, key) => sum + (typeof usage[key] === 'number' ? usage[key] as number : 0), 0)
       : 0;
     let dshHome: string | undefined;
+    let dshEntry: string | undefined;
     try {
-      const spec = JSON.parse(await readFile(path.join(executorDir(ctx.home, record.executorId), 'spec.json'), 'utf8')) as { env?: Record<string, string> };
+      const spec = JSON.parse(await readFile(path.join(executorDir(ctx.home, record.executorId), 'spec.json'), 'utf8')) as { env?: Record<string, string>; args?: string[] };
       dshHome = spec.env?.DSH_HOME;
+      dshEntry = spec.env?.AI4AI_DSH_ENTRY ?? spec.args?.find(arg => typeof arg === 'string' && arg.endsWith('.js'));
     } catch { /* the environment may not be recorded */ }
+    // Detached executors always run the headless profile; the config layer must
+    // read that profile's patch and bundle defaults, not the web app's.
     return resolveDshStatus(ctx.identity.workspace, status.sessionId, {
       used: input === null ? null : verifiedTokens(input + cached),
-    }, dshHome);
+    }, dshHome, { profile: 'headless', ...(dshEntry ? { dshEntry } : {}) });
   }
 }
 

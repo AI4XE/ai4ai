@@ -6,6 +6,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ExecutorRecord } from '../core/store.js';
 import type { HarnessId, LifecycleState } from '../contract/states.js';
+import { spawnEnvironment } from '../core/env-policy.js';
+import { SUPERVISOR_PROTOCOL } from '../core/protocol.js';
 
 export interface LaunchSpec {
   executorId: string;
@@ -21,8 +23,21 @@ export interface LaunchSpec {
   sessionRegex?: string;
   /** The adapter pre-built the complete cmd.exe command line. */
   windowsVerbatimArguments?: boolean;
-  /** Protocol spoken by the supervisor launched here (2 = per-turn resume). */
+  /** Protocol spoken by the supervisor launched here (3 = idle + turn ledger). */
   supervisorProtocol?: number;
+  /** `one-shot` (default) or `persistent` (idle between turns). */
+  persistence?: 'one-shot' | 'persistent';
+  /** Inbox generation; a revival swaps the inbox and starts a new epoch. */
+  epoch?: number;
+  /** Receipt id for the first turn (spawn or a revival message). */
+  initialTurnId?: string;
+  /** Turn count carried across a revival (the ledger is cumulative). */
+  initialTurns?: number;
+  initialOperationId?: string;
+  /** The carrier keeps one interactive child alive across turns. */
+  resident?: boolean;
+  /** The native session this turn must stay in (same-session guard). */
+  expectedSessionId?: string;
 }
 
 export interface ExecutorStatus {
@@ -41,30 +56,95 @@ export interface ExecutorStatus {
   supervisorPid?: number;
   /** Supervisor protocol version; v0.0.3 supervisors omit it. */
   protocol?: number;
+  /** `running` while a turn executes, `idle` between turns (persistent only). */
+  turnState?: 'running' | 'idle';
+  persistence?: 'one-shot' | 'persistent';
+  lastOperationId?: string;
+  lastTurnAt?: string;
+  lastTurnOutcome?: 'completed' | 'failed' | 'cancelled';
+  queuedTurns?: number;
+  turnStartedAt?: string;
+  idleSince?: string;
+  epoch?: number;
+  resident?: boolean;
+  /** Supervisor-reported child identity (pid + start token/command hash). */
+  child?: { pid?: number; startToken?: string; commandHash?: string };
 }
 
 export interface LogLine { ts: string; stream: string; line: string }
 
+/** Liveness of the two processes that make up a detached executor. */
+export interface ExecutorLiveness {
+  /** Supervisor process (owns status.json, the inbox and the turn ledger). */
+  supervisorAlive?: boolean | null;
+  /** Harness child process (per-turn) or resident child. */
+  childAlive?: boolean | null;
+}
+
 /**
  * Collapse an internal supervisor status into the shared lifecycle vocabulary.
- * Liveness wins over a stale status-file claim: a live pid is running, and a
- * dead pid without a recorded clean exit is failed. A pid that cannot be
- * checked keeps the recorded terminal outcome or falls back to running.
+ *
+ * Liveness wins over a stale status-file claim, but which pid matters depends
+ * on the carrier: while `idle` the supervisor is alive and a per-turn child is
+ * expected to be dead, so the child must never turn a healthy idle executor
+ * into `failed`. A supervisor that is gone while the child still runs is an
+ * orphan, never `running`.
+ *
+ * The boolean overload treats the flag as "the executor's observed process is
+ * alive" and is kept for callers that only observe one pid.
  */
-export function lifecycleOfStatus(raw: ExecutorStatus | undefined, alive: boolean | null): LifecycleState {
+export function lifecycleOfStatus(raw: ExecutorStatus | undefined, alive: boolean | null | ExecutorLiveness): LifecycleState {
   if (!raw) return 'unknown';
-  if (alive === true) return 'running';
-  if (alive === false) {
-    return raw.state === 'stopped' ? 'cancelled'
-      : raw.state === 'exited' ? (raw.exitCode === 0 ? 'completed' : 'failed')
-      : 'failed';
-  }
-  return raw.state === 'exited' ? (raw.exitCode === 0 ? 'completed' : 'failed')
+  const liveness: ExecutorLiveness = typeof alive === 'object' && alive !== null ? alive : { childAlive: alive };
+  const supervisor = liveness.supervisorAlive;
+  const child = liveness.childAlive;
+  const recorded = (): LifecycleState => raw.state === 'exited' ? (raw.exitCode === 0 ? 'completed' : 'failed')
     : raw.state === 'failed' ? 'failed'
     : raw.state === 'stopped' || raw.state === 'cancelled' ? 'cancelled'
     : raw.state === 'completed' ? 'completed'
     : raw.state === 'unknown' ? 'unknown'
+    : raw.state === 'idle' ? 'idle'
     : 'running';
+  // Supervisor death is authoritative: a recorded terminal outcome stands, a
+  // non-terminal record is failed (or orphaned, which the caller reports).
+  if (supervisor === false) return recorded() === 'running' || recorded() === 'idle' ? 'failed' : recorded();
+  if (supervisor === true) {
+    if (raw.state === 'idle') return 'idle';
+    if (child === false) {
+      // Between turns a persistent supervisor writes `idle`; a `running` record
+      // whose child just exited is still the turn-boundary transient until
+      // `idle`/`turnState: "idle"` lands. Reporting `idle` early would race
+      // `message` against an unreported session id.
+      if (raw.state === 'idle' || raw.turnState === 'idle') return 'idle';
+      return recorded();
+    }
+    if (child === true) return 'running';
+    return recorded();
+  }
+  // Supervisor liveness unknown: fall back to the child observation and never
+  // invent `idle` or a failure from a stale file. Pre-protocol-3 executors have
+  // no supervisorPid, so their child is the only liveness signal.
+  if (child === true) return 'running';
+  if (child === false && raw.supervisorPid === undefined) {
+    const base = recorded();
+    return base === 'running' || base === 'idle' ? 'failed' : base;
+  }
+  return recorded();
+}
+
+/** Process liveness relative to the two pids; `unknown` fails closed. */
+export function processStateOf(raw: ExecutorStatus | undefined, liveness: ExecutorLiveness): { state: 'alive' | 'orphaned' | 'dead' | 'unknown'; reason?: string } {
+  if (!raw) return { state: 'unknown', reason: 'No supervisor status recorded' };
+  const { supervisorAlive, childAlive } = liveness;
+  if (supervisorAlive === true) return { state: 'alive' };
+  if (supervisorAlive === false) {
+    if (childAlive === true) return { state: 'orphaned', reason: 'Supervisor is dead but the harness child is still alive; run ai4ai sweep or a force stop' };
+    if (childAlive === false) return { state: 'dead' };
+    return { state: 'unknown', reason: 'Supervisor is dead and child liveness cannot be determined' };
+  }
+  if (childAlive === true) return { state: 'unknown', reason: 'Supervisor liveness cannot be determined' };
+  if (childAlive === false) return { state: 'unknown', reason: 'Supervisor liveness cannot be determined' };
+  return { state: 'unknown', reason: 'Liveness cannot be determined' };
 }
 
 export const executorRoot = (home: string): string => path.join(home, 'executors');
@@ -127,6 +207,11 @@ export async function readLog(home: string, executorId: string, lines = 200): Pr
 
 export interface QueuedTurn {
   inputFile?: string;
+  /** The turn must run in this native session; a different id is a failure. */
+  expectedSessionId?: string;
+  /** Receipt id returned by `message` and written to the turn ledger. */
+  turnId?: string;
+  operationId?: string;
   command?: string;
   args?: string[];
   windowsVerbatimArguments?: boolean;
@@ -163,18 +248,18 @@ export async function turnPlacement(home: string, executorId: string, name: stri
 }
 
 export async function requestStop(home: string, executorId: string): Promise<void> {
-  await writeAtomic(path.join(executorDir(home, executorId), 'control.json'), { stop: true, requestedAt: new Date().toISOString() });
+  await writeAtomic(path.join(executorDir(home, executorId), 'control.json'), { stop: true, finish: false, requestedAt: new Date().toISOString() });
 }
 
-export async function markStoppedIfDead(home: string, executorId: string, status: ExecutorStatus): Promise<ExecutorStatus> {
-  if (!status.pid || status.state !== 'running') return status;
-  try { process.kill(status.pid, 0); return status; }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return status;
-    const next = { ...status, state: 'exited', endedAt: status.endedAt ?? new Date().toISOString() };
-    await writeAtomic(path.join(executorDir(home, executorId), 'status.json'), next);
-    return next;
-  }
+/** Ask the supervisor to complete gracefully after the current turn (finish). */
+export async function requestFinish(home: string, executorId: string): Promise<void> {
+  await writeAtomic(path.join(executorDir(home, executorId), 'control.json'), { stop: false, finish: true, requestedAt: new Date().toISOString() });
+}
+
+/** Read the control file; a malformed/missing file means "no request". */
+export async function readControl(home: string, executorId: string): Promise<{ stop?: boolean; finish?: boolean }> {
+  try { return JSON.parse(await readFile(path.join(executorDir(home, executorId), 'control.json'), 'utf8')) as { stop?: boolean; finish?: boolean }; }
+  catch { return {}; }
 }
 
 // Provider credentials must reach the detached carrier through the supervisor's
@@ -198,27 +283,38 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
   await writeFile(path.join(directory, 'task.md'), task);
   const persisted = persistedEnv(spec.env);
   await writeAtomic(path.join(directory, 'spec.json'), {
+    harness: spec.harness,
     command: spec.command,
     args: spec.args,
     ...(persisted ? { env: persisted } : {}),
+    ...(spec.envExclude ? { envExclude: spec.envExclude } : {}),
     cwd: spec.cwd,
     inputFile: 'task.prompt',
     ...(spec.sessionRegex ? { sessionRegex: spec.sessionRegex } : {}),
     ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    supervisorProtocol: spec.supervisorProtocol ?? 2,
+    supervisorProtocol: spec.supervisorProtocol ?? SUPERVISOR_PROTOCOL,
+    persistence: spec.persistence ?? 'one-shot',
+    ...(spec.epoch ? { epoch: spec.epoch } : {}),
+    ...(spec.initialTurnId ? { initialTurnId: spec.initialTurnId } : {}),
+    ...(spec.initialTurns ? { initialTurns: spec.initialTurns } : {}),
+    ...(spec.initialOperationId ? { initialOperationId: spec.initialOperationId } : {}),
+    ...(spec.resident ? { resident: true } : {}),
+    ...(spec.expectedSessionId ? { expectedSessionId: spec.expectedSessionId } : {}),
   });
   // The task file the supervisor feeds on stdin is the plain prompt.
   await writeFile(path.join(directory, 'task.prompt'), task);
   await writeAtomic(path.join(directory, 'control.json'), { stop: false });
   const supervisor = fileURLToPath(new URL('./supervisor.js', import.meta.url));
   const runtime = resolveNodeRuntime();
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) if (value !== undefined && !spec.envExclude?.includes(key)) env[key] = value;
+  // The built-in environment policy (messaging transport, bot tokens, tmux,
+  // host provider route) applies to every harness; the caller's envExclude is
+  // additive and the adapter's explicit env is merged afterwards.
+  const env = spawnEnvironment(process.env, { envExclude: spec.envExclude ?? [], explicit: spec.env ?? {} });
   // The carrier runs with `cwd: spec.cwd`, but an inherited PWD can still name
   // the caller's directory. Harnesses such as OpenCode resolve their project
   // config through PWD, so a detached executor started with --workspace from
   // another directory would load the wrong config and fail every provider call.
-  const fullEnv = { ...env, ...(spec.env ?? {}), PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory };
+  const fullEnv = { ...env, PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory };
   await writeAtomic(path.join(directory, 'launch.json'), { runtime, supervisor, at: new Date().toISOString() });
   const child = spawn(runtime, [supervisor, '--dir', directory], {
     detached: true,
@@ -243,5 +339,6 @@ export function executorState(record: ExecutorRecord, status: ExecutorStatus | u
   if (status.state === 'exited') return status.exitCode === 0 ? 'completed' : 'failed';
   if (status.state === 'failed') return 'failed';
   if (status.state === 'stopped') return 'cancelled';
+  if (status.state === 'idle') return 'idle';
   return 'running';
 }

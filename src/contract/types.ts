@@ -1,6 +1,6 @@
 import type {
-  Availability, ContextVerification, HandoffMode, HandoffPhase, HarnessId, Isolation, LifecycleState,
-  ModelVerification, Operation, Os, PercentSource, State, StoredProofMechanism, Surface, SourceLabel, AutoCompactSource,
+  Availability, ContextVerification, EventKind, EventLevel, EventRole, HandoffMode, HandoffPhase, HarnessId, Isolation, LifecycleState,
+  ModelVerification, Operation, Os, PercentSource, PermissionMode, PersistenceMode, ProcessState, SpawnSurface, State, StoredProofMechanism, Surface, SourceLabel, AutoCompactSource, TurnOutcome, FieldStateValue,
 } from './states.js';
 import type { Feature } from './version.js';
 
@@ -12,6 +12,55 @@ export interface Identity {
   session: string;
   generation: string;
   agent: string;
+}
+
+/**
+ * Carrier options for `spawn`. They are persisted with the executor and
+ * re-applied to every resumed/revived turn so no option is lost after turn 1.
+ */
+export interface SpawnOptions {
+  /** Default `one-shot`; `persistent` keeps the supervisor (and, for a
+   * resident carrier, the harness process) alive between turns in `idle`. */
+  persistence?: PersistenceMode;
+  /** Carrier surface. Defaults are feasibility-gated per harness. */
+  surface?: SpawnSurface;
+  /** DSH profile selection; unsupported on other harnesses. */
+  profile?: string;
+  /** Claude: `bypassPermissions` (default) or `dontAsk` + `allowedTools`. */
+  permissionMode?: PermissionMode;
+  /** Only meaningful with `permissionMode: "dontAsk"`. */
+  allowedTools?: string[];
+  /** Tools the carrier must refuse even when installed. */
+  disallowedTools?: string[];
+  /** Extra environment variables removed before launch (names only). */
+  envExclude?: string[];
+  /** Extra MCP server names to remove; defaults cannot be re-enabled. */
+  mcp?: { deny?: string[] };
+}
+
+/** One normalized event (event v1). */
+export interface NormalizedEvent {
+  /** Global line ordinal inside the executor log. */
+  seq: number;
+  ts: string;
+  kind: EventKind;
+  role?: EventRole;
+  /** Bounded to 4 KB. */
+  text?: string;
+  tool?: string;
+  phase?: string;
+  /** Bounded diagnostic/raw detail (≤4 KB), never a secret. */
+  detail?: string;
+}
+
+/** Bounded log/event tail with a byte cursor at a line boundary. */
+export interface LogTail {
+  format: 'events' | 'lines';
+  events?: NormalizedEvent[];
+  lines?: string[];
+  nextCursor: number;
+  /** The log was truncated or replaced; the tail starts from the beginning. */
+  reset?: boolean;
 }
 
 /** Caller-settable child policy. Denials return `forbidden`. */
@@ -47,10 +96,14 @@ export interface Request {
   model?: string;
   reasoningEffort?: string;
   policy?: Policy;
+  /** Carrier options for `spawn`; persisted and reused on resumed turns. */
+  spawn?: SpawnOptions;
   isolation?: Isolation;
   count?: number;
   timeoutMs?: number;
   reason?: string;
+  /** For `status`: return a bounded normalized event tail. */
+  logTail?: { tail?: number; cursor?: number; format?: 'events' | 'lines' };
 }
 
 export interface ContextSources {
@@ -61,9 +114,11 @@ export interface ContextSources {
 
 export interface ContextInfo {
   window: number | null;
+  /** Prompt occupancy: input + cache read/write, output excluded. */
   used: number | null;
   percent?: number | null;
   percentSource?: PercentSource | null;
+  /** Prompt occupancy including native output tokens (qgo-live compatible). */
   /** Per-value provenance; only fields with values are labelled. */
   sources?: ContextSources;
 }
@@ -115,6 +170,15 @@ export interface ExecutorSummary {
   reasoningEffort?: string | null;
   context?: ContextInfo;
   surface: 'tui' | 'headless' | 'web';
+  turns?: number;
+  queuedTurns?: number;
+  lastTurnAt?: string | null;
+  lastTurnOutcome?: TurnOutcome | null;
+  lastOperationId?: string | null;
+  turnStartedAt?: string | null;
+  idleSince?: string | null;
+  processState?: ProcessState;
+  persistence?: PersistenceMode;
   /** Pointer to the persisted session store; content is never returned. */
   session?: SessionPointer | null;
 }
@@ -143,6 +207,30 @@ export interface Result {
   /** Supervisor-observed activity time (native) or the persisted store mtime. */
   lastActivityAt?: string | null;
   lastActivityAtSource?: SourceLabel | null;
+  /** Supervisor/child liveness, independent of `state`. */
+  processState?: ProcessState;
+  processStateReason?: string;
+  /** Turn reconciliation surface (durable ledger owned by the supervisor). */
+  turns?: number;
+  lastOperationId?: string | null;
+  lastTurnOutcome?: TurnOutcome | null;
+  queuedTurns?: number;
+  lastTurnAt?: string | null;
+  turnStartedAt?: string | null;
+  /** Set while a persistent executor is quiescent between turns. */
+  idleSince?: string | null;
+  /** Receipt of a queued/started turn (`message`). */
+  turnId?: string;
+  /** 1-based position in the pending queue; 0 when already claimed. */
+  queuePosition?: number;
+  /** Persistence model of the executor. */
+  persistence?: PersistenceMode;
+  /** Native harness version when observed. */
+  runtimeVersion?: string | null;
+  /** MCP servers copied into the executor after filtering. */
+  mcpFiltered?: { names: string[]; count: number };
+  /** Bounded log/event tail (status with `logTail`). */
+  logTail?: LogTail;
   /** Provenance of the observed state: native > session > unknown. */
   stateSource?: SourceLabel | null;
   /** Terminal process outcome, surfaced when known (null otherwise). */
@@ -160,7 +248,7 @@ export interface Result {
   error?: ContractError;
   proof?: AdoptionProof;
   /** Closed per-field state map; `unavailable` is derived from it. */
-  fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown'>;
+  fieldStates?: Record<string, FieldStateValue>;
   /** Optional auto-compaction metadata; unknown values stay null with source `unknown`. */
   autoCompact?: AutoCompact;
   capabilities?: CapabilityDeclaration[];
@@ -186,7 +274,13 @@ export interface CapabilityDeclaration {
     lifecycle: 'detached' | 'attached' | 'none';
     maxConcurrent: number;
     isolation: Availability;
+    persistenceModes: PersistenceMode[];
+    surfaces: SpawnSurface[];
+    permissionModes: PermissionMode[];
+    mcpFilter: Availability;
   };
+  /** Event observation capability of the carrier log. */
+  observation: { events: EventLevel };
   status: {
     availability: Availability;
     model: Availability;

@@ -3,7 +3,9 @@ import { derivedPercent, result, validateRequest, validateResult } from '../cont
 import type { CapabilityDeclaration, ExecutorSummary, Request, Result } from '../contract/types.js';
 import type { Adapter, AdapterContext, NativeOutcome } from '../adapters/types.js';
 import { fingerprint, sameIdentity } from './fingerprint.js';
-import { lifecycleOfStatus, pidAlive, readStatus } from '../adapters/executors.js';
+import { lifecycleOfStatus, processStateOf, readStatus } from '../adapters/executors.js';
+import { livenessOf } from '../adapters/external.js';
+import { queuedTurns, readTurns } from './turns.js';
 import { sessionPointer } from './session-probe.js';
 import { checkPolicy, normalizePolicy, ROOT_POLICY } from './policy.js';
 import { guardHandoffOutcome } from './handoff.js';
@@ -33,9 +35,21 @@ function ownedBy(record: ExecutorRecord, caller: Identity): boolean {
     && record.parent.agent === caller.agent;
 }
 
-function normalizeOutcome(request: Request, outcome: NativeOutcome): Result {
-  const context = outcome.context ?? { window: null, used: null, percent: null, percentSource: null };
-  if (context.percent == null && context.used != null && context.window != null && context.window > 0) {
+/** Native outcome fields copied to the result verbatim when present. */
+const PASSTHROUGH = [
+  'state', 'handoff', 'executorId', 'sessionId', 'surfaceChanged', 'model', 'reasoningEffort',
+  'lastActivityAt', 'lastActivityAtSource', 'stateSource', 'exitCode', 'signal', 'session',
+  'autoCompact', 'fieldStates', 'error', 'proof', 'processState', 'processStateReason', 'turns',
+  'lastOperationId', 'lastTurnOutcome', 'queuedTurns', 'lastTurnAt', 'turnStartedAt', 'idleSince',
+  'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail',
+] as const;
+
+export function normalizeOutcome(request: Request, outcome: NativeOutcome): Result {
+  // Only state-reporting outcomes carry a context block. A spawn/message/stop
+  // result must not fabricate a null context (which would then mark every
+  // context field unavailable); explicit `unavailable` entries still pass through.
+  const context = outcome.context ?? null;
+  if (context && context.percent == null && context.used != null && context.window != null && context.window > 0) {
     const percent = derivedPercent(context.used, context.window);
     if (percent !== null) {
       context.percent = percent;
@@ -43,31 +57,18 @@ function normalizeOutcome(request: Request, outcome: NativeOutcome): Result {
       context.sources = { ...(context.sources ?? {}), percent: 'derived' };
     }
   }
-  return result(request, outcome.status, outcome.reason, {
+  const options: Record<string, unknown> = {
     durable: outcome.durable ?? false,
-    ...(outcome.state !== undefined ? { state: outcome.state } : {}),
-    ...(outcome.handoff !== undefined ? { handoff: outcome.handoff } : {}),
-    ...(outcome.executorId !== undefined ? { executorId: outcome.executorId } : {}),
-    ...(outcome.sessionId !== undefined ? { sessionId: outcome.sessionId } : {}),
-    ...(outcome.surfaceChanged !== undefined ? { surfaceChanged: outcome.surfaceChanged } : {}),
-    ...(outcome.model !== undefined ? { model: outcome.model } : {}),
-    ...(outcome.reasoningEffort !== undefined ? { reasoningEffort: outcome.reasoningEffort } : {}),
-    ...(outcome.lastActivityAt !== undefined ? { lastActivityAt: outcome.lastActivityAt } : {}),
-    ...(outcome.lastActivityAtSource !== undefined ? { lastActivityAtSource: outcome.lastActivityAtSource } : {}),
-    ...(outcome.stateSource !== undefined ? { stateSource: outcome.stateSource } : {}),
-    ...(outcome.exitCode !== undefined ? { exitCode: outcome.exitCode } : {}),
-    ...(outcome.signal !== undefined ? { signal: outcome.signal } : {}),
-    ...(outcome.session !== undefined ? { session: outcome.session } : {}),
     modelVerification: outcome.modelVerification ?? 'unknown',
     verification: outcome.verification ?? { model: 'unknown', context: 'reported' },
-    context,
-    ...(outcome.autoCompact ? { autoCompact: outcome.autoCompact } : {}),
-    ...(outcome.fieldStates ? { fieldStates: outcome.fieldStates } : {}),
+    ...(context ? { context } : {}),
     unavailable: outcome.unavailable ?? [],
     notices: outcome.notices ?? [],
-    ...(outcome.error ? { error: outcome.error } : {}),
-    ...(outcome.proof ? { proof: outcome.proof } : {}),
-  });
+  };
+  for (const key of PASSTHROUGH) {
+    if (outcome[key] !== undefined) options[key] = outcome[key];
+  }
+  return result(request, outcome.status, outcome.reason, options);
 }
 
 function policyOf(executors: readonly ExecutorRecord[], identity: Identity, executorId?: string): Required<Policy> {
@@ -204,6 +205,9 @@ async function executeInner(request: unknown, options: OperationsOptions): Promi
     const policy = checkPolicy(callerPolicy, 'cancel');
     if (!policy.ok) return result(req, 'forbidden', policy.reason, { error: { code: 'forbidden', message: policy.reason } });
   }
+  if (req.operation === 'finish' && target === 'self') {
+    return result(req, 'unsupported', 'finish completes a detached owned executor; an in-harness session has no supervisor to complete', { unavailable: ['finish.self'] });
+  }
 
   let outcome: NativeOutcome;
   try {
@@ -214,6 +218,7 @@ async function executeInner(request: unknown, options: OperationsOptions): Promi
       case 'message': outcome = await adapter.message(req, ctx); break;
       case 'cancel':
       case 'stop': outcome = await adapter.cancel(req, ctx); break;
+      case 'finish': outcome = await adapter.finish(req, ctx); break;
       default: outcome = { status: 'unsupported', reason: 'This adapter has no implementation for this operation' };
     }
   } catch (error) {
@@ -246,17 +251,36 @@ async function listExecutors(req: Request, options: OperationsOptions): Promise<
   const executors: ExecutorSummary[] = [];
   for (const e of records) {
     const raw = await readStatus(options.home, e.executorId);
-    const alive = raw?.pid === undefined ? null : pidAlive(raw.pid);
+    const liveness = raw ? await livenessOf(options.home, e.executorId, raw) : {};
     // One lifecycle vocabulary for self and executors (starting/stopping and
-    // liveness-only observations collapse into `running`).
-    const state = lifecycleOfStatus(raw, alive);
-    const pointer = await sessionPointer(e.harness, options.identity.workspace, e.sessionId).catch(() => null);
+    // liveness-only observations collapse into `running`; a quiescent
+    // persistent executor is `idle`).
+    const state = lifecycleOfStatus(raw, liveness);
+    const processState = raw ? processStateOf(raw, liveness).state : 'unknown';
+    const pointer = await sessionPointer(e.harness, options.identity.workspace, raw?.sessionId ?? e.sessionId).catch(() => null);
+    const turns = await readTurns(options.home, e.executorId, 500);
+    const lastTurn = turns.at(-1);
+    if (['completed', 'failed', 'cancelled'].includes(state) && e.state !== state && typeof options.store.updateExecutor === 'function') {
+      await options.store.updateExecutor(e.executorId, {
+        state,
+        ...(raw?.sessionId && e.sessionId !== raw.sessionId ? { sessionId: raw.sessionId } : {}),
+      }).catch(() => undefined);
+    }
     executors.push({
       executorId: e.executorId,
       state,
       surface: e.surface,
-      ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+      processState,
+      ...((raw?.sessionId ?? e.sessionId) ? { sessionId: (raw?.sessionId ?? e.sessionId)! } : {}),
       ...(pointer ? { session: pointer } : {}),
+      turns: raw?.turns ?? turns.length,
+      queuedTurns: raw?.queuedTurns ?? await queuedTurns(options.home, e.executorId),
+      lastTurnAt: raw?.lastTurnAt ?? lastTurn?.endedAt ?? lastTurn?.startedAt ?? null,
+      lastTurnOutcome: raw?.lastTurnOutcome ?? lastTurn?.outcome ?? null,
+      lastOperationId: raw?.lastOperationId ?? e.lastOperationId ?? null,
+      turnStartedAt: raw?.turnStartedAt ?? null,
+      idleSince: state === 'idle' ? raw?.idleSince ?? null : null,
+      ...((e.persistence ?? raw?.persistence) ? { persistence: (e.persistence ?? raw?.persistence)! } : {}),
     });
   }
   return result(req, 'completed', `${executors.length} owned executor(s)`, {

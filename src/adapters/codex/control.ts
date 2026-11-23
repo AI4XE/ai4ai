@@ -314,7 +314,7 @@ export async function listThreads(): Promise<CodexThread[]> {
   if (!socket) return [];
   const daemon = await CodexDaemon.connect(socket);
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.6' } });
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } });
     return await listAllThreads(daemon);
   } finally { daemon.close(); }
 }

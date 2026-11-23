@@ -17,12 +17,13 @@ This document is generated from the machine-readable schema and validators in
 | `handoff` | Renew the caller's or an owned executor's context without losing the task. |
 | `spawn` | Create 1..N detached executors seeded with a task. |
 | `status` | Report state, model, reasoning effort, context usage and unavailable fields. |
-| `message` | Deliver text to an owned executor. |
-| `cancel` / `stop` | Cancel an operation or stop an owned executor. |
+| `message` | Deliver text to an owned executor, or revive a terminal one in its recorded session. |
+| `cancel` / `stop` | Cancel an operation or stop an owned executor (`cancelled`). |
+| `finish` | Complete a detached owned executor gracefully (`completed`). |
 | `list` | List executors owned by the caller. |
 | `capabilities` | Return the adapter's declared capabilities for this OS. |
 
-Operations: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `capabilities`.
+Operations: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `finish`, `list`, `capabilities`.
 
 ## Result state machine
 
@@ -71,9 +72,9 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 
 ## Request fields
 
-- `operation`: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `capabilities`.
+- `operation`: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `finish`, `list`, `capabilities`.
 - `operationId`: caller-chosen idempotency key.
-- `target`: `"self"` or an owned executor id (`handoff`, `status`, `message`, `cancel`).
+- `target`: `"self"` or an owned executor id (`handoff`, `status`, `message`, `cancel`, `stop`, `finish`).
 - `mode`: `compact` | `restart` (`restart` is the default and replaces the context in place with the material only; `compact` is an explicit opt-in that uses the harness summarizer and is refused where the capability declaration does not list it).
 - `surface`: `preserve` | `tui` | `headless` | `web`; default `preserve`. A silent surface change is forbidden.
 - `task`: seed material for `handoff`, `spawn`, `message`.
@@ -81,7 +82,10 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 - `policy`: `allowSelfHandoff` (default `true`), `allowSpawnChildren` (default `false`), `allowSelfStop` (default `true`).
 - `isolation`: `inherit` | `isolated`; `inherit` is the default.
 - `count`: 1..16 for `spawn`; the adapter declares the effective concurrency limit and over-limit requests fail loudly.
-- `requiredFeatures`: optional mandatory feature names: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `list`, `surface-preserve`, `surface-cross`, `spawn-isolation`, `spawn-policy`, `model-override`, `reasoning-effort-override`.
+- `spawn` (spawn only): `{ persistence: "one-shot"|"persistent", surface: "headless"|"web", profile, permissionMode: "bypassPermissions"|"dontAsk", allowedTools, disallowedTools, envExclude, mcp: { deny } }`. Options are persisted and re-applied to every resumed or revived turn.
+- `logTail` (status only): `{ tail: 1..1000, cursor, format: "events"|"lines" }`; asks for a bounded event/log tail.
+- `reason` applicability: accepted for `handoff`, `spawn`, `status`, `message`, `cancel`, `stop` and `finish`; **not applicable** to `list` and `capabilities` (a closed-request error, never a journal failure).
+- `requiredFeatures`: optional mandatory feature names: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `finish`, `list`, `surface-preserve`, `surface-cross`, `spawn-isolation`, `spawn-policy`, `spawn-persistence`, `spawn-surface`, `spawn-permission-mode`, `spawn-env-exclude`, `spawn-mcp-deny`, `message-revival`, `events`, `watch`, `model-override`, `reasoning-effort-override`.
 
 ## Result fields
 
@@ -93,14 +97,20 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 - `stateSource`: provenance of the observed state (`native` from the status file and pid check, `session` when only a persisted store is known, `unknown`).
 - `exitCode` / `signal`: the terminal process outcome when known, `null` otherwise; surfaced only on terminal states.
 - `session`: `{ id, store, path }` — a pointer to the persisted session store (`path` is a host-local file or SQLite path, `null` when unresolvable). Content is never read or returned. `list` executor summaries carry the same pointer.
-- State is always cross-checked against pid liveness: a live pid is never reported `completed`/`cancelled`, and a dead pid without a recorded clean exit is `failed`. There is deliberately no `idle` state and no stale flag.
+- Lifecycle states: `running | idle | completed | failed | cancelled | unknown`. `idle` is non-terminal: the supervisor (and, for a resident carrier, the harness child) is alive, no turn runs, and queued turns may exist. `finish` completes an executor; `stop` cancels it. `idle` is never a task-completion signal.
+- `processState`: `alive | orphaned | dead | unknown`, independent of the lifecycle. `orphaned` means the supervisor died while the harness child is still alive; revival is refused until `ai4ai sweep` or a force stop cleans it. Unverifiable liveness fails closed to `unknown`.
+- Turn reconciliation: `turns`, `lastOperationId`, `lastTurnOutcome`, `queuedTurns`, `lastTurnAt`, `turnStartedAt`, `idleSince`. The supervisor owns a separate append-only `turns.ndjson`; `status.json` remains its single-writer snapshot.
+- Receipts: `message` returns `turnId` and `queuePosition` (1-based while pending, 0 once claimed). A revived executor keeps its `executorId` and native `sessionId`; the old inbox generation is swapped out and never replayed.
+- `persistence`: the executor's `one-shot` or `persistent` model. `runtimeVersion` reports the native harness version when observed; `mcpFiltered` reports the kept MCP server names/count (never definitions or secrets).
+- `logTail`: `{ format, events?|lines?, nextCursor, reset? }`. `nextCursor` is a byte offset at a line boundary; a cursor beyond the file yields `reset: true` and restarts from the beginning. Events are truncated to 4 KB and unknown lines are `unmapped` with bounded raw detail.
+- State is always cross-checked against process liveness: a live supervisor is never reported terminal, a dead supervisor with a live child is `orphaned` (never `running`), and an `idle` per-turn executor is not `failed` because its child exited between turns.
 - `context`: `{ window, used, percent?, percentSource, sources? }`; `sources` labels the provenance of each value and `percent` is derived locally from `used`/`window` whenever both are known.
-- `context.used` semantics: prompt/context occupancy — input tokens plus cache reads/writes, excluding generated output and reasoning. Adapters populate it whenever the harness exposes it, even when `window`/`percent` are `null`.
+- `context.used` semantics: prompt/context occupancy — input tokens plus cache reads/writes, excluding generated output and reasoning. Adapters populate it whenever the harness exposes it, even when `window`/`percent` are `null`. Generated output is deliberately excluded: the orchestrator and executor thresholds both use this prompt-occupancy value.
 - Units: `context.window` and `context.used` are **token counts** (non-negative integers); `context.percent` is **0-100 with one decimal**. Adapters convert platform values; an unreliable conversion becomes `null` and is listed in `unavailable` — units are never mixed.
 - `context.percent` is exactly `used / window` against the harness native context window. A configured auto-compact/soft limit is not a substitute for the window; when the native window is unknown, `window` and `percent` are `null` and `unavailable` names the gap.
 - `context.percent`: computed locally (`derived`) whenever both `used` and `window` are known; a native percentage is used only when those inputs are unavailable. A `null` percent is a known limitation, not a reason to skip context management: absolute thresholds can use `used` (with a declared window when available).
-- `autoCompact`: `{ tokens, ratio, source }`. `tokens` is an absolute threshold, `ratio` is `tokens / window` and is only derived when the window is known and verified; a platform ratio is normalized to 0-1. Unknown values stay `null` with source `unknown` and a `fieldStates` reason.
-- `fieldStates`: closed per-field state map. Keys are only `model`, `reasoningEffort`, `context.window`, `context.used`, `context.percent`, `context.autoCompact`; values are only `unsupported`, `unavailable`, `unknown`. `unavailable` is derived from it (single source).
+- `autoCompact`: `{ tokens, ratio, source }`. `tokens` is an absolute threshold, `ratio` is `tokens / window` and is only derived when the window is known and verified; a platform ratio is normalized to 0-1. A configured threshold above the observed window yields `ratio: null` plus an informational notice (never a false 100% clamp, never an invalid result). Unknown values stay `null` with source `unknown` and a `fieldStates` reason.
+- `fieldStates`: closed per-field state map. Keys are only `model`, `reasoningEffort`, `context.window`, `context.used`, `context.percent`, `context.autoCompact`; values are only `unsupported`, `unavailable`, `unknown`, `disabled`. `disabled` means the harness has the feature but it is turned off by configuration (it is not missing and is never listed in `unavailable`); every other state is a missing value and is listed there (single source).
 - `unavailable`: names of fields the adapter could not obtain; their values are `null`. Missing values are never omitted or replaced with 0/empty placeholders.
 - `notices`: `{ code, impact: "none", action_required: false, message }`. **Skills must treat notices as informational: never stop, retry or prompt because of one.**
 - `error`: `{ code, message }` for refusals and failures.
@@ -147,8 +157,8 @@ because the harness persists no such value):
 | Harness | native | session | env | config |
 |---|---|---|---|---|
 | Claude Code | stream-json result / live session usage (model, used, window) | transcript JSONL (model, used, window, effort) | `ANTHROPIC_MODEL`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_CODE_EFFORT_LEVEL` | settings `env`, `effortLevel`, `autoCompactWindow` (local project > project > user; settings `env` overrides the process env) |
-| Codex | runner `usage.json` / `model.json` (used, window, model) | rollout JSONL under `~/.codex/sessions` (model, effort, window, used) | — | `$CODEX_HOME/config.toml` and the trusted project `.codex/config.toml` (`model`, `model_reasoning_effort`, `model_context_window`, `model_auto_compact_token_limit`) |
-| OpenCode | `run --format json` events (model, used) | `opencode.db` session + last assistant message (model, used, variant) and model catalog (window) | — | `opencode.json(c)`: `model`, `providers.<p>.models.<m>.limit.context`, `compaction.buffer` |
+| Codex | runner `usage.json` / `model.json` (used, window, model) | rollout JSONL under `~/.codex/sessions` (model, effort, window, used) | — | `$CODEX_HOME/config.toml` and the trusted project `.codex/config.toml` (`model`, `model_reasoning_effort`, `model_context_window`, `model_auto_compact_token_limit`); `$CODEX_HOME/models_cache.json` model metadata (window, effective window percent, catalog limit); the core default auto-compaction limit is 90% of the resolved window |
+| OpenCode | `run --format json` events (model, used) | `opencode.db` session + last assistant message (model, used, variant) and model catalog (window) | — | `opencode.json(c)`: `model` (optionally `#variant`), `providers.<p>.models.<m>.limit.context`, `settings`/`options`/`variants[].settings` `reasoningEffort`, `compaction.auto`, `compaction.buffer` (legacy `reserved`); the default ceiling keeps 15% of the window free, at least 16k |
 | DSH | headless `--json` events (used); in-harness events (model, window, effort) | `DSH_HOME/sessions` records (model, window, used, effort) | — | headless profile patch (`agent-default-model`, `llm-pi-ai` limits, `compaction-basic.thresholdRatio`) |
 
 ## AI-facing tool
@@ -163,8 +173,9 @@ AI Harness Extension Kit (ai4ai)
 - status — query this session's context window, tokens used, usage percent, model, reasoning effort and auto-compact setting. Returns context {window, used (tokens), percent (0–100), sources}, model, reasoningEffort, autoCompact {tokens, ratio, source}.
 - handoff — renew this session's context at a safe point: start a fresh context that keeps the same task when the conversation gets long or the context is nearly full.
 - spawn — start a detached executor that works in parallel while this session continues.
-- message / stop / list — manage executors.
+- message / stop / finish / list — manage executors (message revives a terminal executor in its session; finish completes gracefully).
 - capabilities — list supported operations for this harness.
+- CLI helpers (orchestrator-side; shell commands, not tool calls): `ai4ai watch --executor <id> --until "<condition>" [--timeout S]` (exit 0 met / 3 timeout / 2 usage / 1 runtime), `ai4ai events --executor <id>` (normalized tail with cursor), `ai4ai sweep` (identity-checked orphan cleanup). Run `ai4ai --help` for conditions and flags.
 Notices are informational; on pending, finish the turn.
 ```
 
@@ -181,7 +192,7 @@ provide.
 ## Capability declarations
 
 Each adapter declares, per OS and interface (`tui` | `headless` | `web`): operation availability, handoff modes and overrides,
-spawn lifecycle and limits, status introspection, and experimental features. Availability values: `supported`, `limited`, `unsupported`, `not-tested`.
+spawn lifecycle, persistence modes, surfaces, permission modes, MCP filtering, status introspection, event observation level, and experimental features. Availability values: `supported`, `limited`, `unsupported`, `not-tested`.
 A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is reported as `limited` or `unsupported`, never left untested.
 
 ## Ownership and policy
@@ -190,6 +201,13 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
 - Parent/peer delegation is not part of this contract; foreign targets return `unauthorized` without leaking state.
 - Policy denial returns `forbidden`; harness approval returns `authorization-required`.
 - Parent close does not kill a detached child; durable state enables reattachment.
+
+## Executors, environment and observation
+
+- Default environment policy (all harnesses, applied at launch and again by the supervisor): remove `TELEGRAM_*`, `CC_SESSION_KEY`, `CLAUDE_CODE_*` transport variables, `TMUX*`, `*_BOT_TOKEN`, `*_SESSION_DRIVER` and host `ANTHROPIC_*`. `spawn.envExclude` only adds names; nothing is re-enabled. The executor identity (`AI4AI_EXECUTOR_ID`, `AI4AI_EXECUTOR_DIR`) is injected.
+- Default MCP deny: `telegram`, `cc-connect`, `ccgram`, `feishu`, `wechat`, `slack`, `discord` (case-insensitive) plus `spawn.mcp.deny`. The only source is the project `.mcp.json`; user-level MCP is out of scope and never copied. The filtered config is written 0600 in the executor directory and only kept names/counts are reported.
+- Event v1 kinds: `message | tool | result | error | progress | system | unmapped`. The log is mapped at read time; harness transcripts are never read.
+- CLI-only helpers (not contract operations): `ai4ai watch` (declarative conditions, JSON, exit 0 met / 3 timeout / 2 usage / 1 runtime), `ai4ai events` (bounded normalized tail with cursor), `ai4ai sweep` (list + identity-check + kill orphan trees + reconcile dead records).
 
 ## JSON Schema
 
@@ -213,11 +231,20 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
           "message",
           "cancel",
           "stop",
+          "finish",
           "list",
           "surface-preserve",
           "surface-cross",
           "spawn-isolation",
           "spawn-policy",
+          "spawn-persistence",
+          "spawn-surface",
+          "spawn-permission-mode",
+          "spawn-env-exclude",
+          "spawn-mcp-deny",
+          "message-revival",
+          "events",
+          "watch",
           "model-override",
           "reasoning-effort-override"
         ]
@@ -232,10 +259,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         "message",
         "cancel",
         "stop",
+        "finish",
         "list",
         "capabilities"
       ],
-      "description": "Operation to perform: handoff, spawn, status, message, cancel/stop, list or capabilities."
+      "description": "Operation to perform: handoff, spawn, status, message, cancel/stop, finish, list or capabilities."
     },
     "operationId": {
       "type": "string",
@@ -312,6 +340,91 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
       ],
       "description": "Executor isolation: inherit the caller environment (default) or isolated."
     },
+    "spawn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Carrier options for a spawned executor; persisted and re-applied to every resumed or revived turn.",
+      "properties": {
+        "persistence": {
+          "enum": [
+            "one-shot",
+            "persistent"
+          ],
+          "description": "one-shot (default) exits after the turn queue drains; persistent stays alive in idle between turns."
+        },
+        "surface": {
+          "enum": [
+            "headless",
+            "web"
+          ],
+          "description": "Carrier surface; defaults are feasibility-gated per harness."
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "DSH profile name; unsupported on other harnesses."
+        },
+        "permissionMode": {
+          "enum": [
+            "bypassPermissions",
+            "dontAsk"
+          ],
+          "description": "Claude permission mode; interactive modes are refused."
+        },
+        "allowedTools": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "description": "Tool allow-list used with permissionMode dontAsk."
+        },
+        "disallowedTools": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "description": "Tools the carrier must refuse even when installed (for example Skill(gclear))."
+        },
+        "envExclude": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "description": "Extra environment variable names removed before launch; the built-in defaults are always removed."
+        },
+        "mcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Extra MCP servers to deny; default message-class denials cannot be re-enabled.",
+          "properties": {
+            "deny": {
+              "type": "array",
+              "maxItems": 64,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "description": "Additional MCP server names to remove (case-insensitive)."
+            }
+          }
+        }
+      }
+    },
     "count": {
       "type": "integer",
       "minimum": 1,
@@ -322,13 +435,38 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
       "type": "integer",
       "minimum": 0,
       "maximum": 300000,
-      "description": "Maximum wait in milliseconds for a stop confirmation."
+      "description": "Maximum wait in milliseconds for a stop/finish confirmation."
     },
     "reason": {
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
       "description": "Human-readable reason recorded with the operation."
+    },
+    "logTail": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Bounded log tail for status; events are normalized (event v1), lines are raw log lines.",
+      "properties": {
+        "tail": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Maximum number of entries (default 50)."
+        },
+        "cursor": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte cursor returned by a previous call; at a line boundary."
+        },
+        "format": {
+          "enum": [
+            "events",
+            "lines"
+          ],
+          "description": "events (default) or raw lines."
+        }
+      }
     }
   },
   "required": [
@@ -370,6 +508,16 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "required": [
                 "policy"
               ]
+            },
+            {
+              "required": [
+                "spawn"
+              ]
+            },
+            {
+              "required": [
+                "logTail"
+              ]
             }
           ]
         }
@@ -407,6 +555,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "surface"
+              ]
+            },
+            {
+              "required": [
+                "logTail"
               ]
             }
           ]
@@ -467,6 +620,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "surface"
+              ]
+            },
+            {
+              "required": [
+                "spawn"
               ]
             }
           ]
@@ -529,6 +687,16 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "required": [
                 "surface"
               ]
+            },
+            {
+              "required": [
+                "spawn"
+              ]
+            },
+            {
+              "required": [
+                "logTail"
+              ]
             }
           ]
         }
@@ -540,7 +708,8 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
           "operation": {
             "enum": [
               "cancel",
-              "stop"
+              "stop",
+              "finish"
             ]
           }
         }
@@ -594,6 +763,16 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "surface"
+              ]
+            },
+            {
+              "required": [
+                "spawn"
+              ]
+            },
+            {
+              "required": [
+                "logTail"
               ]
             }
           ]
@@ -664,6 +843,16 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "timeoutMs"
+              ]
+            },
+            {
+              "required": [
+                "spawn"
+              ]
+            },
+            {
+              "required": [
+                "logTail"
               ]
             }
           ]
@@ -740,6 +929,16 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "required": [
                 "timeoutMs"
               ]
+            },
+            {
+              "required": [
+                "spawn"
+              ]
+            },
+            {
+              "required": [
+                "logTail"
+              ]
             }
           ]
         }
@@ -764,6 +963,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         "message",
         "cancel",
         "stop",
+        "finish",
         "list",
         "capabilities"
       ]
@@ -814,6 +1014,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
     "state": {
       "enum": [
         "running",
+        "idle",
         "completed",
         "failed",
         "cancelled",
@@ -891,6 +1092,205 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         {
           "type": "null"
         }
+      ]
+    },
+    "processState": {
+      "enum": [
+        "alive",
+        "orphaned",
+        "dead",
+        "unknown"
+      ]
+    },
+    "processStateReason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "turns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lastOperationId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lastTurnOutcome": {
+      "anyOf": [
+        {
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "queuedTurns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lastTurnAt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turnStartedAt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "idleSince": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turnId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "queuePosition": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "persistence": {
+      "enum": [
+        "one-shot",
+        "persistent"
+      ]
+    },
+    "runtimeVersion": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcpFiltered": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "names",
+        "count"
+      ]
+    },
+    "logTail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "enum": [
+            "events",
+            "lines"
+          ]
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "seq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "ts": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "kind": {
+                "enum": [
+                  "message",
+                  "tool",
+                  "result",
+                  "error",
+                  "progress",
+                  "system",
+                  "unmapped"
+                ]
+              },
+              "role": {
+                "enum": [
+                  "user",
+                  "assistant",
+                  "system",
+                  "tool"
+                ]
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "tool": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "phase": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "detail": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "seq",
+              "ts",
+              "kind"
+            ]
+          }
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "nextCursor": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reset": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "format",
+        "nextCursor"
       ]
     },
     "exitCode": {
@@ -1141,6 +1541,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             "config",
             "config:project",
             "config:user",
+            "default",
             "unknown"
           ]
         }
@@ -1167,7 +1568,8 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         "enum": [
           "unsupported",
           "unavailable",
-          "unknown"
+          "unknown",
+          "disabled"
         ]
       }
     },
@@ -1437,13 +1839,71 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
                   "unsupported",
                   "not-tested"
                 ]
+              },
+              "persistenceModes": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "one-shot",
+                    "persistent"
+                  ]
+                }
+              },
+              "surfaces": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "headless",
+                    "web"
+                  ]
+                }
+              },
+              "permissionModes": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "bypassPermissions",
+                    "dontAsk"
+                  ]
+                }
+              },
+              "mcpFilter": {
+                "enum": [
+                  "supported",
+                  "limited",
+                  "unsupported",
+                  "not-tested"
+                ]
               }
             },
             "required": [
               "availability",
               "lifecycle",
               "maxConcurrent",
-              "isolation"
+              "isolation",
+              "persistenceModes",
+              "surfaces",
+              "permissionModes",
+              "mcpFilter"
+            ]
+          },
+          "observation": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "events": {
+                "enum": [
+                  "normalized",
+                  "raw",
+                  "unsupported"
+                ]
+              }
+            },
+            "required": [
+              "events"
             ]
           },
           "status": {
@@ -1531,6 +1991,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
           "handoff",
           "spawn",
           "status",
+          "observation",
           "experimental",
           "reason"
         ],
@@ -1584,6 +2045,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
           "state": {
             "enum": [
               "running",
+              "idle",
               "completed",
               "failed",
               "cancelled",
@@ -1719,6 +2181,71 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "tui",
               "headless",
               "web"
+            ]
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queuedTurns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastTurnAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastTurnOutcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastOperationId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "turnStartedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "idleSince": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "processState": {
+            "enum": [
+              "alive",
+              "orphaned",
+              "dead",
+              "unknown"
+            ]
+          },
+          "persistence": {
+            "enum": [
+              "one-shot",
+              "persistent"
             ]
           },
           "session": {

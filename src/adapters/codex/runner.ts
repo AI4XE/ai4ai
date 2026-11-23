@@ -81,9 +81,38 @@ const matchesTurn = (message: any, turnId: string | undefined): boolean =>
   message.method === 'turn/completed' && message.params?.threadId === threadId
   && (turnId === undefined || message.params?.turn?.id === turnId);
 
+/**
+ * Tee key app-server notifications to stdout so the supervisor records them in
+ * `log.ndjson` (the supervisor remains the log's single writer). Deltas are
+ * omitted: the final item/turn events are enough to normalize the stream and
+ * a chatty stream must not turn into a log flood. Unsigned raw diagnostics stay
+ * bounded.
+ */
+const tee = (method: string, params: any): void => {
+  if (method.includes('delta')) return;
+  const bounded = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' || !value) return undefined;
+    return value.length <= 2000 ? value : value.slice(0, 2000) + '…';
+  };
+  let payload: Record<string, unknown> = {};
+  if (method.startsWith('item/')) {
+    const item = params?.item ?? {};
+    payload = { item: { id: item.id, type: item.type, name: item.name, text: bounded(item.text) } };
+  } else if (method === 'turn/completed' || method === 'turn/failed') {
+    payload = { turn: { id: params?.turn?.id, status: params?.turn?.status, error: { message: bounded(params?.turn?.error?.message) } } };
+  } else if (method === 'error') {
+    payload = { error: { message: bounded(params?.error?.message) } };
+  } else if (method === 'thread/tokenUsage/updated') {
+    payload = { usage: { modelContextWindow: params?.modelContextWindow } };
+  }
+  try { process.stdout.write(JSON.stringify({ ai4ai: 'codex-event', method, params: payload }) + '\n'); }
+  catch { /* logging must never break the turn */ }
+};
+
 server.onNotification((method, params) => {
   const message = { method, params };
   events.push(message);
+  tee(method, params);
   if (method === 'item/agentMessage/delta' && typeof params.delta === 'string') answer += params.delta;
   if (method === 'thread/tokenUsage/updated') void writeUsage(params);
   for (const waiter of [...waiters]) if (waiter.predicate(message)) waiter.resolve(message);

@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { AdapterContext, CarrierCommand, StatusDetails, NativeOutcome } from '../external.js';
 import { ExternalExecutorAdapter, contextFromUsage, lastJson } from '../external.js';
 import { openCodeSessionUsage } from '../../core/session-probe.js';
-import { probeOpenCodeConfig } from '../../core/config-probe.js';
+import { probeOpenCodeConfig, openCodeAutoCompact } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens } from '../../core/ladder.js';
+import { envValue } from '../../core/config-probe.js';
 import type { CapabilityDeclaration, Request } from '../../contract/types.js';
 import type { HarnessId, Os } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
@@ -89,8 +91,8 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     // 2.3.2 binary at ~/data/opencode-2.3.2, not the older 1.19.6 on PATH:
     // handoff (pending→scheduled→applied→completed, same session) and the
     // detached carrier (spawn/status/message×2/stop/error) both completed.
-    // The test used a free OpenCode Go model because the account's weekly
-    // quota was exhausted; the handoff mechanism is model-agnostic.
+    // The TUI export stores assistant tokens as tokens{input,output,reasoning,
+    // cache}, so prompt occupancy and output-inclusive occupancy are native.
     const verified = os === 'linux' || os === 'darwin';
     const reason = os === 'linux'
       ? 'The native plugin replacement supplies a fresh window containing only the task material (restart) and was exercised on Linux with a real handoff (pending, scheduled, applied, completed) and a successor turn; the detached carrier and status mapping were also exercised.'
@@ -104,8 +106,15 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     // context in place (the shared external adapter refuses), so headless
     // handoff is declared unsupported instead of over-claiming.
     const common = {
-      spawn: { availability: level, maxConcurrent: 4 },
-      status: { availability: level, model: level, reasoningEffort: 'unsupported' as const, context: verified ? 'limited' as const : 'not-tested' as const, percentSource: 'derived' as const },
+      spawn: {
+        availability: level, maxConcurrent: 4,
+        persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
+        surfaces: ['headless'] as ('headless' | 'web')[],
+        permissionModes: [] as ('bypassPermissions' | 'dontAsk')[],
+        mcpFilter: 'not-tested' as const,
+      },
+      events: 'normalized' as const,
+      status: { availability: level, model: level, reasoningEffort: 'unsupported' as const, context: verified ? 'supported' as const : 'not-tested' as const, percentSource: 'derived' as const },
     };
     return [
       declaration({
@@ -149,23 +158,40 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
   }
 
   protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {
-    // One session selector only: resume the existing session or create one.
-    const args = ['run', '--standalone', '--format', 'json', '--session', resumeSessionId ?? `ses_ai4ai_${randomUUID().replaceAll('-', '')}`];
-    const model = request.model || process.env.AI4AI_OPENCODE_MODEL;
-    if (model) args.push('--model', model);
     const command = openCodeBinary(ctx.home);
     if (!command) throw new Error('OpenCode executable not found; set AI4AI_OPENCODE_BIN or put opencode on PATH');
+    // OpenCode 1.x rejects `--standalone` and requires an existing session id
+    // for `--session`; 2.x accepts both. Probe the binary instead of assuming.
+    let major = 2;
+    try {
+      const probe = spawnSync(command, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      const match = /(\d+)\.\d+\.\d+/.exec(String(probe.stdout ?? ''));
+      if (match) major = Number(match[1]);
+    } catch { /* keep the 2.x shape when the probe fails */ }
+    // One session selector only: resume the existing session or create one.
+    const args = ['run', '--format', 'json'];
+    if (major >= 2) {
+      args.push('--standalone', '--session', resumeSessionId ?? `ses_ai4ai_${randomUUID().replaceAll('-', '')}`);
+    } else {
+      args.push('--auto');
+      if (resumeSessionId) args.push('--session', resumeSessionId);
+    }
+    const model = request.model || process.env.AI4AI_OPENCODE_MODEL;
+    if (model) args.push('--model', model);
     return { command, args, sessionRegex: '"session(?:ID|_id)"\\s*:\\s*"([^"]+)"' };
   }
 
-  protected async statusDetails(_record: ExecutorRecord, status: ExecutorStatus, log: LogLine[], ctx: AdapterContext): Promise<StatusDetails> {
+  protected async statusDetails(record: ExecutorRecord, status: ExecutorStatus, log: LogLine[], ctx: AdapterContext): Promise<StatusDetails> {
     // Layer 1: the live `run --format json` events.
     const message = lastJson(log, value => typeof value.sessionID === 'string' || typeof value.session_id === 'string');
     const usage = lastJson(log, value => {
       const part = value.part as Record<string, unknown> | undefined;
-      return !!part && typeof part.tokens === 'object' && part.tokens !== null;
+      return !!part && ((typeof part.tokens === 'object' && part.tokens !== null)
+        || (typeof part.usage === 'object' && part.usage !== null));
     });
-    const tokens = usage ? (usage.part as Record<string, unknown>).tokens as Record<string, unknown> : undefined;
+    const part = usage ? usage.part as Record<string, unknown> : undefined;
+    const tokens = (part && typeof part.tokens === 'object' && part.tokens !== null ? part.tokens
+      : part && typeof part.usage === 'object' && part.usage !== null ? part.usage : undefined) as Record<string, unknown> | undefined;
     // `used` is prompt/context occupancy: input plus cache reads/writes.
     // Generated output and reasoning are deliberately excluded so absolute
     // thresholds stay comparable with the other harnesses.
@@ -176,7 +202,7 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     const nativeModel = message && typeof message.model === 'string' ? verifiedText(message.model) : null;
 
     // Layer 2: the persisted session store and its model catalog (window).
-    const session = await openCodeSessionUsage(ctx.identity.workspace, status.sessionId).catch(() => null);
+    const session = await openCodeSessionUsage(ctx.identity.workspace, status.sessionId ?? record.sessionId).catch(() => null);
     // Layer 4: configuration (model default, per-model limits, compaction buffer).
     // OpenCode exposes no model-selection environment variable, so the env layer
     // is genuinely N/A for this harness.
@@ -185,6 +211,7 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     const modelField = firstVerified<string>([
       { value: nativeModel, source: 'native' },
       { value: session?.model ?? null, source: 'session' },
+      { value: envValue('AI4AI_OPENCODE_MODEL') ?? envValue('OPENCODE_MODEL'), source: 'env' },
       { value: config?.model?.value ?? null, source: config?.model?.source ?? 'config' },
     ]);
     const usedField = firstVerified<number>([
@@ -193,10 +220,12 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     ]);
     const windowField = firstVerified<number>([
       { value: session?.window ?? null, source: 'session' },
+      { value: Number(envValue('AI4AI_OPENCODE_CONTEXT_WINDOW') ?? envValue('OPENCODE_CONTEXT_WINDOW')) || null, source: 'env' },
       { value: config?.window?.value ?? null, source: config?.window?.source ?? 'config' },
     ]);
     const reasoningEffortField = firstVerified<string>([
       { value: session?.reasoningEffort ?? null, source: 'session' },
+      { value: envValue('AI4AI_OPENCODE_REASONING_EFFORT') ?? envValue('OPENCODE_REASONING_EFFORT'), source: 'env' },
       { value: config?.reasoningEffort?.value ?? null, source: config?.reasoningEffort?.source ?? 'config' },
     ]);
 
@@ -208,9 +237,11 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
       used: usedField?.source ?? null,
       percent: context.percent !== null ? 'derived' : null,
     };
-    const autoCompact = config?.autoCompact
-      ? { tokens: config.autoCompact.value.tokens, ratio: config.autoCompact.value.ratio, source: config.autoCompact.source }
-      : undefined;
+    // OpenCode's ceiling: the window minus compaction.buffer (or the 15%/16k
+    // default); compaction.auto=false is a disabled state, not a missing value.
+    const derived = openCodeAutoCompact(config?.compaction ?? null, window);
+    const autoCompact = derived.autoCompact;
+    const autoCompactState = derived.fieldState;
 
     const unavailable: string[] = [];
     if (!modelField) unavailable.push('model');
@@ -219,7 +250,10 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     return {
       model: modelField?.value ?? null,
       reasoningEffort: reasoningEffortField?.value ?? null,
-      ...(reasoningEffortField ? {} : { fieldStates: { reasoningEffort: 'unavailable' as const } }),
+      fieldStates: {
+        ...(reasoningEffortField ? {} : { reasoningEffort: session?.reasoningSupported === false ? ('unsupported' as const) : ('unknown' as const) }),
+        ...(autoCompact ? {} : autoCompactState ? { 'context.autoCompact': autoCompactState } : {}),
+      },
       context,
       ...(autoCompact ? { autoCompact } : {}),
       ...(modelField ? { modelVerification: modelField.source === 'native' || modelField.source === 'session' ? 'reported' as const : 'configured-only' as const } : {}),

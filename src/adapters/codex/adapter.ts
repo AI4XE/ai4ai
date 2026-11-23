@@ -16,7 +16,7 @@ import { declaration } from '../declarations.js';
 import { CodexDaemon, daemonSocket, resolveTuiThread, type CodexThread } from './control.js';
 import { legacyProofMechanism, sameSessionProof } from '../../core/handoff.js';
 import { codexSessionUsage } from '../../core/session-probe.js';
-import { envValue, probeCodexConfig } from '../../core/config-probe.js';
+import { envValue, probeCodexConfig, probeCodexModelInfo, codexAutoCompact } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
 
 /**
@@ -84,7 +84,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
     // native compact opt-in was not exercised on macOS, so it is not claimed
     // there.
     const reason = linux
-      ? 'Linux headless spawn/status and the same-thread restart handoff were verified with a real app-server: thread/revert to the thread start, then the material turn in the same thread id with no summary call. TUI restart uses the shared daemon and the same revert; compact is the explicit native-summary opt-in. The app-server protocol is upstream-experimental.'
+      ? 'Linux headless spawn/status and the same-thread restart handoff were verified with a real app-server: thread/revert to the thread start, then the material turn in the same thread id with no summary call. TUI restart uses the shared daemon and the same revert; compact is the explicit native-summary opt-in. A Codex-hosted shell reports self status from the identity-bound native rollout (CODEX_THREAD_ID plus workspace). The app-server protocol is upstream-experimental.'
       : mac
         ? 'macOS was exercised with Codex 0.170.0 using the opencode-go provider from the environment (not `codex login`): thread/revert preserved the thread, the headless handoff and the TUI handoff both completed in the same thread, and the old codeword was not in the replaced live context. Native compact was not exercised on macOS, so only restart is claimed. The app-server protocol is upstream-experimental.'
         : 'Codex is supported via WSL on Windows; native Windows harness integration is out of scope and was not exercised.';
@@ -92,14 +92,67 @@ export class CodexAdapter extends ExternalExecutorAdapter {
     const modes = (linux ? ['restart', 'compact'] : ['restart']) as ('compact' | 'restart')[];
     const common = {
       handoff: { availability: level, modes },
-      spawn: { availability: level, maxConcurrent: 4 },
+      spawn: {
+        availability: level, maxConcurrent: 4,
+        persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
+        surfaces: ['headless'] as ('headless' | 'web')[],
+        permissionModes: [] as ('bypassPermissions' | 'dontAsk')[],
+        mcpFilter: 'not-tested' as const,
+      },
+      events: 'normalized' as const,
       status: { availability: level, model: 'not-tested' as const, reasoningEffort: 'unsupported' as const, context: level, percentSource: 'derived' as const },
-      ...(linux || mac ? { evidence: `matrix:codex/${os}/2026-11-21` } : {}),
+      ...(linux || mac ? { evidence: `matrix:codex/${os}/2026-11-22` } : {}),
     };
     return [
       declaration({ harness: 'codex', os, interface: 'headless', reason, experimental: ['app-server'], ...common }),
       declaration({ harness: 'codex', os, interface: 'tui', reason, experimental: ['app-server'], ...common }),
     ];
+  }
+
+  /**
+   * Codex self status.
+   *
+   * A Codex-hosted shell carries `CODEX_THREAD_ID` (verified 0.171.0), so the
+   * caller can observe its own live thread without an executor record. The
+   * rollout must declare both that thread id and this workspace; anything else
+   * is a structured refusal, never a guess from the newest file. Detached
+   * executors keep the supervisor-owned status path.
+   */
+  async status(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    if (request.target !== 'self' || ctx.executorId || !process.env.CODEX_THREAD_ID) return super.status(request, ctx);
+    const thread = process.env.CODEX_THREAD_ID;
+    const usage = await codexSessionUsage(ctx.identity.workspace, thread, process.env.CODEX_HOME).catch(() => null);
+    if (!usage) {
+      return {
+        status: 'unknown',
+        reason: 'The live Codex thread is not present in the native session store for this workspace; no status is fabricated',
+        durable: false,
+        unavailable: ['status.session'],
+        error: { code: 'codex-self-unread', message: `No rollout for thread ${thread} in this workspace` },
+      };
+    }
+    const details = await codexUsage(path.join(ctx.home, '.self'), {
+      workspace: ctx.identity.workspace,
+      sessionId: thread,
+      ...(process.env.CODEX_HOME ? { codexHome: process.env.CODEX_HOME } : {}),
+    }).catch((): StatusDetails => ({}));
+    const state = usage.lastEvent === 'task_complete' ? 'idle' as const : 'running' as const;
+    return {
+      status: 'completed',
+      reason: 'Codex session status read from the native rollout store',
+      durable: true,
+      state,
+      processState: 'alive',
+      sessionId: thread,
+      turns: usage.turns ?? 0,
+      ...(state === 'idle' ? { lastTurnOutcome: 'completed' as const, idleSince: null } : {}),
+      ...(details.model !== undefined ? { model: details.model } : {}),
+      ...(details.reasoningEffort !== undefined ? { reasoningEffort: details.reasoningEffort } : {}),
+      ...(details.context ? { context: details.context } : {}),
+      ...(details.fieldStates ? { fieldStates: details.fieldStates } : {}),
+      ...(details.unavailable ? { unavailable: details.unavailable } : {}),
+      ...(details.modelVerification ? { modelVerification: details.modelVerification } : {}),
+    };
   }
 
   /**
@@ -215,7 +268,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
       };
     }
     try {
-      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.6' } });
+      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } });
       const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
       if (!resolution.ok) {
         return {
@@ -297,7 +350,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
   protected async statusDetails(record: ExecutorRecord, status: ExecutorStatus, _log: LogLine[], ctx: AdapterContext): Promise<StatusDetails> {
     return codexUsage(executorDir(ctx.home, record.executorId), {
       workspace: ctx.identity.workspace,
-      ...(status.sessionId ? { sessionId: status.sessionId } : {}),
+      ...((status.sessionId ?? record.sessionId) ? { sessionId: status.sessionId ?? record.sessionId } : {}),
     });
   }
 }
@@ -490,7 +543,7 @@ async function nativeCompactHandoff(
   ctx: AdapterContext,
   markMutated: () => void,
 ): Promise<NativeOutcome> {
-  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.6' } });
+  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } });
   const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
   if (!resolution.ok) throw new NoLiveThread(resolution.reason);
   const thread = resolution.thread.id;
@@ -636,10 +689,14 @@ export async function codexUsage(
   const modelField = firstVerified<string>([
     { value: nativeModel, source: 'native' },
     { value: session?.model ?? null, source: 'session' },
+    // Codex documents no model-selection variable; these are the only plausible
+    // overrides and an absent one skips the layer without affecting other fields.
+    { value: envValue('CODEX_MODEL') ?? envValue('AI4AI_CODEX_MODEL'), source: 'env' },
     { value: config?.model?.value ?? null, source: config?.model?.source ?? 'unknown' },
   ]);
   const reasoningEffortField = firstVerified<string>([
     { value: session?.reasoningEffort ?? null, source: 'session' },
+    { value: envValue('CODEX_REASONING_EFFORT') ?? envValue('AI4AI_CODEX_REASONING_EFFORT'), source: 'env' },
     { value: config?.reasoningEffort?.value ?? null, source: config?.reasoningEffort?.source ?? 'unknown' },
   ]);
   const usedField = firstVerified<number>([
@@ -649,6 +706,7 @@ export async function codexUsage(
   const windowField = firstVerified<number>([
     { value: nativeWindow, source: 'native' },
     { value: session?.window ?? null, source: 'session' },
+    { value: verifiedWindow(Number(envValue('CODEX_CONTEXT_WINDOW') ?? envValue('AI4AI_CODEX_CONTEXT_WINDOW'))), source: 'env' },
     { value: config?.window?.value ?? null, source: config?.window?.source ?? 'unknown' },
   ]);
 
@@ -660,9 +718,12 @@ export async function codexUsage(
     used: usedField?.source ?? null,
     percent: context.percent !== null ? 'derived' : null,
   };
-  const autoCompact = config?.autoCompact
-    ? { tokens: config.autoCompact.value, ratio: window ? Math.round((config.autoCompact.value / window) * 1000) / 1000 : null, source: config.autoCompact.source }
-    : undefined;
+  // Codex derives its default threshold from the model catalog (90% of the
+  // resolved window); an explicit config/catalog limit is clamped to that.
+  const catalog = modelField
+    ? await probeCodexModelInfo(modelField.value, options.codexHome).catch(() => null)
+    : null;
+  const autoCompact = codexAutoCompact(config?.autoCompact ?? null, catalog, window, windowField?.source) ?? undefined;
 
   const unavailable: string[] = [];
   if (!modelField) unavailable.push('model');
@@ -674,7 +735,10 @@ export async function codexUsage(
   return {
     model: modelField?.value ?? null,
     reasoningEffort: reasoningEffortField?.value ?? null,
-    ...(reasoningEffortField ? {} : { fieldStates: { reasoningEffort: 'unavailable' as const } }),
+    fieldStates: {
+      ...(reasoningEffortField ? {} : { reasoningEffort: 'unavailable' as const }),
+      ...(autoCompact ? {} : { 'context.autoCompact': 'unavailable' as const }),
+    },
     context,
     ...(autoCompact ? { autoCompact } : {}),
     ...(modelField ? { modelVerification: modelField.source === 'native' || modelField.source === 'session' ? 'reported' as const : 'configured-only' as const } : {}),

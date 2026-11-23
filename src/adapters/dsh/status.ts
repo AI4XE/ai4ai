@@ -1,17 +1,20 @@
 import type { AutoCompact, ContextInfo } from '../../contract/types.js';
+import type { FieldStateValue } from '../../contract/states.js';
 import { contextFromUsage } from '../external.js';
 import { dshSessionUsage } from '../../core/session-probe.js';
-import { probeDshConfig } from '../../core/config-probe.js';
+import { probeDshConfig, type DshProfile } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
+import { envValue, dshRuntimeVersion } from '../../core/config-probe.js';
 
 /**
  * Per-field status resolution for DSH, shared by the external adapter and the
  * Cordis plugin.
  *
- * Layers: native session events (usage; model/effort/window when the record
- * carries them) > persisted DSH_HOME session store > config (headless profile
- * patch). DSH exposes no model-selection environment variable, so the env layer
- * is genuinely N/A for this harness.
+ * Layers per field: native session events (usage; model/effort/window when the
+ * record carries them) > persisted DSH_HOME session store > process env > config
+ * (headless profile patch). DSH publishes no documented model/effort variable;
+ * the env candidates below are the only plausible overrides, and an absent one
+ * simply skips that layer without affecting the other fields.
  */
 export interface DshNativeStatus {
   used?: unknown;
@@ -25,12 +28,14 @@ export interface DshStatusDetails {
   reasoningEffort: string | null;
   context: ContextInfo;
   autoCompact?: AutoCompact;
+  /** Installed DSH runtime version (read from the carrier's package). */
+  runtimeVersion?: string;
   modelVerification: 'reported' | 'configured-only' | 'unknown';
-  fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown'>;
+  fieldStates?: Record<string, FieldStateValue>;
   unavailable: string[];
 }
 
-export async function resolveDshStatus(workspace: string, sessionId: string | undefined, native: DshNativeStatus, dshHome?: string): Promise<DshStatusDetails> {
+export async function resolveDshStatus(workspace: string, sessionId: string | undefined, native: DshNativeStatus, dshHome?: string, options: { profile?: DshProfile; dshEntry?: string } = {}): Promise<DshStatusDetails> {
   let used = verifiedTokens(native.used);
   let usedSource: 'native' | 'session' | null = used !== null ? 'native' : null;
   let model = verifiedText(native.model);
@@ -47,18 +52,21 @@ export async function resolveDshStatus(workspace: string, sessionId: string | un
     if (window === null) { window = verifiedWindow(probe?.window); if (window !== null) windowSource = 'session'; }
     if (reasoningEffort === null) { reasoningEffort = verifiedText(probe?.reasoningEffort); if (reasoningEffort !== null) reasoningEffortSource = 'session'; }
   }
-  const config = await probeDshConfig(dshHome).catch(() => null);
+  const config = await probeDshConfig(dshHome, options).catch(() => null);
 
   const modelField = firstVerified<string>([
     { value: model, source: modelSource ?? 'native' },
+    { value: envValue('DSH_MODEL') ?? envValue('AI4AI_DSH_MODEL'), source: 'env' },
     { value: config?.model?.value ?? null, source: config?.model?.source ?? 'config' },
   ]);
   const windowField = firstVerified<number>([
     { value: window, source: windowSource ?? 'native' },
+    { value: verifiedWindow(Number(envValue('DSH_CONTEXT_WINDOW') ?? envValue('AI4AI_DSH_CONTEXT_WINDOW'))), source: 'env' },
     { value: config?.window?.value ?? null, source: config?.window?.source ?? 'config' },
   ]);
   const reasoningEffortField = firstVerified<string>([
     { value: reasoningEffort, source: reasoningEffortSource ?? 'session' },
+    { value: envValue('DSH_REASONING_EFFORT') ?? envValue('AI4AI_DSH_REASONING_EFFORT'), source: 'env' },
     { value: config?.reasoningEffort?.value ?? null, source: config?.reasoningEffort?.source ?? 'config' },
   ]);
 
@@ -70,7 +78,7 @@ export async function resolveDshStatus(workspace: string, sessionId: string | un
     used: usedValue !== null ? usedSource : null,
     percent: context.percent !== null ? 'derived' : null,
   };
-  const autoCompact = config?.autoCompactRatio
+  const autoCompact = !config?.autoCompactDisabled && config?.autoCompactRatio
     ? {
       tokens: windowValue ? Math.round(windowValue * config.autoCompactRatio.value) : null,
       ratio: config.autoCompactRatio.value,
@@ -82,13 +90,25 @@ export async function resolveDshStatus(workspace: string, sessionId: string | un
   if (!modelField) unavailable.push('model');
   if (windowValue === null) unavailable.push('context.window');
   if (usedValue === null) unavailable.push('context.used');
+  // DSH never puts its version in status/usage records; the installed package is
+  // the authoritative artifact the carrier executes. Absent means the runtime
+  // could not be resolved at all, so the field is omitted instead of guessed.
+  const runtimeVersion = await dshRuntimeVersion(options.dshEntry).catch(() => null);
   return {
     model: modelField?.value ?? null,
     reasoningEffort: reasoningEffortField?.value ?? null,
     context,
     ...(autoCompact ? { autoCompact } : {}),
+    ...(runtimeVersion ? { runtimeVersion } : {}),
     modelVerification: !modelField ? 'unknown' : modelField.source === 'native' || modelField.source === 'session' ? 'reported' : 'configured-only',
-    ...(reasoningEffortField ? {} : { fieldStates: { reasoningEffort: 'unavailable' as const } }),
+    fieldStates: {
+      ...(reasoningEffortField ? {} : { reasoningEffort: 'unavailable' as const }),
+      // The active profile's configuration (the web bundle patch or a user
+      // patch) turns compaction-basic off: the harness has the feature but it is
+      // disabled, which is the contract's `disabled` state — never a missing
+      // value and therefore never listed in `unavailable`.
+      ...(config?.autoCompactDisabled ? { 'context.autoCompact': 'disabled' as const } : {}),
+    },
     unavailable,
   };
 }
@@ -102,13 +122,19 @@ export async function resolveDshStatus(workspace: string, sessionId: string | un
 export function reconcileDshStatus(
   base: Pick<import('../../contract/types.js').Result, 'fieldStates'>,
   details: DshStatusDetails,
-): { fieldStates: Record<string, 'unsupported' | 'unavailable' | 'unknown'>; unavailable: string[] } {
+): { fieldStates: Record<string, FieldStateValue>; unavailable: string[] } {
   const missing = new Set(details.unavailable);
+  // Every non-`disabled` field state is a missing value and must be listed in
+  // `unavailable` (contract: disabled is the only state that is not missing).
+  for (const [key, state] of Object.entries(details.fieldStates ?? {})) if (state !== 'disabled') missing.add(key);
   if (details.context.percent === null) missing.add('context.percent');
+  const fieldStates: Record<string, FieldStateValue> = { ...(base.fieldStates ?? {}), ...(details.fieldStates ?? {}) };
   const auto = details.autoCompact;
-  if (!auto || (auto.tokens === null && auto.ratio === null)) missing.add('context.autoCompact');
-  const fieldStates: Record<string, 'unsupported' | 'unavailable' | 'unknown'> = { ...(base.fieldStates ?? {}), ...(details.fieldStates ?? {}) };
-  for (const key of Object.keys(fieldStates)) if (!missing.has(key)) delete fieldStates[key];
+  if ((!auto || (auto.tokens === null && auto.ratio === null)) && fieldStates['context.autoCompact'] !== 'disabled') missing.add('context.autoCompact');
+  for (const key of Object.keys(fieldStates)) {
+    if (fieldStates[key] === 'disabled') missing.delete(key);
+    else if (!missing.has(key)) delete fieldStates[key];
+  }
   for (const key of missing) fieldStates[key] = fieldStates[key] ?? 'unavailable';
   return { fieldStates, unavailable: [...missing] };
 }

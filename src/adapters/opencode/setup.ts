@@ -11,8 +11,8 @@ import { Ai4aiStore } from '../../core/store.js';
 import { activeRecord } from '../../core/journal.js';
 import { currentOs, execute } from '../../core/operations.js';
 import { openCodeSessionUsage, sessionActivity, sessionPointer } from '../../core/session-probe.js';
-import { probeOpenCodeConfig } from '../../core/config-probe.js';
-import { firstVerified } from '../../core/ladder.js';
+import { envValue, probeOpenCodeConfig, openCodeAutoCompact } from '../../core/config-probe.js';
+import { firstVerified, verifiedTokens } from '../../core/ladder.js';
 import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
 import { contextFromUsage } from '../external.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
@@ -24,6 +24,37 @@ const latestWindow = (messages: any[]): any => messages.filter(message => messag
 /** The handoff window: accepted but not yet completed. */
 const handoffWindow = (record: OpenCodeRecord): boolean => ['pending', 'scheduled', 'applied'].includes(record.phase);
 const retainedNotice = 'AI4AI is replacing this session\'s context; this input was retained and will be delivered in the fresh context.';
+
+/**
+ * Native token accounting for one assistant message.
+ *
+ * OpenCode stores the figures under `tokens` (the TUI export) or `usage` (an
+ * earlier shape); both carry `input`, `output`, `reasoning` and
+ * `cache.{read,write}`. `used` is prompt occupancy (input + cache reads/writes);
+ * generated output is deliberately excluded so thresholds stay comparable.
+ */
+/**
+ * Pick the assistant message that carries token figures. The newest row can be
+ * the in-progress turn (the status call runs inside it) and reports no tokens;
+ * the most recent completed message is the truthful usage source.
+ */
+export function selectAssistantUsage(messages: any[]): any | undefined {
+  const assistants = [...messages].reverse().filter(message => message && message.type === 'assistant');
+  return assistants.find(message => (message.tokens && typeof message.tokens === 'object')
+    || (message.usage && typeof message.usage === 'object')) ?? assistants[0];
+}
+
+export function openCodeMessageUsage(last: any): { model: string | null; used: number | null } {
+  const model = typeof last?.modelID === 'string' ? last.modelID
+    : typeof last?.model?.id === 'string' ? last.model.id : null;
+  const source = last?.tokens && typeof last.tokens === 'object' ? last.tokens
+    : last?.usage && typeof last.usage === 'object' ? last.usage : null;
+  const cache = source?.cache && typeof source.cache === 'object' ? source.cache as Record<string, unknown> : {};
+  const input = typeof source?.input === 'number' ? source.input as number : null;
+  const cached = (typeof cache.read === 'number' ? cache.read as number : 0) + (typeof cache.write === 'number' ? cache.write as number : 0);
+  const used = input === null ? null : verifiedTokens(input + cached);
+  return { model, used };
+}
 
 /**
  * Native OpenCode plugin: same-session handoff through the plugin's own
@@ -97,24 +128,22 @@ export async function setup(ctx: any): Promise<() => void> {
     let nativeUsed: number | null = null;
     try {
       const messages = await ctx.session.context({ sessionID: caller.session });
-      const last = [...messages].reverse().find(message => message.type === 'assistant');
-      nativeModel = last?.modelID ?? last?.model?.id ?? null;
-      if (last?.usage) {
-        // Prompt occupancy only: input plus cache reads/writes.
-        const cache = last.usage.cache;
-        const cached = cache && typeof cache === 'object'
-          ? (typeof cache.read === 'number' ? cache.read : 0) + (typeof cache.write === 'number' ? cache.write : 0)
-          : 0;
-        const input = typeof last.usage.input === 'number' ? last.usage.input : null;
-        nativeUsed = input === null ? null : input + cached;
-      }
-    } catch { /* report unavailable */ }
+      // The tool call runs inside the current assistant turn, so the newest
+      // assistant row is still in progress and carries no token figures. Use the
+      // most recent assistant message that actually reports tokens (completed
+      // turn); fall back to the newest one only for the model field.
+      const last = selectAssistantUsage(messages);
+      const usage = openCodeMessageUsage(last);
+      nativeModel = usage.model;
+      nativeUsed = usage.used;
+    } catch { /* the persisted layers below still apply */ }
     // Layers 2/4: the persisted session store and the model catalog/config.
     const probe = await openCodeSessionUsage(caller.workspace, caller.session).catch(() => null);
     const config = await probeOpenCodeConfig(caller.workspace).catch(() => null);
     const modelField = firstVerified<string>([
       { value: nativeModel, source: 'native' },
       { value: probe?.model ?? null, source: 'session' },
+      { value: envValue('AI4AI_OPENCODE_MODEL') ?? envValue('OPENCODE_MODEL'), source: 'env' },
       { value: config?.model?.value ?? null, source: config?.model?.source ?? 'config' },
     ]);
     const usedField = firstVerified<number>([
@@ -123,10 +152,12 @@ export async function setup(ctx: any): Promise<() => void> {
     ]);
     const windowField = firstVerified<number>([
       { value: probe?.window ?? null, source: 'session' },
+      { value: Number(envValue('AI4AI_OPENCODE_CONTEXT_WINDOW') ?? envValue('OPENCODE_CONTEXT_WINDOW')) || null, source: 'env' },
       { value: config?.window?.value ?? null, source: config?.window?.source ?? 'config' },
     ]);
     const reasoningEffortField = firstVerified<string>([
       { value: probe?.reasoningEffort ?? null, source: 'session' },
+      { value: envValue('AI4AI_OPENCODE_REASONING_EFFORT') ?? envValue('OPENCODE_REASONING_EFFORT'), source: 'env' },
       { value: config?.reasoningEffort?.value ?? null, source: config?.reasoningEffort?.source ?? 'config' },
     ]);
     const used = usedField?.value ?? null;
@@ -137,12 +168,18 @@ export async function setup(ctx: any): Promise<() => void> {
       used: usedField?.source ?? null,
       percent: context.percent !== null ? 'derived' : null,
     };
-    const autoCompact = config?.autoCompact
-      ? { tokens: config.autoCompact.value.tokens, ratio: config.autoCompact.value.ratio, source: config.autoCompact.source }
-      : undefined;
+    // OpenCode's ceiling: the window minus compaction.buffer (or the 15%/16k
+    // default); compaction.auto=false is a disabled state, not a missing value.
+    const derived = openCodeAutoCompact(config?.compaction ?? null, window);
+    const autoCompact = derived.autoCompact;
+    const autoCompactState = derived.fieldState;
     const records = await journal.rows(caller);
     const active = activeRecord(records, record => terminal(record));
-    const unavailable = [...(modelField ? [] : ['model']), ...(window === null ? ['context.window'] : []), ...(used === null ? ['context.used'] : [])];
+    const unavailable = [
+      ...(modelField ? [] : ['model']),
+      ...(window === null ? ['context.window'] : []),
+      ...(used === null ? ['context.used'] : []),
+    ];
     const pointer = await sessionPointer('opencode', caller.workspace, caller.session).catch(() => null);
     const activity = await sessionActivity(pointer?.path ?? null);
     const handoff = active ? handoffOutcome(active.phase) : undefined;
@@ -161,7 +198,10 @@ export async function setup(ctx: any): Promise<() => void> {
       verification: { model: !modelField ? 'unknown' : modelField.source === 'native' || modelField.source === 'session' ? 'reported' : 'configured-only', context: 'derived' },
       context,
       ...(autoCompact ? { autoCompact } : {}),
-      ...(reasoningEffortField ? {} : { fieldStates: { reasoningEffort: 'unavailable' as const } }),
+      fieldStates: {
+        ...(reasoningEffortField ? {} : { reasoningEffort: probe?.reasoningSupported === false ? ('unsupported' as const) : ('unknown' as const) }),
+        ...(autoCompact ? {} : autoCompactState ? { 'context.autoCompact': autoCompactState } : {}),
+      },
       unavailable,
     });
   };

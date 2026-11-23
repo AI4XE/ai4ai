@@ -1,7 +1,7 @@
 import type {
-  AdoptionProof, AutoCompact, CapabilityDeclaration, ContextInfo, ContractError, Notice, Request, Result,
+  AdoptionProof, AutoCompact, CapabilityDeclaration, ContextInfo, ContractError, LogTail, Notice, Request, Result,
 } from '../contract/types.js';
-import type { HarnessId, LifecycleState, Os, State } from '../contract/states.js';
+import type { FieldStateValue, HarnessId, LifecycleState, Os, PersistenceMode, ProcessState, State, TurnOutcome } from '../contract/states.js';
 import type { Identity } from '../contract/types.js';
 import type { Ai4aiStore } from '../core/store.js';
 
@@ -20,6 +20,21 @@ export interface NativeOutcome {
   lastActivityAt?: string | null;
   lastActivityAtSource?: import('../contract/states.js').SourceLabel | null;
   stateSource?: import('../contract/states.js').SourceLabel | null;
+  processState?: ProcessState;
+  processStateReason?: string;
+  turns?: number;
+  lastOperationId?: string | null;
+  lastTurnOutcome?: TurnOutcome | null;
+  queuedTurns?: number;
+  lastTurnAt?: string | null;
+  turnStartedAt?: string | null;
+  idleSince?: string | null;
+  turnId?: string;
+  queuePosition?: number;
+  persistence?: PersistenceMode;
+  runtimeVersion?: string | null;
+  mcpFiltered?: { names: string[]; count: number };
+  logTail?: LogTail;
   exitCode?: number | null;
   signal?: string | null;
   session?: Result['session'];
@@ -27,7 +42,7 @@ export interface NativeOutcome {
   verification?: Result['verification'];
   context?: ContextInfo;
   autoCompact?: AutoCompact;
-  fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown'>;
+  fieldStates?: Record<string, FieldStateValue>;
   unavailable?: string[];
   notices?: Notice[];
   error?: ContractError;
@@ -63,4 +78,6 @@ export interface Adapter {
   status(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
   message(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
   cancel(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
+  /** Graceful completion of a detached owned executor (`stop` stays cancelled). */
+  finish(request: Request, ctx: AdapterContext): Promise<NativeOutcome>;
 }

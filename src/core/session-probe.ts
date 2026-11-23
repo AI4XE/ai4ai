@@ -19,6 +19,10 @@ export interface SessionUsage {
   model: string | null;
   window: number | null;
   reasoningEffort?: string | null;
+  /** Completed/started task turns observed in the rollout (Codex only). */
+  turns?: number;
+  /** Last task event type, used to distinguish a running turn from idle (Codex only). */
+  lastEvent?: string | null;
   source: string;
 }
 
@@ -180,7 +184,7 @@ export async function dshSessionUsage(workspace: string, sessionId?: string, dsh
       const model = selection.model;
       const reasoningEffort = selection.reasoningEffort;
       let used: number | null = null;
-      let window: number | null = null;
+        let window: number | null = null;
       for (const row of rows) {
         // DSH persists typed events under `data`; tolerate older flat shapes.
         const data = row.data && typeof row.data === 'object' ? row.data as Record<string, unknown> : row;
@@ -227,7 +231,9 @@ export async function claudeTranscriptUsage(workspace: string, sessionId?: strin
       const usage = message?.usage ?? row.usage;
       if (usage && typeof usage === 'object') {
         const input = safeInt(usage.input_tokens);
-        if (input !== null) used = input + (safeInt(usage.cache_creation_input_tokens) ?? 0) + (safeInt(usage.cache_read_input_tokens) ?? 0);
+        if (input !== null) {
+          used = input + (safeInt(usage.cache_creation_input_tokens) ?? 0) + (safeInt(usage.cache_read_input_tokens) ?? 0);
+        }
       }
       if (typeof message?.model === 'string') model = message.model;
       if (typeof row.effort === 'string') reasoningEffort = row.effort;
@@ -272,6 +278,8 @@ export async function codexSessionUsage(workspace: string, sessionId?: string, c
     let model: string | null = null;
     let window: number | null = null;
     let reasoningEffort: string | null = null;
+    let turns = 0;
+    let lastEvent: string | null = null;
     for (const row of rows) {
       if (row.type === 'turn_context' && row.payload && typeof row.payload === 'object') {
         const payload = row.payload as Record<string, unknown>;
@@ -284,18 +292,23 @@ export async function codexSessionUsage(workspace: string, sessionId?: string, c
         if (payload.type === 'token_count' && payload.info && typeof payload.info === 'object') {
           const last = payload.info.last_token_usage as Record<string, unknown> | undefined;
           const input = safeInt(last?.input_tokens);
-          if (input !== null) used = input;
+          if (input !== null) {
+            used = input;
+          }
           const candidate = safeInt(payload.info.model_context_window);
           if (candidate) window = candidate;
         }
         if (payload.type === 'task_started') {
+          turns += 1;
+          lastEvent = 'task_started';
           const candidate = safeInt(payload.model_context_window);
           if (candidate) window = candidate;
         }
+        if (payload.type === 'task_complete') lastEvent = 'task_complete';
       }
     }
     if (used !== null || model !== null || window !== null || reasoningEffort !== null) {
-      return { used, model, window, reasoningEffort, source: 'codex-session-store' };
+      return { used, model, window, reasoningEffort, turns, lastEvent, source: 'codex-session-store' };
     }
   } catch { /* schema change: no fallback */ }
   return null;
@@ -320,6 +333,8 @@ async function findCodexRollout(root: string, sessionId: string): Promise<string
 
 export interface OpenCodeUsage extends SessionUsage {
   provider?: string | null;
+  /** Whether the model catalog declares reasoning support (null when not stated). */
+  reasoningSupported?: boolean | null;
 }
 
 /**
@@ -337,44 +352,75 @@ export async function openCodeSessionUsage(workspace: string, sessionId?: string
   if (!id) return null;
   const file = dbPath || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'opencode', 'opencode.db');
   if (!existsSync(file)) return null;
-  let db: { prepare: (sql: string) => { get: (...params: unknown[]) => Record<string, unknown> | undefined }; close: () => void } | null = null;
+  let db: { prepare: (sql: string) => { get: (...params: unknown[]) => Record<string, unknown> | undefined; all: (...params: unknown[]) => Record<string, unknown>[] }; close: () => void } | null = null;
   try {
     const sqlite = await import('node:sqlite');
     db = new (sqlite as unknown as { DatabaseSync: new (path: string, options: { readOnly: boolean }) => any }).DatabaseSync(file, { readOnly: true });
-    const row = db!.prepare('SELECT directory, model FROM session_v2 WHERE id = ?').get(id);
+    // 2.x keeps sessions in `session_v2`; 1.x uses `session` with flat token columns.
+    let row: Record<string, unknown> | undefined;
+    let schema: 'v2' | 'v1' = 'v2';
+    try {
+      row = db!.prepare('SELECT directory, model FROM session_v2 WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    } catch { row = undefined; /* the 1.x schema has no session_v2 table */ }
+    if (!row) {
+      try {
+        const legacy = db!.prepare('SELECT directory, model, tokens_input, tokens_cache_read, tokens_cache_write FROM session WHERE id = ?').get(id);
+        if (legacy) { row = legacy; schema = 'v1'; }
+      } catch { /* not the 1.x schema either */ }
+    }
     if (!row || !sameWorkspace(row.directory, workspace)) return null;
     let model: string | null = null;
     let provider: string | null = null;
+    let variant: string | null = null;
     try {
-      const parsed = JSON.parse(String(row.model)) as { id?: unknown; providerID?: unknown };
+      const parsed = JSON.parse(String(row.model)) as { id?: unknown; providerID?: unknown; variant?: unknown };
       model = safeText(parsed.id);
       provider = safeText(parsed.providerID);
+      variant = safeText(parsed.variant);
     } catch { /* older or malformed model column */ }
     let used: number | null = null;
-    const message = db!.prepare("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' ORDER BY seq DESC LIMIT 1").get(id);
-    if (message && typeof message.data === 'string') {
-      try {
-        const data = JSON.parse(message.data) as { tokens?: Record<string, any> };
-        const tokens = data.tokens;
-        const input = safeInt(tokens?.input);
-        if (input !== null) {
+    if (schema === 'v2') {
+      // A status call can run while the newest assistant row is still streaming
+      // (tokens null). Walk back to the most recent completed message that carries
+      // token figures instead of stopping at the in-progress row.
+      const messageRows = db!.prepare("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' ORDER BY seq DESC LIMIT 20").all(id);
+      for (const message of messageRows) {
+        if (!message || typeof message.data !== 'string') continue;
+        try {
+          const data = JSON.parse(message.data) as { tokens?: Record<string, any> };
+          const tokens = data.tokens;
+          const input = safeInt(tokens?.input);
+          if (input === null) continue;
           const cache = tokens?.cache && typeof tokens.cache === 'object' ? tokens.cache as Record<string, unknown> : {};
           used = input + (safeInt(cache.read) ?? 0) + (safeInt(cache.write) ?? 0);
-        }
-      } catch { /* malformed message */ }
+          break;
+        } catch { /* malformed message */ }
+      }
+    } else {
+      const input = safeInt(row.tokens_input);
+      if (input !== null) used = input + (safeInt(row.tokens_cache_read) ?? 0) + (safeInt(row.tokens_cache_write) ?? 0);
     }
     let window: number | null = null;
+    let reasoningSupported: boolean | null = null;
     if (provider && model) {
-      const catalogRow = db!.prepare('SELECT value FROM kv WHERE key = ?').get('models-dev:v2:catalog');
-      if (catalogRow && typeof catalogRow.value === 'string') {
-        try {
+      try {
+        const catalogRow = db!.prepare('SELECT value FROM kv WHERE key = ?').get('models-dev:v2:catalog');
+        if (catalogRow && typeof catalogRow.value === 'string') {
           const catalog = JSON.parse(String(JSON.parse(catalogRow.value).body)) as Record<string, any>;
-          const limit = catalog?.[provider]?.models?.[model]?.limit?.context;
+          const entry = catalog?.[provider]?.models?.[model];
+          const limit = entry?.limit?.context;
           window = safeInt(limit) || null;
-        } catch { /* catalog cache shape changed */ }
-      }
+          const capability = entry?.capabilities?.reasoning;
+          if (typeof capability === 'boolean') reasoningSupported = capability;
+          else if (capability && typeof capability === 'object' && typeof capability.supported === 'boolean') reasoningSupported = capability.supported;
+        }
+      } catch { /* 1.x or an unexpected catalog cache shape */ }
     }
-    return { used, model, window, reasoningEffort: null, provider, source: 'opencode-session-store' };
+    // OpenCode records the selected variant (`default` = the provider default).
+    // It is the harness's own value for the reasoning-effort selection; a model
+    // the catalog declares non-reasoning has no effort to report.
+    const reasoningEffort = reasoningSupported === false ? null : variant ?? (model ? 'default' : null);
+    return { used, model, window, reasoningEffort, reasoningSupported, provider, source: 'opencode-session-store' };
   } catch {
     return null;
   } finally {

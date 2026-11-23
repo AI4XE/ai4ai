@@ -57,7 +57,7 @@ async function main(): Promise<void> {
     onMessage: listener => daemon.onMessage(listener),
   };
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.6' } }, 10000);
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } }, 10000);
     const delivery = `AI4AI handoff delivery ${marker}. Adopt the caller-supplied task in this fresh context:\n${request.task ?? ''}\nNative system/security instructions remain authoritative.`;
     const outcome = await applyRevertHandoff(transport, {
       threadId,

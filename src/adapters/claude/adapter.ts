@@ -2,15 +2,16 @@ import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AdapterContext, CarrierCommand, StatusDetails } from '../external.js';
-import { ExternalExecutorAdapter, lastJson } from '../external.js';
+import { ExternalExecutorAdapter, lastJson, readFilteredMcp } from '../external.js';
 import { resolveClaudeStatus } from './status.js';
 import { verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
 import { envValue, probeClaudeSettings } from '../../core/config-probe.js';
 import type { CapabilityDeclaration, Request } from '../../contract/types.js';
 import type { HarnessId, Os } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
-import type { LogLine, ExecutorStatus } from '../executors.js';
+import { executorDir, type LogLine, type ExecutorStatus } from '../executors.js';
 import { declaration } from '../declarations.js';
+import { filterMcpConfig } from '../../core/mcp-filter.js';
 
 /**
  * Claude Code adapter.
@@ -48,9 +49,16 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
     const carrier = linux || mac ? 'supported' as const : 'not-tested' as const;
     const common = {
       handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart'] as ('compact' | 'restart')[] },
-      spawn: { availability: carrier, maxConcurrent: 4 },
+      spawn: {
+        availability: carrier, maxConcurrent: 4,
+        persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
+        surfaces: ['headless'] as ('headless' | 'web')[],
+        permissionModes: ['bypassPermissions', 'dontAsk'] as ('bypassPermissions' | 'dontAsk')[],
+        mcpFilter: 'supported' as const,
+      },
+      events: 'normalized' as const,
       status: { availability: carrier, model: carrier, reasoningEffort: 'unsupported' as const, context: carrier, percentSource: 'derived' as const },
-      ...(linux || mac ? { evidence: `matrix:claude-code/${os}/2026-11-21` } : {}),
+      ...(linux || mac ? { evidence: `matrix:claude-code/${os}/2026-11-22` } : {}),
     };
     return [
       declaration({ harness: 'claude-code', os, interface: 'tui', reason, ...common }),
@@ -79,10 +87,52 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
     return settings?.effortLevel?.value ?? undefined;
   }
 
-  protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {
-    // A detached executor has no one to answer permission prompts: run it in the
-    // harness's non-interactive bypass mode, consistent with the spawn contract.
-    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'];
+  protected carrierMode(request: Request): 'resident' | 'per-turn' {
+    // qgo-parity persistent mode keeps one interactive stream-json child alive
+    // across turns, preserving in-process/background state and MCP connections.
+    return request.spawn?.persistence === 'persistent' ? 'resident' : 'per-turn';
+  }
+
+  /** Generate the filtered MCP config once per executor and reuse it on resume. */
+  private async ensureMcp(request: Request, ctx: AdapterContext, executorId: string): Promise<string> {
+    const destination = path.join(executorDir(ctx.home, executorId), 'mcp.json');
+    if (existsSync(destination)) return destination;
+    await filterMcpConfig({
+      workspace: ctx.identity.workspace,
+      destination,
+      extraDeny: request.spawn?.mcp?.deny ?? [],
+    });
+    return destination;
+  }
+
+  protected async filteredMcpNames(ctx: AdapterContext, executorId: string): Promise<{ names: string[]; count: number } | undefined> {
+    return readFilteredMcp(executorDir(ctx.home, executorId));
+  }
+
+  protected async carrier(request: Request, ctx: AdapterContext, executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {
+    // A detached executor has no one to answer permission prompts: run it in a
+    // non-interactive permission mode. `bypassPermissions` is the default;
+    // `dontAsk` requires an explicit allowedTools list (validated by the
+    // contract) because the carrier implements no prompt control protocol.
+    const spawn = request.spawn ?? {};
+    const permissionMode = spawn.permissionMode ?? 'bypassPermissions';
+    const resident = this.carrierMode(request) === 'resident';
+    const args = resident
+      ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
+      : ['-p', '--output-format', 'stream-json', '--verbose'];
+    // Project/local settings only: user-level settings must not be able to
+    // override the executor's provider/model route (qgo carrier parity).
+    args.push('--setting-sources', 'project,local');
+    args.push('--permission-mode', permissionMode);
+    // Harmless settings qgo passes so a bypass executor never shows an
+    // interactive dangerous-mode prompt or suggestions.
+    args.push('--settings', JSON.stringify({ skipDangerousModePermissionPrompt: true, promptSuggestionEnabled: false }));
+    if (permissionMode === 'dontAsk') args.push('--allowedTools', (spawn.allowedTools ?? []).join(','));
+    if (spawn.disallowedTools?.length) args.push('--disallowedTools', spawn.disallowedTools.join(','));
+    // Only the filtered project MCP configuration is visible to the executor;
+    // user-level MCP servers are never copied or inherited.
+    const mcpPath = await this.ensureMcp(request, ctx, executorId);
+    args.push('--strict-mcp-config', '--mcp-config', mcpPath);
     // Resume selects the existing session; a new turn gets a fresh session id.
     // Never pass both: the CLI rejects two session selectors.
     if (resumeSessionId) args.push('--resume', resumeSessionId);
@@ -128,9 +178,14 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
       nativeModel = verifiedText(Object.keys(modelUsage)[0] ?? result.model);
       nativeWindow = nativeModel ? verifiedWindow(modelUsage[nativeModel]?.contextWindow) : null;
     }
-    return resolveClaudeStatus(ctx.identity.workspace, status.sessionId, {
+    // Runtime version: the stream-json init event carries the native version.
+    const init = lastJson(log, value => value.type === 'system' && value.subtype === 'init');
+    const runtimeVersion = verifiedText(init?.claude_code_version ?? init?.version, 256);
+    const details = await resolveClaudeStatus(ctx.identity.workspace, status.sessionId, {
       used: nativeUsed, model: nativeModel, window: nativeWindow,
+      runtimeVersion,
     });
+    return details;
   }
 }
 

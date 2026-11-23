@@ -118,7 +118,21 @@ if (command.action === 'transition') {
 }
 
 const parsed = validateRequest(command.request);
-if (!parsed.ok) throw new Error('Invalid AI4AI request: ' + parsed.issues.map(issue => issue.code).join(', '));
+if (!parsed.ok) {
+  // INFRA-085 B: a caller field/validation error is a structured result, not a
+  // thrown error. Throwing here made the plugin report a journal failure for a
+  // request the caller can fix.
+  const base = (command.request && typeof command.request === 'object' ? command.request : {}) as Partial<Request>;
+  console.log(JSON.stringify({
+    result: result(
+      { operation: (base.operation as Request['operation']) ?? 'status', operationId: typeof base.operationId === 'string' ? base.operationId : 'invalid-request' },
+      'unsupported',
+      'Request failed contract validation',
+      { error: { code: 'invalid-request', message: parsed.issues.map(issue => `${issue.path}:${issue.code}`).join(', ') } },
+    ),
+  }));
+  process.exit(0);
+}
 const request = parsed.value;
 const prior = journal.latest(records, request.operationId);
 
@@ -137,11 +151,14 @@ if (request.operation === 'status' && (request.target === undefined || request.t
   const pointer = await sessionPointer('claude-code', caller.workspace, caller.session).catch(() => null);
   const activity = await sessionActivity(pointer?.path ?? null);
   const compactionDisabled = !!process.env.DISABLE_COMPACT && process.env.DISABLE_COMPACT !== '0';
+  const notices = [
+    ...(compactionDisabled ? [{ code: 'claude-compaction-disabled', impact: 'none' as const, action_required: false as const, message: 'Compaction is switched off in this session (DISABLE_COMPACT); the in-place restart handoff is unsupported here.' }] : []),
+    ...(details.notices ?? []),
+  ];
   console.log(JSON.stringify({
     result: result(request, 'completed', 'Native session status', {
       durable: true,
-      // A session-level limit, reported honestly without blocking status.
-      ...(compactionDisabled ? { notices: [{ code: 'claude-compaction-disabled', impact: 'none' as const, action_required: false as const, message: 'Compaction is switched off in this session (DISABLE_COMPACT); the in-place restart handoff is unsupported here.' }] } : {}),
+      ...(notices.length ? { notices } : {}),
       // The session is alive while it serves this call; handoff progress is
       // reported separately, and quiescence is inferred from lastActivityAt.
       state: 'running',
@@ -165,6 +182,17 @@ if (request.operation === 'status' && (request.target === undefined || request.t
 
 if (request.operation === 'capabilities') {
   console.log(JSON.stringify({ result: result(request, 'completed', 'Claude adapter capabilities are declared by the installed plugin', { durable: false, capabilities: new ClaudeAdapter().capabilities(currentOs()) }) }));
+  process.exit(0);
+}
+
+if (request.operation === 'finish') {
+  // A self finish is refused explicitly; a detached owned executor is served
+  // by the external control plane.
+  if (request.target === 'self' || request.target === undefined) {
+    console.log(JSON.stringify({ result: result(request, 'unsupported', 'finish completes a detached owned executor; an in-harness session has no supervisor to complete', { unavailable: ['finish.self'] }) }));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({ result: await external(request) }));
   process.exit(0);
 }
 

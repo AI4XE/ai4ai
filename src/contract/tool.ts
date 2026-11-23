@@ -41,8 +41,9 @@ export const TOOL_DESCRIPTION = `AI Harness Extension Kit (ai4ai)
 - status — query this session's context window, tokens used, usage percent, model, reasoning effort and auto-compact setting. Returns context {window, used (tokens), percent (0–100), sources}, model, reasoningEffort, autoCompact {tokens, ratio, source}.
 - handoff — renew this session's context at a safe point: start a fresh context that keeps the same task when the conversation gets long or the context is nearly full.
 - spawn — start a detached executor that works in parallel while this session continues.
-- message / stop / list — manage executors.
+- message / stop / finish / list — manage executors (message revives a terminal executor in its session; finish completes gracefully).
 - capabilities — list supported operations for this harness.
+- CLI helpers (orchestrator-side; shell commands, not tool calls): \`ai4ai watch --executor <id> --until "<condition>" [--timeout S]\` (exit 0 met / 3 timeout / 2 usage / 1 runtime), \`ai4ai events --executor <id>\` (normalized tail with cursor), \`ai4ai sweep\` (identity-checked orphan cleanup). Run \`ai4ai --help\` for conditions and flags.
 Notices are informational; on pending, finish the turn.`;
 
 /** Logical tool identifier per surface, for docs and help text. */

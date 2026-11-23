@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { homedir } from 'node:os';
@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { atomicJson, bytes, digest, ownership, selectedRoot, withScopeLock } from './scope.js';
-import { installDsh } from './dsh-installer.js';
+import { installDsh, inspectDshProfiles, type DshProfileInspection } from './dsh-installer.js';
 import type { HarnessId, Os } from '../contract/states.js';
 import { currentOs } from '../core/operations.js';
 
@@ -17,6 +17,13 @@ export interface InstallActionReport {
   state: 'installed' | 'already-installed' | 'uninstalled' | 'already-uninstalled' | 'unsupported' | 'skipped' | 'failed' | 'unknown';
   reason: string;
   target?: string;
+  /** DSH destination profile; other harnesses have no profile dimension. */
+  profile?: string;
+}
+export interface DshCoverage {
+  home: string;
+  profiles: DshProfileInspection[];
+  notices: string[];
 }
 export interface InstallReport {
   product: 'ai4ai';
@@ -25,6 +32,7 @@ export interface InstallReport {
   scope: 'user' | 'project';
   dryRun: boolean;
   actions: InstallActionReport[];
+  dsh?: DshCoverage;
 }
 
 export interface InstallOptions {
@@ -43,6 +51,19 @@ export interface InstallOptions {
 interface Detection { harness: HarnessId; installed: boolean; binary?: string; version?: string; reason: string }
 
 const HARNESSES: readonly HarnessId[] = ['claude-code', 'codex', 'opencode', 'dsh'];
+
+/** DSH functional pair: the Web session orchestrates, detached executors boot headless. */
+const DSH_PROFILES = ['web', 'headless'] as const;
+
+/** With no --profile, DSH installs both functional profiles; --profile narrows to one. */
+export function dshProfilesFor(options: InstallOptions): string[] {
+  return options.profile ? [options.profile] : [...DSH_PROFILES];
+}
+
+/** Resolve DSH_HOME the way the native harness does: blank means unset. */
+export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
+  return path.resolve(env.DSH_HOME?.trim() ? env.DSH_HOME : path.join(homedir(), '.dsh'));
+}
 
 const packageRoot = (options: InstallOptions): string =>
   options.packageRoot ?? process.env.AI4AI_PACKAGE_ROOT ?? fileURLToPath(new URL('../../', import.meta.url));
@@ -109,7 +130,7 @@ export async function detectHarnesses(options: InstallOptions = { action: 'insta
 }
 
 interface JournalRecord {
-  harness: HarnessId; action: InstallAction; state: string; target?: string; version: string; at: string;
+  harness: HarnessId; action: InstallAction; state: string; target?: string; profile?: string; version: string; at: string;
 }
 interface Journal { product: 'ai4ai'; format: 2; ownerToken: string; records: JournalRecord[] }
 
@@ -325,16 +346,91 @@ async function unregisterOpenCodeProject(workspace: string, spec: string | undef
   return { harness: 'opencode', action: 'uninstall', state: 'uninstalled', reason: 'Project-scoped OpenCode plugin registration removed', target: file };
 }
 
-async function registerDsh(runtime: string, options: InstallOptions, env: NodeJS.ProcessEnv): Promise<InstallActionReport> {
-  const dshHome = env.DSH_HOME || path.join(homedir(), '.dsh');
-  const profile = options.profile ?? env.AI4AI_DSH_PROFILE ?? 'web';
+async function registerDsh(runtime: string, options: InstallOptions, env: NodeJS.ProcessEnv, profile: string): Promise<InstallActionReport> {
+  const dshHome = resolveDshHome(env);
   const entry = env.AI4AI_DSH_ENTRY;
   const command = entry
     ? { file: env.AI4AI_DSH_NODE || process.execPath, prefixArgs: [entry], env }
     : { file: 'dsh', prefixArgs: [], env };
-  if (options.dryRun) return { harness: 'dsh', action: 'install', state: 'installed', reason: `dry-run: would install into DSH profile ${profile}`, target: dshHome };
+  if (options.dryRun) return { harness: 'dsh', action: 'install', state: 'installed', reason: `dry-run: would install into DSH profile ${profile}`, target: path.join(dshHome, 'profiles', profile), profile };
   const result = await installDsh({ home: dshHome, profile, command, action: options.action === 'uninstall' ? 'uninstall' : 'install', packageRoot: runtime });
-  return { harness: 'dsh', action: options.action, state: result.state as InstallActionReport['state'], reason: result.reason };
+  return {
+    harness: 'dsh', action: options.action, state: result.state as InstallActionReport['state'], reason: result.reason, profile,
+    ...(result.target ? { target: result.target } : {}),
+  };
+}
+
+/**
+ * After a multi-profile run, confirm every reported success really landed and
+ * that the profiles agree on one version. A half-installed DSH must fail the
+ * command instead of passing as complete.
+ */
+async function verifyDshReport(actions: InstallActionReport[], options: InstallOptions, env: NodeJS.ProcessEnv): Promise<void> {
+  const dshActions = actions.filter(action => action.harness === 'dsh');
+  if (!dshActions.length || dshActions.some(action => action.state === 'failed' || action.state === 'unknown')) return;
+  const coverage = await inspectDshProfiles(resolveDshHome(env), dshProfilesFor(options));
+  for (const action of dshActions) {
+    if (action.state !== 'installed' && action.state !== 'already-installed') continue;
+    const entry = coverage.find(candidate => candidate.profile === action.profile);
+    if (!entry || entry.state !== 'installed') {
+      action.state = 'failed';
+      action.reason = `DSH profile ${action.profile} is not completely installed (${entry?.reason ?? 'profile is missing'})`;
+    }
+  }
+  if (dshActions.some(action => action.state === 'failed')) return;
+  const versions = new Set(coverage.filter(entry => entry.state === 'installed' && entry.version).map(entry => entry.version!));
+  if (versions.size > 1) {
+    const detail = coverage.filter(entry => entry.state === 'installed').map(entry => `${entry.profile}: ${entry.version ?? 'unknown'}`).join(', ');
+    for (const action of dshActions) {
+      action.state = 'failed';
+      action.reason = `DSH profiles disagree on the installed ai4ai version (${detail})`;
+    }
+  }
+}
+
+/** Read-only DSH profile coverage plus user-facing notices for partial installs. */
+export async function dshCoverage(options: InstallOptions = { action: 'install' }): Promise<DshCoverage> {
+  const env = { ...process.env, ...(options.env ?? {}) };
+  const home = resolveDshHome(env);
+  const profiles: string[] = [...DSH_PROFILES];
+  try {
+    for (const entry of await readdir(path.join(home, 'profiles'), { withFileTypes: true })) {
+      if (entry.isDirectory() && !entry.name.startsWith('.') && !entry.name.startsWith('node_modules') && !profiles.includes(entry.name)) profiles.push(entry.name);
+    }
+  } catch { /* an absent DSH home simply has no profiles */ }
+  const inspected = await inspectDshProfiles(home, profiles);
+  const notices: string[] = [];
+  const byProfile = new Map(inspected.map(entry => [entry.profile, entry]));
+  const web = byProfile.get('web');
+  const headless = byProfile.get('headless');
+  const installed = inspected.filter(entry => entry.state === 'installed');
+  if (!installed.length) {
+    notices.push('DSH has no complete ai4ai installation; run "ai4ai init --harness dsh".');
+  } else {
+    if (web?.state === 'installed' && headless?.state !== 'installed') {
+      notices.push('DSH is only half installed: the web profile has ai4ai but headless does not; detached executors boot the headless profile. Run "ai4ai init --harness dsh".');
+    }
+    if (headless?.state === 'installed' && web?.state !== 'installed') {
+      notices.push('DSH is only half installed: the headless profile has ai4ai but web does not; the Web orchestration session cannot call ai4ai. Run "ai4ai init --harness dsh".');
+    }
+  }
+  for (const entry of inspected.filter(candidate => candidate.state === 'partial')) {
+    const profileDir = path.join(home, 'profiles', entry.profile);
+    const stateDir = path.join(home, '.ai4ai', 'dsh', entry.profile);
+    if (entry.declared || entry.bundled) {
+      // A registration this home does not own (or cannot verify) is refused by
+      // the native mutation guard. The recovery must clear both the native
+      // registration and ai4ai's stale per-profile state, or init keeps
+      // refusing the leftover ownership baseline.
+      notices.push(`DSH profile "${entry.profile}" has an ai4ai registration this installation home does not own or cannot verify (${entry.reason ?? 'unknown reason'}). Remove the registration with "dsh plugin --profile ${entry.profile} remove ai4ai" and delete "${stateDir}", then run "ai4ai init --harness dsh --profile ${entry.profile}".`);
+    } else {
+      notices.push(`DSH profile "${entry.profile}" has an unregistered ai4ai payload (${entry.reason ?? 'unknown reason'}). Remove "${path.join(profileDir, 'node_modules', 'ai4ai')}" or reinstall the profile, then run "ai4ai init --harness dsh --profile ${entry.profile}".`);
+    }
+  }
+  if (new Set(installed.map(entry => entry.version).filter(Boolean)).size > 1) {
+    notices.push(`DSH profiles use different ai4ai versions (${installed.map(entry => `${entry.profile}: ${entry.version ?? 'unknown'}`).join(', ')}); run "ai4ai init --harness dsh".`);
+  }
+  return { home, profiles: inspected, notices };
 }
 
 /**
@@ -351,13 +447,19 @@ export async function install(options: InstallOptions): Promise<InstallReport> {
   const detections = await detectHarnesses(options);
   const requested = options.harnesses?.length
     ? options.harnesses
-    : options.yes ? detections.filter(d => d.installed).map(d => d.harness) : detections.filter(d => d.installed).map(d => d.harness);
+    : detections.filter(d => d.installed).map(d => d.harness);
+  // DSH is installed per profile; the default run covers the functional pair.
+  const targets: { harness: HarnessId; profile?: string }[] = [];
+  for (const harness of requested) {
+    if (harness === 'dsh') for (const profile of dshProfilesFor(options)) targets.push({ harness, profile });
+    else targets.push({ harness });
+  }
   const actions: InstallActionReport[] = [];
-  if (!requested.length) {
+  if (!targets.length) {
     return { product: 'ai4ai', version: versionString, home, scope, dryRun: options.dryRun === true, actions: [{ harness: 'claude-code', action: options.action, state: 'skipped', reason: 'No supported harness detected' }] };
   }
   if (options.dryRun) {
-    for (const harness of requested) actions.push({ harness, action: options.action, state: 'installed', reason: 'dry-run: no files changed' });
+    for (const target of targets) actions.push({ harness: target.harness, action: options.action, state: 'installed', reason: 'dry-run: no files changed', ...(target.profile ? { profile: target.profile } : {}) });
     return { product: 'ai4ai', version: versionString, home, scope, dryRun: true, actions };
   }
   const selected = await selectedRoot(home);
@@ -365,27 +467,37 @@ export async function install(options: InstallOptions): Promise<InstallReport> {
   return withScopeLock(owned.root, owned.owner, async () => {
     const runtime = await snapshotRuntime(root, selected, versionString, workspace, owned.owner.token, scope);
     const journal = await readJournal(selected, owned.owner.token);
-    for (const harness of requested) {
-      const detection = detections.find(d => d.harness === harness);
-      const last = journal.records.filter(record => record.harness === harness).at(-1);
-      const prior = [...journal.records].reverse().find(record => record.harness === harness && record.action !== 'uninstall');
-      let report: InstallActionReport;
-      if (options.action === 'install' && prior?.version === versionString && prior.target && existsSync(prior.target)) {
-        report = { harness, action: 'install', state: 'already-installed', reason: 'Owned registration for this version already exists', target: prior.target };
+    for (const { harness, profile } of targets) {
+      const belongs = (record: JournalRecord): boolean => record.harness === harness
+        && (harness !== 'dsh' || (record.profile ?? 'web') === profile);
+      const last = [...journal.records].reverse().find(belongs);
+      // Only the latest confirmed successful attempt is a trustworthy baseline:
+      // a later failure or a post-install drift check must re-open the work
+      // instead of being masked by an older success.
+      const lastSuccessful = last && last.action !== 'uninstall'
+        && (last.state === 'installed' || last.state === 'already-installed') ? last : undefined;
+      const label: { profile?: string } = profile ? { profile } : {};
+      // One failing harness must not abort the remaining targets or lose the
+      // journal for work that already succeeded; report it and continue.
+      let report: InstallActionReport = { harness, action: options.action, state: 'failed', reason: 'Action did not produce a result', ...label };
+      try {
+      if (options.action === 'install' && lastSuccessful?.version === versionString && lastSuccessful.target && existsSync(lastSuccessful.target)) {
+        report = { harness, action: 'install', state: 'already-installed', reason: 'Owned registration for this version already exists', target: lastSuccessful.target, ...label };
       } else if (options.action === 'uninstall') {
-        if (!last || last.action === 'uninstall') { report = { harness, action: 'uninstall', state: 'already-uninstalled', reason: 'No owned registration recorded' }; }
+        if (!last || last.action === 'uninstall') { report = { harness, action: 'uninstall', state: 'already-uninstalled', reason: 'No owned registration recorded', ...label }; }
         else if (harness === 'claude-code') {
           const result = await run(env.AI4AI_CLAUDE_BIN || 'claude', ['plugin', 'uninstall', `ai4ai@${claudeMarketplaceName(selected)}`, '--scope', scope, '-y'], { env });
           report = { harness, action: 'uninstall', state: result.code === 0 ? 'uninstalled' : 'unknown', reason: result.code === 0 ? 'Native plugin removed' : `uninstall outcome: ${(result.stderr || result.stdout).slice(-400)}` };
         } else if (harness === 'opencode') {
           report = scope === 'project'
-            ? await unregisterOpenCodeProject(workspace, prior?.target)
+            ? await unregisterOpenCodeProject(workspace, lastSuccessful?.target)
             : await (async () => {
-              const result = await run(env.AI4AI_OPENCODE_BIN || 'opencode', ['plugin', 'remove', prior?.target ?? ''], { env });
+              const result = await run(env.AI4AI_OPENCODE_BIN || 'opencode', ['plugin', 'remove', lastSuccessful?.target ?? ''], { env });
               return { harness: 'opencode', action: 'uninstall', state: result.code === 0 ? 'uninstalled' : 'unknown', reason: result.code === 0 ? 'Native plugin removed' : `uninstall outcome: ${(result.stderr || result.stdout).slice(-400)}` } as InstallActionReport;
             })();
         } else if (harness === 'dsh') {
-          report = await registerDsh(runtime, { ...options, action: 'uninstall' }, env);
+          try { report = await registerDsh(runtime, { ...options, action: 'uninstall' }, env, profile!); }
+          catch (error) { report = { harness: 'dsh', action: 'uninstall', state: 'failed', reason: error instanceof Error ? error.message : 'DSH uninstall failed', ...label }; }
         } else {
           report = { harness, action: 'uninstall', state: 'unsupported', reason: 'No native registration is owned for this harness' };
         }
@@ -394,7 +506,8 @@ export async function install(options: InstallOptions): Promise<InstallReport> {
       } else if (harness === 'opencode') {
         report = await registerOpenCode(runtime, selected, false, env, workspace, scope);
       } else if (harness === 'dsh') {
-        report = await registerDsh(runtime, options, env);
+        try { report = await registerDsh(runtime, options, env, profile!); }
+        catch (error) { report = { harness: 'dsh', action: options.action, state: 'failed', reason: error instanceof Error ? error.message : 'DSH install failed', ...label }; }
       } else {
         report = {
           harness, action: options.action, state: 'installed',
@@ -402,9 +515,22 @@ export async function install(options: InstallOptions): Promise<InstallReport> {
           target: path.join(runtime, 'dist', 'cli.js'),
         };
       }
+      } catch (error) {
+        report = { harness, action: options.action, state: 'failed', reason: error instanceof Error ? error.message : 'Installer action failed', ...label };
+      }
+      // A profile is part of the DSH identity even when a helper omitted it.
+      if (harness === 'dsh' && profile && report.profile === undefined) report.profile = profile;
       actions.push(report);
-      await appendJournal(selected, owned.owner.token, { harness, action: options.action, state: report.state, ...(report.target ? { target: report.target } : {}), version: versionString, at: new Date().toISOString() });
-      void detection;
+    }
+    // Verification may downgrade a reported success; journal only the final
+    // state so the next run cannot treat a failed check as already installed.
+    if (options.action !== 'uninstall' && targets.some(target => target.harness === 'dsh')) await verifyDshReport(actions, options, env);
+    for (const action of actions) {
+      await appendJournal(selected, owned.owner.token, {
+        harness: action.harness, action: options.action, state: action.state,
+        ...(action.target ? { target: action.target } : {}), ...(action.profile ? { profile: action.profile } : {}),
+        version: versionString, at: new Date().toISOString(),
+      });
     }
     return { product: 'ai4ai', version: versionString, home: selected, scope, dryRun: false, actions };
   });
@@ -422,9 +548,37 @@ export async function statusReport(options: InstallOptions = { action: 'install'
     for (const record of journal.records) lastAction.set(record.harness, record.action);
     registered = [...lastAction.entries()].filter(([, action]) => action !== 'uninstall').map(([harness]) => harness);
   } catch { /* uninstalled home is simply empty */ }
+  const coverage = await dshCoverage(options);
+  const relevant = detections.some(detection => detection.harness === 'dsh' && detection.installed)
+    || coverage.profiles.some(profile => profile.state !== 'absent')
+    || existsSync(coverage.home);
   return {
     product: 'ai4ai', version: await version(root), home,
     scope: options.scope ?? 'user', dryRun: false, actions: [], detections, registered,
+    ...(relevant ? { dsh: coverage } : {}),
+  };
+}
+
+export interface DetectReport {
+  product: 'ai4ai';
+  version: string;
+  home: string;
+  scope: 'user' | 'project';
+  dryRun: boolean;
+  detections: Detection[];
+  dsh?: DshCoverage;
+}
+
+/** Detection view: probe binaries and DSH profile coverage without touching any installation home. */
+export async function detectReport(options: InstallOptions = { action: 'install' }): Promise<DetectReport> {
+  const detections = await detectHarnesses(options);
+  const coverage = await dshCoverage(options);
+  const relevant = detections.some(detection => detection.harness === 'dsh' && detection.installed)
+    || coverage.profiles.some(profile => profile.state !== 'absent') || existsSync(coverage.home);
+  return {
+    product: 'ai4ai', version: await version(packageRoot(options)), home: '-',
+    scope: options.scope ?? 'user', dryRun: false, detections,
+    ...(relevant ? { dsh: coverage } : {}),
   };
 }
 

@@ -21,6 +21,7 @@ export interface ClaudeNativeStatus {
   model?: unknown;
   reasoningEffort?: unknown;
   percent?: unknown;
+  runtimeVersion?: unknown;
 }
 
 export interface ClaudeStatusDetails {
@@ -30,8 +31,16 @@ export interface ClaudeStatusDetails {
   autoCompact?: AutoCompact;
   modelVerification: 'reported' | 'configured-only' | 'unknown';
   fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown'>;
+  notices?: { code: string; impact: 'none'; action_required: false; message: string }[];
   unavailable: string[];
+  runtimeVersion?: string | null;
 }
+
+/** Env layer number: absent variables must skip the layer, not become 0. */
+const envNumber = (name: string): number | null => {
+  const value = envValue(name);
+  return value === null ? null : Number(value);
+};
 
 export async function resolveClaudeStatus(workspace: string, sessionId: string | undefined, native: ClaudeNativeStatus): Promise<ClaudeStatusDetails> {
   let used = verifiedTokens(native.used);
@@ -66,13 +75,13 @@ export async function resolveClaudeStatus(workspace: string, sessionId: string |
 
   const modelField = firstVerified<string>([
     { value: model, source: modelSource ?? 'native' },
-    { value: modelSettings.env[0]?.value ?? null, source: modelSettings.env[0]?.source ?? 'config' },
     { value: envValue('ANTHROPIC_MODEL'), source: 'env' },
+    { value: modelSettings.env[0]?.value ?? null, source: modelSettings.env[0]?.source ?? 'config' },
   ]);
   const windowField = firstVerified<number>([
     { value: window, source: windowSource ?? 'native' },
+    { value: verifiedWindow(envNumber('CLAUDE_CODE_MAX_CONTEXT_TOKENS')), source: 'env' },
     { value: verifiedWindow(Number(windowSettings.env[0]?.value)), source: windowSettings.env[0]?.source ?? 'config' },
-    { value: verifiedWindow(Number(envValue('CLAUDE_CODE_MAX_CONTEXT_TOKENS'))), source: 'env' },
   ]);
   // Env before config: CLAUDE_CODE_EFFORT_LEVEL overrides settings effortLevel.
   const reasoningEffortField = firstVerified<string>([
@@ -81,9 +90,9 @@ export async function resolveClaudeStatus(workspace: string, sessionId: string |
     { value: settings.effortLevel?.value ?? null, source: settings.effortLevel?.source ?? 'config' },
   ]);
   const autoField = firstVerified<number>([
+    { value: verifiedThreshold(envNumber('CLAUDE_CODE_AUTO_COMPACT_WINDOW')), source: 'env' },
     { value: verifiedThreshold(Number(autoSettings.env[0]?.value)), source: autoSettings.env[0]?.source ?? 'config' },
     { value: settings.autoCompactWindow?.value ?? null, source: settings.autoCompactWindow?.source ?? 'config' },
-    { value: verifiedThreshold(Number(envValue('CLAUDE_CODE_AUTO_COMPACT_WINDOW'))), source: 'env' },
   ]);
 
   const usedValue = used;
@@ -100,21 +109,43 @@ export async function resolveClaudeStatus(workspace: string, sessionId: string |
     percent: context.percentSource === 'native' ? 'native' : context.percent !== null ? 'derived' : null,
   };
 
-  const autoCompact = autoField
-    ? { tokens: autoField.value, ratio: windowValue && windowValue > 0 ? Math.round((autoField.value / windowValue) * 1000) / 1000 : null, source: autoField.source as AutoCompact['source'] }
-    : undefined;
+  // INFRA-085 A: sanitize the auto-compact ratio. A configured threshold above
+  // the observed window cannot be expressed as a (0,1] ratio; report the ratio
+  // as null with a notice instead of invalidating the whole status or clamping
+  // to a false 100%.
+  const notices: { code: string; impact: 'none'; action_required: false; message: string }[] = [];
+  let autoCompact: AutoCompact | undefined;
+  if (autoField) {
+    const tokens = verifiedThreshold(autoField.value);
+    let ratio: number | null = null;
+    if (tokens !== null && windowValue !== null && windowValue > 0) {
+      const raw = tokens / windowValue;
+      if (raw > 0 && raw <= 1) ratio = Math.round(raw * 1000) / 1000;
+      else if (raw > 1) {
+        notices.push({
+          code: 'auto-compact-threshold-exceeds-window', impact: 'none', action_required: false,
+          message: 'The configured auto-compact threshold exceeds the observed context window; the ratio is reported as unavailable while the threshold and window values remain valid.',
+        });
+      }
+    }
+    autoCompact = { tokens, ratio, source: autoField.source as AutoCompact['source'] };
+  }
 
   const unavailable: string[] = [];
   if (!modelField) unavailable.push('model');
   if (windowValue === null) unavailable.push('context.window');
   if (usedValue === null) unavailable.push('context.used');
+  const fieldStates: Record<string, 'unsupported' | 'unavailable' | 'unknown'> = {};
+  if (!reasoningEffortField) fieldStates.reasoningEffort = 'unavailable';
   return {
     model: modelField?.value ?? null,
     reasoningEffort: reasoningEffortField?.value ?? null,
     context,
     ...(autoCompact ? { autoCompact } : {}),
+    ...(notices.length ? { notices } : {}),
     modelVerification: !modelField ? 'unknown' : modelField.source === 'native' || modelField.source === 'session' ? 'reported' : 'configured-only',
-    ...(reasoningEffortField ? {} : { fieldStates: { reasoningEffort: 'unavailable' as const } }),
+    ...(Object.keys(fieldStates).length ? { fieldStates } : {}),
+    runtimeVersion: typeof native.runtimeVersion === 'string' && native.runtimeVersion.trim() ? native.runtimeVersion.trim().slice(0, 256) : null,
     unavailable,
   };
 }

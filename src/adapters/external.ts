@@ -1,20 +1,28 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import type { Adapter, AdapterContext, NativeOutcome } from './types.js';
 export type { AdapterContext, NativeOutcome, Adapter } from './types.js';
 import type {
-  AutoCompact, CapabilityDeclaration, ContextInfo, Request, Result,
+  AutoCompact, CapabilityDeclaration, ContextInfo, LogTail, Request, Result,
 } from '../contract/types.js';
-import type { HarnessId, LifecycleState, Os } from '../contract/states.js';
+import type { FieldStateValue, HarnessId, LifecycleState, Os, ProcessState, TurnOutcome } from '../contract/states.js';
 import type { ExecutorRecord } from '../core/store.js';
 import { normalizePolicy } from '../core/policy.js';
 import { newExecutorId, ownedBy } from '../core/operations.js';
 import {
-  enqueueTurn, executorDir, launch, lifecycleOfStatus, pidAlive, readLog, readStatus, requestStop, turnPlacement,
-  type ExecutorStatus, type LogLine,
+  enqueueTurn, executorDir, launch, lifecycleOfStatus, processStateOf, readLog, readStatus, requestFinish, requestStop,
+  turnPlacement, type ExecutorLiveness, type ExecutorStatus, type LogLine,
 } from './executors.js';
 import { sessionActivity, sessionPointer } from '../core/session-probe.js';
+import { readEventTail } from '../core/events.js';
+import { queuedTurns, queuePositionOf, readTurns } from '../core/turns.js';
+import { withExecutorLock } from '../core/executor-lock.js';
+
+/** Best-effort registry reconciliation; test doubles may not implement it. */
+const updateRecord = (store: AdapterContext['store'], executorId: string, patch: Parameters<AdapterContext['store']['updateExecutor']>[1]): Promise<unknown> =>
+  typeof (store as { updateExecutor?: unknown }).updateExecutor === 'function' ? store.updateExecutor(executorId, patch).catch(() => undefined) : Promise.resolve();
+import { forceKillTree, heartbeatAlive, processAlive, readHeartbeat, verifyIdentity } from '../core/process-identity.js';
 
 export interface CarrierCommand {
   command: string;
@@ -34,17 +42,29 @@ export interface StatusDetails {
   autoCompact?: AutoCompact;
   modelVerification?: 'verified' | 'reported' | 'configured-only' | 'unknown';
   /** Explicit per-field states for fields with no value (defaults are derived). */
-  fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown'>;
+  fieldStates?: Record<string, FieldStateValue>;
   unavailable?: string[];
+  runtimeVersion?: string | null;
+  notices?: { code: string; impact: 'none'; action_required: false; message: string }[];
+}
+
+/** Observed liveness and lifecycle for one executor. */
+export interface Observation {
+  state: LifecycleState;
+  processState: ProcessState;
+  processStateReason?: string;
+  liveness: ExecutorLiveness;
+  status: ExecutorStatus;
+  log: LogLine[];
 }
 
 /**
  * Base for adapters whose spawn carrier is a detached OS process.
  *
- * `spawn`, `message`, `cancel` and `status` are real file-backed operations;
- * `handoff` is deliberately unsupported externally because a one-shot headless
- * turn has no in-place context to replace. In-harness plugins implement handoff
- * with their native in-process API.
+ * `spawn`, `message`, `finish`, `cancel` and `status` are real file-backed
+ * operations; `handoff` is deliberately unsupported externally because a
+ * one-shot headless turn has no in-place context to replace. In-harness
+ * plugins implement handoff with their native in-process API.
  */
 export abstract class ExternalExecutorAdapter implements Adapter {
   abstract readonly harness: HarnessId;
@@ -53,6 +73,12 @@ export abstract class ExternalExecutorAdapter implements Adapter {
   protected abstract carrier(request: Request, ctx: AdapterContext, executorId: string, resumeSessionId?: string): Promise<CarrierCommand>;
   /** Adapter-specific context/model/reasoning-effort extraction from the carrier output. */
   protected statusDetails(_record: ExecutorRecord, _status: ExecutorStatus, _log: LogLine[], _ctx: AdapterContext): StatusDetails | Promise<StatusDetails> { return {}; }
+
+  /**
+   * Carrier model for a spawn: `resident` keeps one interactive child across
+   * turns (Claude persistent); everything else starts one child per turn.
+   */
+  protected carrierMode(_request: Request): 'resident' | 'per-turn' { return 'per-turn'; }
 
   /**
    * Model a resumed turn must keep: the explicit request override, or the
@@ -81,31 +107,76 @@ export abstract class ExternalExecutorAdapter implements Adapter {
     };
   }
 
+  /** Refuse carrier options the harness does not implement, loudly. */
+  protected validateSpawnOptions(request: Request, os: Os): NativeOutcome | undefined {
+    const spawn = request.spawn ?? {};
+    const declarations = this.capabilities(os);
+    const surfaces = new Set(declarations.flatMap(declaration => declaration.spawn.surfaces));
+    const persistence = new Set(declarations.flatMap(declaration => declaration.spawn.persistenceModes));
+    const permissions = new Set(declarations.flatMap(declaration => declaration.spawn.permissionModes));
+    if (spawn.profile !== undefined && this.harness !== 'dsh') {
+      return { status: 'unsupported', reason: 'spawn.profile is a DSH profile selector; this harness has no profile concept', unavailable: ['spawn.profile'] };
+    }
+    if (spawn.surface !== undefined && !surfaces.has(spawn.surface)) {
+      return { status: 'unsupported', reason: `The ${this.harness} carrier does not implement the ${spawn.surface} spawn surface`, unavailable: [`spawn.surface.${spawn.surface}`] };
+    }
+    if (spawn.persistence !== undefined && !persistence.has(spawn.persistence)) {
+      return { status: 'unsupported', reason: `The ${this.harness} carrier does not implement ${spawn.persistence} persistence`, unavailable: [`spawn.persistence.${spawn.persistence}`] };
+    }
+    if (spawn.permissionMode !== undefined && !permissions.has(spawn.permissionMode)) {
+      return { status: 'unsupported', reason: `The ${this.harness} carrier does not implement permissionMode ${spawn.permissionMode}`, unavailable: ['spawn.permissionMode'] };
+    }
+    return undefined;
+  }
+
   async spawn(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    if (request.isolation === 'isolated') {
+      return {
+        status: 'unsupported',
+        reason: 'Executor isolation is recorded as a field but not implemented by any carrier; omit isolation or use the default inherit',
+        unavailable: ['spawn.isolation.isolated'],
+      };
+    }
+    const refused = this.validateSpawnOptions(request, process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux');
+    if (refused) return refused;
     const count = request.count ?? 1;
     const ids = Array.from({ length: count }, () => newExecutorId(this.harness));
     const created: ExecutorRecord[] = [];
     try {
       for (const executorId of ids) {
-        const carrier = await this.carrier(request, ctx, executorId);
+        // The task file must exist before the carrier builds an MCP config in
+        // the same executor directory.
         const taskFile = await this.writeTask(ctx, executorId, 'spawn.prompt', request.task ?? '');
+        const carrier = await this.carrier(request, ctx, executorId);
         const model = await this.persistedModel(request, ctx);
         const reasoningEffort = await this.persistedReasoningEffort(request, ctx);
+        const persistence = request.spawn?.persistence ?? 'one-shot';
+        const mcpFiltered = await this.filteredMcpNames(ctx, executorId);
         const record: ExecutorRecord = {
           format: 2, kind: 'executor', executorId, parent: ctx.identity, harness: this.harness,
-          surface: 'headless', policy: normalizePolicy(request.policy), isolation: request.isolation ?? 'inherit',
+          surface: request.spawn?.surface ?? 'headless', policy: normalizePolicy(request.policy), isolation: request.isolation ?? 'inherit',
           state: 'running', createdAt: new Date().toISOString(),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(request.spawn ? { spawn: sanitizeSpawnOptions(request.spawn) } : {}),
+          persistence,
+          epoch: 1,
+          ...(mcpFiltered ? { mcpFiltered } : {}),
           carrier: { detached: true, command: [carrier.command, ...carrier.args] },
         };
         created.push(record);
         await ctx.store.addExecutors([record]);
+        const initialTurnId = `turn-${randomUUID()}`;
         await launch({
           executorId, harness: this.harness, home: ctx.home, command: carrier.command, args: carrier.args,
           ...(carrier.env ? { env: carrier.env } : {}), ...(carrier.envExclude ? { envExclude: carrier.envExclude } : {}),
           ...(carrier.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-          supervisorProtocol: 2,
+          supervisorProtocol: 3,
+          persistence,
+          epoch: 1,
+          initialTurnId,
+          initialOperationId: request.operationId,
+          resident: persistence === 'persistent' && this.carrierMode(request) === 'resident',
           cwd: ctx.identity.workspace, taskFile,
           ...(carrier.sessionRegex ? { sessionRegex: carrier.sessionRegex } : {}),
         });
@@ -116,6 +187,8 @@ export abstract class ExternalExecutorAdapter implements Adapter {
         durable: true,
         executorId: created[0]!.executorId,
         state: 'running',
+        ...(created[0]!.persistence ? { persistence: created[0]!.persistence } : {}),
+        ...(created[0]!.mcpFiltered ? { mcpFiltered: created[0]!.mcpFiltered } : {}),
         modelVerification: 'unknown',
         verification: { model: 'unknown', context: 'reported' },
       };
@@ -129,7 +202,12 @@ export abstract class ExternalExecutorAdapter implements Adapter {
     }
   }
 
-  private async executorFor(request: Request, ctx: AdapterContext): Promise<ExecutorRecord | undefined> {
+  /** Names of the MCP servers copied by the adapter, read back from its file. */
+  protected async filteredMcpNames(_ctx: AdapterContext, _executorId: string): Promise<{ names: string[]; count: number } | undefined> {
+    return undefined;
+  }
+
+  protected async executorFor(request: Request, ctx: AdapterContext): Promise<ExecutorRecord | undefined> {
     const target = request.target;
     if (!target || target === 'self') return undefined;
     const records = await ctx.store.executors();
@@ -154,11 +232,33 @@ export abstract class ExternalExecutorAdapter implements Adapter {
     const lastActivityAtSource = nativeActivity ? 'native' : fallbackActivity ? 'session' : 'unknown';
     const stateSource = observed.state === 'unknown' ? (pointer ? 'session' : 'unknown') : 'native';
     const terminal = ['completed', 'failed', 'cancelled'].includes(observed.state);
+    const turns = await readTurns(ctx.home, record.executorId, 500);
+    const lastTurn = turns.at(-1);
+    const queued = await queuedTurns(ctx.home, record.executorId);
+    // Registry reconciliation: the supervisor is the authority; the durable
+    // registry is updated to match a terminal observation.
+    // Dead-supervisor exception: a client may reconcile the registry only when
+    // the supervisor is provably gone; while it is alive it is the single
+    // writer of executor state.
+    if (terminal && observed.liveness.supervisorAlive !== true && (record.state !== observed.state || (sessionId && record.sessionId !== sessionId))) {
+      if (typeof ctx.store.updateExecutor === 'function') await ctx.store.updateExecutor(record.executorId, {
+        state: observed.state,
+        ...(sessionId ? { sessionId } : {}),
+        ...(lastTurn?.outcome ? { lastTurnOutcome: lastTurn.outcome } : {}),
+        ...(lastTurn?.endedAt ?? lastTurn?.startedAt ? { lastTurnAt: lastTurn.endedAt ?? lastTurn.startedAt! } : {}),
+        ...(observed.status.lastOperationId ? { lastOperationId: observed.status.lastOperationId } : {}),
+      }).catch(() => undefined);
+    }
+    const logTail = request.logTail ? await readEventTail(ctx.home, record.executorId, record.harness, request.logTail) : undefined;
     return {
-      status: observed.state === 'running' ? 'pending' : 'completed',
-      reason: observed.state === 'running' ? 'Executor process is running' : `Executor process is ${observed.state}`,
+      status: observed.state === 'running' || observed.state === 'idle' ? 'pending' : 'completed',
+      reason: observed.state === 'running' ? 'Executor process is running'
+        : observed.state === 'idle' ? 'Executor is idle and waiting for the next message'
+        : `Executor process is ${observed.state}`,
       durable: true,
       state: observed.state,
+      processState: observed.processState,
+      ...(observed.processStateReason ? { processStateReason: observed.processStateReason } : {}),
       executorId: record.executorId,
       ...(sessionId ? { sessionId } : {}),
       ...(details.model !== undefined ? { model: details.model } : {}),
@@ -167,11 +267,23 @@ export abstract class ExternalExecutorAdapter implements Adapter {
       ...(details.autoCompact ? { autoCompact: details.autoCompact } : {}),
       ...(details.fieldStates ? { fieldStates: details.fieldStates } : {}),
       ...(details.unavailable ? { unavailable: details.unavailable } : {}),
+      ...(details.notices ? { notices: details.notices } : {}),
+      ...(details.runtimeVersion !== undefined ? { runtimeVersion: details.runtimeVersion } : {}),
+      ...(record.persistence ? { persistence: record.persistence } : {}),
+      ...(record.mcpFiltered ? { mcpFiltered: record.mcpFiltered } : {}),
+      turns: observed.status.turns ?? turns.length,
+      ...(observed.status.lastOperationId ?? record.lastOperationId ? { lastOperationId: observed.status.lastOperationId ?? record.lastOperationId } : {}),
+      lastTurnOutcome: observed.status.lastTurnOutcome ?? lastTurn?.outcome ?? null,
+      queuedTurns: observed.status.queuedTurns ?? queued,
+      lastTurnAt: observed.status.lastTurnAt ?? lastTurn?.endedAt ?? lastTurn?.startedAt ?? null,
+      turnStartedAt: observed.status.turnStartedAt ?? null,
+      idleSince: observed.state === 'idle' ? observed.status.idleSince ?? null : null,
       lastActivityAt,
       lastActivityAtSource,
       stateSource,
       ...(terminal ? { exitCode: observed.status.exitCode ?? null, signal: observed.status.signal ?? null } : {}),
       ...(pointer ? { session: pointer } : {}),
+      ...(logTail ? { logTail } : {}),
       modelVerification,
       verification: {
         model: modelVerification,
@@ -183,63 +295,69 @@ export abstract class ExternalExecutorAdapter implements Adapter {
   /**
    * Deliver a follow-up turn to an owned executor.
    *
-   * Only a running executor with a live protocol-2 supervisor is served: the
-   * turn is queued for that supervisor and resumes the same native session.
-   * Idle/exited executors fail structurally instead of silently starting a new
-   * session (which would lose the previous context).
+   * Running/idle executors queue the turn for the live protocol-3 supervisor.
+   * A terminal executor (completed/failed/cancelled) is revived in the same
+   * executor id and native session by relaunching its supervisor with a resume
+   * carrier; the old inbox is swapped out atomically so no backlog is replayed.
+   * An orphan (dead supervisor, live child) is refused until it is swept, so a
+   * revival can never double-run a session.
    */
   async message(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     const record = await this.executorFor(request, ctx);
     if (!record) return { status: 'unauthorized', reason: 'Target is not owned by this caller' };
-    const observed = await this.observe(record, ctx);
-    // Same lifecycle vocabulary as status/list (one raw status -> one state).
-    if (observed.state !== 'running') {
+    const directory = executorDir(ctx.home, record.executorId);
+    return withExecutorLock(directory, async () => {
+      const observed = await this.observe(record, ctx);
+      if (observed.processState === 'orphaned') {
+        return {
+          status: 'failed',
+          reason: 'The supervisor is dead but its harness child is still alive; revive is refused until the orphan is cleaned with ai4ai sweep or a force stop',
+          durable: true,
+          state: observed.state,
+          processState: 'orphaned',
+          error: { code: 'executor-orphaned', message: 'Supervisor dead, child alive' },
+        };
+      }
+      const live = observed.state === 'running' || observed.state === 'idle';
+      if (live && observed.liveness.supervisorAlive === true) {
+        return this.enqueueForLive(record, observed, request, ctx);
+      }
+      if (live && observed.liveness.supervisorAlive !== true) {
+        return {
+          status: 'failed',
+          reason: 'The recorded lifecycle is live but the supervisor cannot be verified; start a new executor or run ai4ai sweep',
+          durable: true,
+          state: observed.state,
+          processState: observed.processState,
+          error: { code: 'message-supervisor-unavailable', message: 'Supervisor liveness could not be verified' },
+        };
+      }
+      return this.revive(record, observed, request, ctx);
+    }, { operation: `message:${request.operationId}` });
+  }
+
+  private async enqueueForLive(record: ExecutorRecord, observed: Observation, request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    if ((observed.status.protocol ?? 1) < 3) {
       return {
         status: 'failed',
-        reason: `Executor is ${observed.state}; a message is only queued for a running executor. Start a new executor instead.`,
+        reason: 'This executor was started by an older supervisor (protocol < 3) that cannot report idle/turn semantics; start a new executor',
         durable: true,
         state: observed.state,
-        error: { code: 'message-executor-not-running', message: `Executor state is ${observed.state}` },
+        error: { code: 'message-executor-protocol-too-old', message: `Supervisor protocol ${observed.status.protocol ?? 1} < 3` },
       };
     }
-    if (!pidAlive(observed.status.supervisorPid)) {
-      return {
-        status: 'failed',
-        reason: 'The detached supervisor is not alive; start a new executor instead of messaging a stale record',
-        durable: true,
-        state: 'running',
-        error: { code: 'message-executor-not-running', message: 'Supervisor is not alive' },
-      };
-    }
-    if ((observed.status.protocol ?? 1) < 2) {
-      // v0.0.3 supervisors ignore per-turn command/args and would silently start
-      // a new session. Refuse instead of losing context.
-      return {
-        status: 'failed',
-        reason: 'This executor was started by an older supervisor that cannot resume its native session; start a new executor',
-        durable: true,
-        state: 'running',
-        error: { code: 'message-executor-protocol-too-old', message: `Supervisor protocol ${observed.status.protocol ?? 1} < 2` },
-      };
-    }
-    const sessionId = await this.awaitSessionId(ctx.home, record, observed.status);
+    const sessionId = await this.awaitSessionId(ctx.home, record, observed.status.sessionId ?? record.sessionId);
     if (!sessionId) {
       return {
         status: 'failed',
         reason: 'The executor has not reported a native session id yet; the message was not queued (a session-less turn would lose context)',
         durable: true,
-        state: 'running',
-        error: { code: 'message-session-unknown', message: 'No session id observed within the bounded wait' },
+        state: observed.state,
+        error: { code: 'message-session-unknown', message: 'No session id observed' },
       };
     }
     const file = await this.writeTask(ctx, record.executorId, `message-${request.operationId}.prompt`, request.task ?? '');
-    // The message schema forbids model/effort; merge the values recorded at
-    // spawn so the resumed turn keeps the original route.
-    const resume: Request = {
-      ...request,
-      ...(record.model ? { model: record.model } : {}),
-      ...(record.reasoningEffort ? { reasoningEffort: record.reasoningEffort } : {}),
-    };
+    const resume = this.resumeRequest(record, request);
     let carrier: CarrierCommand;
     try {
       carrier = await this.carrier(resume, ctx, record.executorId, sessionId);
@@ -249,47 +367,140 @@ export abstract class ExternalExecutorAdapter implements Adapter {
         status: 'failed',
         reason: `Could not build a resume command for the existing session; the executor was left untouched: ${error instanceof Error ? error.message : 'unknown error'}`,
         durable: true,
-        state: 'running',
-        error: {
-          code: typeof code === 'string' ? code : 'message-resume-failed',
-          message: error instanceof Error ? error.message : 'unknown error',
-        },
+        state: observed.state,
+        error: { code: typeof code === 'string' ? code : 'message-resume-failed', message: error instanceof Error ? error.message : 'unknown error' },
       };
     }
+    const turnId = `turn-${randomUUID()}`;
     const queued = await enqueueTurn(ctx.home, record.executorId, {
       inputFile: path.basename(file),
+      turnId,
+      operationId: request.operationId,
+      expectedSessionId: sessionId,
       command: carrier.command,
       args: carrier.args,
       ...(carrier.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
-    // Recheck after publication: the supervisor may have exited in between.
-    // This is a best-effort narrowing of a file-based TOCTOU window, not a
-    // claim that none exists.
     const after = await readStatus(ctx.home, record.executorId);
     const placement = await turnPlacement(ctx.home, record.executorId, queued);
-    if (!pidAlive(after?.supervisorPid)) {
+    if (after && (after.supervisorPid === undefined || processAlive(after.supervisorPid) !== true)) {
       return {
         status: 'failed',
         reason: `The supervisor exited after the message was queued (${placement === 'pending' ? 'message file remains queued' : 'message was already claimed or consumed'})`,
         durable: true,
-        state: 'running',
+        state: observed.state,
         error: { code: 'message-supervisor-exited', message: `Supervisor exited; queue placement: ${placement}` },
       };
     }
+    const position = await queuePositionOf(ctx.home, record.executorId, queued);
+    await updateRecord(ctx.store, record.executorId, { state: 'running', lastOperationId: request.operationId });
     return {
       status: 'accepted',
       reason: placement === 'pending'
         ? 'Message queued for the executor next turn in its existing native session'
         : 'Message was already claimed by the executor for its next turn in its existing native session',
       durable: true,
-      state: 'running',
+      state: observed.state,
       sessionId,
+      turnId,
+      queuePosition: position,
+      ...(record.persistence ? { persistence: record.persistence } : {}),
     };
   }
 
-  /** Bounded wait for the carrier's session id; never guesses or reuses first-turn args. */
-  private async awaitSessionId(home: string, record: ExecutorRecord, status: ExecutorStatus, timeoutMs = 2000): Promise<string | undefined> {
-    let sessionId = status.sessionId ?? record.sessionId;
+  /**
+   * Revive a terminal executor in the same executor id and native session.
+   * A missing session id is `session-unavailable`; a new session is never
+   * started silently.
+   */
+  private async revive(record: ExecutorRecord, observed: Observation, request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    const sessionId = observed.status.sessionId ?? record.sessionId;
+    if (!sessionId) {
+      return {
+        status: 'failed',
+        reason: 'The executor has no recorded native session to resume; message cannot revive it without losing context. Start a new executor instead.',
+        durable: true,
+        state: observed.state,
+        error: { code: 'session-unavailable', message: 'No recorded session id for revival' },
+      };
+    }
+    const directory = executorDir(ctx.home, record.executorId);
+    const resume = this.resumeRequest(record, request);
+    let carrier: CarrierCommand;
+    try {
+      carrier = await this.carrier(resume, ctx, record.executorId, sessionId);
+    } catch (error) {
+      const code = (error as { code?: unknown })?.code;
+      return {
+        status: 'failed',
+        reason: `The carrier cannot resume this session; revival was not attempted: ${error instanceof Error ? error.message : 'unknown error'}`,
+        durable: true,
+        state: observed.state,
+        error: { code: typeof code === 'string' ? code : 'resume-unsupported', message: error instanceof Error ? error.message : 'unknown error' },
+      };
+    }
+    const file = await this.writeTask(ctx, record.executorId, `revive-${request.operationId}.prompt`, request.task ?? '');
+    // Inbox epoch swap: old pending messages belong to the previous life and
+    // must never be replayed into the revived session.
+    const nextEpoch = (record.epoch ?? 1) + 1;
+    await swapInbox(ctx.home, record.executorId, nextEpoch);
+    const turnId = `turn-${randomUUID()}`;
+    try {
+      await launch({
+        executorId: record.executorId, harness: this.harness, home: ctx.home,
+        command: carrier.command, args: carrier.args,
+        ...(carrier.env ? { env: carrier.env } : {}), ...(carrier.envExclude ? { envExclude: carrier.envExclude } : {}),
+        ...(carrier.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        supervisorProtocol: 3,
+        persistence: record.persistence ?? 'one-shot',
+        epoch: nextEpoch,
+        initialTurnId: turnId,
+        initialOperationId: request.operationId,
+        initialTurns: observed.status.turns ?? (await readTurns(ctx.home, record.executorId, 1)).length,
+        expectedSessionId: sessionId,
+        resident: (record.persistence ?? 'one-shot') === 'persistent' && this.carrierMode(resume) === 'resident',
+        cwd: ctx.identity.workspace, taskFile: file,
+        ...(carrier.sessionRegex ? { sessionRegex: carrier.sessionRegex } : {}),
+      });
+    } catch (error) {
+      return {
+        status: 'failed',
+        reason: `Revival launch failed; the executor remains ${observed.state}: ${error instanceof Error ? error.message : 'unknown error'}`,
+        durable: true,
+        state: observed.state,
+        error: { code: 'revive-failed', message: error instanceof Error ? error.message : 'unknown error' },
+      };
+    }
+    // Revival audit: from-state, operator and time are recorded independently
+    // of the human-readable reason, so a later reviewer can reconcile who
+    // revived which terminal executor and from which state.
+    await appendFile(path.join(directory, 'revival.ndjson'), JSON.stringify({
+      operationId: request.operationId,
+      executorId: record.executorId,
+      fromState: observed.state,
+      operator: ctx.identity,
+      sessionId,
+      at: new Date().toISOString(),
+      epoch: nextEpoch,
+    }) + '\n').catch(() => undefined);
+    await updateRecord(ctx.store, record.executorId, {
+      state: 'running', sessionId, lastOperationId: request.operationId, epoch: nextEpoch,
+    });
+    return {
+      status: 'accepted',
+      reason: 'Executor revived in its recorded native session with the new turn; the previous inbox epoch was not replayed',
+      durable: true,
+      state: 'running',
+      sessionId,
+      turnId,
+      queuePosition: 1,
+      ...(record.persistence ? { persistence: record.persistence } : {}),
+    };
+  }
+
+  /** Bounded wait for the carrier's session id; never guesses or starts a new session. */
+  private async awaitSessionId(home: string, record: ExecutorRecord, initial: string | undefined, timeoutMs = 2000): Promise<string | undefined> {
+    let sessionId = initial;
     const deadline = Date.now() + timeoutMs;
     while (!sessionId && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -299,34 +510,213 @@ export abstract class ExternalExecutorAdapter implements Adapter {
     return sessionId;
   }
 
+  private resumeRequest(record: ExecutorRecord, request: Request): Request {
+    return {
+      ...request,
+      ...(record.model ? { model: record.model } : {}),
+      ...(record.reasoningEffort ? { reasoningEffort: record.reasoningEffort } : {}),
+      ...(record.spawn ? { spawn: record.spawn } : {}),
+    };
+  }
+
   async cancel(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     const record = await this.executorFor(request, ctx);
     if (!record) return { status: 'unauthorized', reason: 'Target is not owned by this caller' };
-    const observed = await this.observe(record, ctx);
-    if (observed.state !== 'running') return { status: 'completed', reason: `Executor is already ${observed.state}`, durable: true, state: observed.state };
-    await requestStop(ctx.home, record.executorId);
-    const deadline = Date.now() + Math.min(15000, Math.max(1000, request.timeoutMs ?? 10000));
-    for (;;) {
-      const current = await this.observe(record, ctx);
-      if (current.state !== 'running') return { status: 'completed', reason: `Executor stopped (${current.state})`, durable: true, state: current.state };
-      if (Date.now() >= deadline) return { status: 'pending', reason: 'Stop requested; the executor has not confirmed exit yet', durable: true, state: 'running' };
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
+    return withExecutorLock(executorDir(ctx.home, record.executorId), async () => {
+      const observed = await this.observe(record, ctx);
+      if (observed.state !== 'running' && observed.state !== 'idle') {
+        return { status: 'completed', reason: `Executor is already ${observed.state}`, durable: true, state: observed.state, processState: observed.processState };
+      }
+      if (observed.processState === 'orphaned') {
+        const forced = await this.forceOrphan(record, observed, ctx);
+        if (forced) return { status: 'completed', reason: 'Orphaned harness child was identity-verified and force-stopped; the executor is recorded cancelled', durable: true, state: 'cancelled', processState: 'dead' };
+        return {
+          status: 'failed',
+          reason: 'The supervisor is dead and the child identity cannot be verified; nothing was killed. Resolve it manually (ai4ai sweep reports the pid).',
+          durable: true,
+          state: observed.state,
+          processState: 'unknown',
+          error: { code: 'orphan-unverified', message: 'Child identity could not be verified' },
+        };
+      }
+      await requestStop(ctx.home, record.executorId);
+      const deadline = Date.now() + Math.min(30000, Math.max(1000, request.timeoutMs ?? 15000));
+      for (;;) {
+        const current = await this.observe(record, ctx);
+        // Supervisor-exit race: the supervisor can die before it writes the
+        // terminal `cancelled` status, so the durable record still says
+        // running/idle while the process is verifiably gone. We already
+        // requested the stop, so the confirmed outcome is `cancelled`, not a
+        // spurious failure.
+        if (stopOutcome(current.status.state, current.processState) === 'cancelled') {
+          await updateRecord(ctx.store, record.executorId, { state: 'cancelled' });
+          return { status: 'completed', reason: 'Executor stopped (cancelled)', durable: true, state: 'cancelled', processState: 'dead' };
+        }
+        if (current.state !== 'running' && current.state !== 'idle') {
+          await updateRecord(ctx.store, record.executorId, { state: current.state });
+          return { status: 'completed', reason: `Executor stopped (${current.state})`, durable: true, state: current.state, processState: current.processState };
+        }
+        if (Date.now() >= deadline) return { status: 'pending', reason: 'Stop requested; the supervisor has not confirmed exit yet (the EOF→SIGTERM→SIGKILL ladder continues)', durable: true, state: current.state };
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }, { operation: `stop:${request.operationId}` });
   }
 
   /**
-   * Observe an executor from durable state, always cross-checking pid liveness:
-   * a live pid is never reported completed/cancelled, and a dead pid with no
-   * recorded clean exit is failed (exitCode/signal when known, null otherwise).
+   * Graceful completion (`finish`): the supervisor exits 0 after the current
+   * turn and the executor becomes `completed`. `stop` remains `cancelled`.
+   * In-harness self-finish is unsupported: there is no supervisor to end.
    */
-  protected async observe(record: ExecutorRecord, ctx: AdapterContext): Promise<{ state: LifecycleState; status: ExecutorStatus; log: LogLine[] }> {
-    const raw = await readStatus(ctx.home, record.executorId);
-    if (!raw) return { state: 'unknown', status: { state: 'unknown' } as ExecutorStatus, log: await readLog(ctx.home, record.executorId, 400) };
-    const alive = raw.pid === undefined ? null : pidAlive(raw.pid);
-    // The recorded state is internal (starting/stopping/exited); the contract
-    // exposes only the shared lifecycle vocabulary.
-    return { state: lifecycleOfStatus(raw, alive), status: raw, log: await readLog(ctx.home, record.executorId, 400) };
+  async finish(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    if (!request.target || request.target === 'self') {
+      return { status: 'unsupported', reason: 'finish targets a detached owned executor only; an in-harness session has no supervisor to complete', unavailable: ['finish.self'] };
+    }
+    const record = await this.executorFor(request, ctx);
+    if (!record) return { status: 'unauthorized', reason: 'Target is not owned by this caller' };
+    return withExecutorLock(executorDir(ctx.home, record.executorId), async () => {
+      const observed = await this.observe(record, ctx);
+      if (observed.processState === 'orphaned') {
+        return { status: 'failed', reason: 'The executor is orphaned (dead supervisor, live child); sweep it before finishing', durable: true, state: observed.state, processState: 'orphaned', error: { code: 'executor-orphaned', message: 'Supervisor dead, child alive' } };
+      }
+      if (observed.state === 'completed') return { status: 'completed', reason: 'Executor is already completed', durable: true, state: 'completed', processState: observed.processState };
+      if (observed.state === 'failed' || observed.state === 'cancelled' || observed.state === 'unknown') {
+        return { status: 'completed', reason: `Executor is already ${observed.state}; finish does not rewrite a terminal outcome`, durable: true, state: observed.state, processState: observed.processState };
+      }
+      if (observed.liveness.supervisorAlive !== true) {
+        return { status: 'failed', reason: 'The supervisor cannot be verified; finish was not recorded', durable: true, state: observed.state, processState: observed.processState, error: { code: 'message-supervisor-unavailable', message: 'Supervisor liveness could not be verified' } };
+      }
+      await requestFinish(ctx.home, record.executorId);
+      const deadline = Date.now() + Math.min(60000, Math.max(1000, request.timeoutMs ?? 20000));
+      for (;;) {
+        const current = await this.observe(record, ctx);
+        const terminalRecord = current.status.state === 'exited' || current.status.state === 'stopped' || current.status.state === 'failed';
+        if (terminalRecord) {
+          const settled: LifecycleState = current.status.state === 'exited'
+            ? (current.status.exitCode === 0 ? 'completed' : 'failed')
+            : current.status.state === 'stopped' ? 'cancelled' : 'failed';
+          await updateRecord(ctx.store, record.executorId, { state: settled });
+          return {
+            status: settled === 'completed' ? 'completed' : 'pending',
+            reason: `Finish requested; executor settled as ${settled}`,
+            durable: true, state: settled, processState: current.processState,
+            exitCode: current.status.exitCode ?? null, signal: current.status.signal ?? null,
+          };
+        }
+        if (Date.now() >= deadline) return { status: 'pending', reason: 'Finish requested; the supervisor is completing the current turn', durable: true, state: current.state, processState: current.processState };
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }, { operation: `finish:${request.operationId}` });
   }
+
+  /** Identity-verified force stop of an orphaned child; false when unverifiable. */
+  private async forceOrphan(record: ExecutorRecord, observed: Observation, ctx: AdapterContext): Promise<boolean> {
+    const childPid = observed.status.pid ?? observed.status.child?.pid;
+    if (!childPid) return false;
+    const recorded = observed.status.child ?? (await readChildIdentity(ctx.home, record.executorId));
+    if (!recorded) return false;
+    const verdict = verifyIdentity({
+      pid: childPid,
+      ...(recorded.startToken ? { startToken: recorded.startToken } : {}),
+      ...(recorded.commandHash ? { commandHash: recorded.commandHash } : {}),
+    });
+    if (verdict.verdict !== 'match') return false;
+    if (process.platform === 'win32') forceKillTree(childPid);
+    else {
+      try { process.kill(-childPid, 'SIGKILL'); } catch { /* not a group leader */ }
+      forceKillTree(childPid);
+    }
+    await updateRecord(ctx.store, record.executorId, { state: 'cancelled' });
+    return true;
+  }
+
+  /**
+   * Observe an executor from durable state, always cross-checking supervisor
+   * and child liveness separately. Which pid defines liveness depends on the
+   * carrier, so `idle` is never misread as `failed` because a per-turn child
+   * exited between turns.
+   */
+  protected async observe(record: ExecutorRecord, ctx: AdapterContext): Promise<Observation> {
+    const raw = await readStatus(ctx.home, record.executorId);
+    if (!raw) return { state: 'unknown', processState: 'unknown', processStateReason: 'No supervisor status recorded', liveness: {}, status: { state: 'unknown' } as ExecutorStatus, log: await readLog(ctx.home, record.executorId, 400) };
+    const liveness = await livenessOf(ctx.home, record.executorId, raw);
+    const state = lifecycleOfStatus(raw, liveness);
+    const processState = processStateOf(raw, liveness);
+    return {
+      state,
+      processState: processState.state,
+      ...(processState.reason ? { processStateReason: processState.reason } : {}),
+      liveness,
+      status: raw,
+      log: await readLog(ctx.home, record.executorId, 400),
+    };
+  }
+}
+
+/**
+ * Terminal lifecycle for a confirmed stop request. A non-terminal durable status
+ * with a dead process is the supervisor-exit race, and the stop outcome is
+ * `cancelled`; a terminal status keeps its own meaning.
+ */
+export function stopOutcome(durableState: unknown, processState: unknown): 'cancelled' | null {
+  if (processState !== 'dead') return null;
+  return durableState === 'running' || durableState === 'idle' || durableState === 'unknown' ? 'cancelled' : null;
+}
+
+/** Supervisor + child liveness, fail-closed to null when unverifiable. */
+export async function livenessOf(home: string, executorId: string, raw: ExecutorStatus): Promise<ExecutorLiveness> {
+  const heartbeat = await readHeartbeat(executorDir(home, executorId));
+  let supervisorAlive: boolean | null;
+  if (heartbeat) supervisorAlive = heartbeatAlive(heartbeat);
+  else if (raw.supervisorPid !== undefined) supervisorAlive = processAlive(raw.supervisorPid);
+  else supervisorAlive = null;
+  // A terminal status with a recorded supervisor pid that is gone makes the
+  // outcome authoritative. Without any supervisor record (legacy executors),
+  // liveness stays unknown rather than being invented from the status text.
+  if (['exited', 'stopped', 'failed'].includes(raw.state) && raw.supervisorPid !== undefined && processAlive(raw.supervisorPid) !== true) supervisorAlive = false;
+  const childAlive = raw.pid === undefined ? false : processAlive(raw.pid);
+  return { supervisorAlive, childAlive };
+}
+
+async function readChildIdentity(home: string, executorId: string): Promise<{ startToken?: string; commandHash?: string } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path.join(executorDir(home, executorId), 'child.json'), 'utf8')) as { startToken?: string; commandHash?: string };
+    return { ...(value.startToken ? { startToken: value.startToken } : {}), ...(value.commandHash ? { commandHash: value.commandHash } : {}) };
+  } catch { return undefined; }
+}
+
+/** Move the current inbox aside and start an empty generation. */
+async function swapInbox(home: string, executorId: string, epoch: number): Promise<void> {
+  const directory = executorDir(home, executorId);
+  const inbox = path.join(directory, 'inbox');
+  try {
+    await rename(inbox, path.join(directory, `inbox-epoch-${epoch - 1}`));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  await mkdir(inbox, { recursive: true, mode: 0o700 });
+}
+
+/** Persisted spawn options: drop undefined values so the record stays stable. */
+function sanitizeSpawnOptions(spawn: NonNullable<Request['spawn']>): NonNullable<Request['spawn']> {
+  const result: NonNullable<Request['spawn']> = {};
+  if (spawn.persistence) result.persistence = spawn.persistence;
+  if (spawn.surface) result.surface = spawn.surface;
+  if (spawn.profile) result.profile = spawn.profile;
+  if (spawn.permissionMode) result.permissionMode = spawn.permissionMode;
+  if (spawn.allowedTools?.length) result.allowedTools = [...spawn.allowedTools];
+  if (spawn.disallowedTools?.length) result.disallowedTools = [...spawn.disallowedTools];
+  if (spawn.envExclude?.length) result.envExclude = [...spawn.envExclude];
+  if (spawn.mcp?.deny?.length) result.mcp = { deny: [...spawn.mcp.deny] };
+  return result;
+}
+
+/** Read the filtered MCP names/count from an adapter-written config. */
+export async function readFilteredMcp(executorDirectory: string): Promise<{ names: string[]; count: number } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path.join(executorDirectory, 'mcp.json'), 'utf8')) as { mcpServers?: Record<string, unknown> };
+    const names = Object.keys(value.mcpServers ?? {});
+    return { names, count: names.length };
+  } catch { return undefined; }
 }
 
 /** Extract the last JSON object line matching a predicate from carrier output. */
@@ -355,4 +745,4 @@ export function contextFromUsage(input: unknown, window: unknown): ContextInfo {
   };
 }
 
-export type { Result };
+export type { Result, LogTail, TurnOutcome, ProcessState };

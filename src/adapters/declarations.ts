@@ -1,5 +1,5 @@
 import type { CapabilityDeclaration } from '../contract/types.js';
-import type { Availability, HandoffMode, HarnessId, Os } from '../contract/states.js';
+import type { Availability, EventLevel, HandoffMode, HarnessId, Os, PermissionMode, PersistenceMode, SpawnSurface } from '../contract/states.js';
 
 export interface DeclarationInput {
   harness: HarnessId;
@@ -13,8 +13,17 @@ export interface DeclarationInput {
     reasoningEffortOverride?: Availability;
     crossSurface?: Availability;
   };
-  spawn?: { availability?: Availability; maxConcurrent?: number; isolation?: Availability };
+  spawn?: {
+    availability?: Availability;
+    maxConcurrent?: number;
+    isolation?: Availability;
+    persistenceModes?: PersistenceMode[];
+    surfaces?: SpawnSurface[];
+    permissionModes?: PermissionMode[];
+    mcpFilter?: Availability;
+  };
   status?: { availability?: Availability; model?: Availability; reasoningEffort?: Availability; context?: Availability; percentSource?: 'native' | 'derived' | null };
+  events?: EventLevel;
   experimental?: string[];
   reason: string;
   evidence?: string;
@@ -41,6 +50,7 @@ export function declaration(input: DeclarationInput): CapabilityDeclaration {
       message: spawn.availability ?? 'not-tested',
       cancel: spawn.availability ?? 'not-tested',
       stop: spawn.availability ?? 'not-tested',
+      finish: spawn.availability ?? 'not-tested',
       list: 'supported',
     },
     handoff: {
@@ -55,7 +65,12 @@ export function declaration(input: DeclarationInput): CapabilityDeclaration {
       lifecycle: 'detached',
       maxConcurrent: spawn.maxConcurrent ?? 2,
       isolation: spawn.isolation ?? 'unsupported',
+      persistenceModes: spawn.persistenceModes ?? ['one-shot'],
+      surfaces: spawn.surfaces ?? ['headless'],
+      permissionModes: spawn.permissionModes ?? [],
+      mcpFilter: spawn.mcpFilter ?? 'not-tested',
     },
+    observation: { events: input.events ?? 'raw' },
     status: {
       availability: status.availability ?? 'not-tested',
       model: status.model ?? 'not-tested',

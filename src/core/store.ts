@@ -4,8 +4,8 @@ import { mkdir, lstat } from 'node:fs/promises';
 import { atomicJson, bytes, contained, digest, ownership, selectedRoot, withScopeLock } from '../install/scope.js';
 import { validateResult } from '../contract/validate.js';
 import { finalizeHandoff } from './handoff.js';
-import type { Identity, Policy, Request, Result } from '../contract/types.js';
-import type { HarnessId, Isolation, State } from '../contract/states.js';
+import type { Identity, Policy, Request, Result, SpawnOptions } from '../contract/types.js';
+import type { HarnessId, Isolation, PersistenceMode, State, TurnOutcome } from '../contract/states.js';
 
 export class StoreError extends Error {}
 
@@ -42,6 +42,23 @@ export interface ExecutorRecord {
   model?: string;
   /** Effective reasoning effort at spawn time, restored on resumed turns. */
   reasoningEffort?: string;
+  /**
+   * Carrier options recorded at spawn (persistence, permission mode, allowed
+   * and disallowed tools, env excludes, MCP policy, surface/profile). Every
+   * resumed or revived turn rebuilds the carrier from these fields, so no
+   * option may be lost after turn 1.
+   */
+  spawn?: SpawnOptions;
+  /** Filtered MCP servers copied for this executor (names/count only). */
+  mcpFiltered?: { names: string[]; count: number };
+  persistence?: PersistenceMode;
+  /** Reconciliation surface mirrored from the supervisor status. */
+  lastOperationId?: string;
+  lastTurnAt?: string;
+  lastTurnOutcome?: TurnOutcome;
+  queuedTurns?: number;
+  /** Inbox generation: a revival swaps the inbox so old messages never replay. */
+  epoch?: number;
   state: string;
   createdAt: string;
   carrier: CarrierInfo;
@@ -68,6 +85,13 @@ function validExecutor(value: unknown): value is ExecutorRecord {
     && typeof r.parent?.session === 'string' && typeof r.harness === 'string' && typeof r.state === 'string'
     && (r.model === undefined || typeof r.model === 'string')
     && (r.reasoningEffort === undefined || typeof r.reasoningEffort === 'string')
+    && (r.spawn === undefined || (typeof r.spawn === 'object' && r.spawn !== null))
+    && (r.persistence === undefined || r.persistence === 'one-shot' || r.persistence === 'persistent')
+    && (r.epoch === undefined || (Number.isSafeInteger(r.epoch) && r.epoch >= 1))
+    && (r.lastOperationId === undefined || typeof r.lastOperationId === 'string')
+    && (r.lastTurnAt === undefined || typeof r.lastTurnAt === 'string')
+    && (r.lastTurnOutcome === undefined || ['completed', 'failed', 'cancelled'].includes(r.lastTurnOutcome))
+    && (r.queuedTurns === undefined || (Number.isSafeInteger(r.queuedTurns) && r.queuedTurns >= 0))
     && typeof r.createdAt === 'string' && !!r.carrier && r.carrier.detached === true && Array.isArray(r.carrier.command);
 }
 
@@ -224,7 +248,8 @@ export class Ai4aiStore {
     });
   }
 
-  async updateExecutor(executorId: string, patch: Partial<Pick<ExecutorRecord, 'state' | 'sessionId'>>): Promise<ExecutorRecord> {
+  async updateExecutor(executorId: string, patch: Partial<Pick<ExecutorRecord,
+    'state' | 'sessionId' | 'lastOperationId' | 'lastTurnAt' | 'lastTurnOutcome' | 'queuedTurns' | 'persistence' | 'epoch'>>): Promise<ExecutorRecord> {
     return this.lock(async () => {
       const file = this.executorFile();
       const existing = await this.readExecutors();

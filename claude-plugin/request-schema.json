@@ -14,11 +14,20 @@
           "message",
           "cancel",
           "stop",
+          "finish",
           "list",
           "surface-preserve",
           "surface-cross",
           "spawn-isolation",
           "spawn-policy",
+          "spawn-persistence",
+          "spawn-surface",
+          "spawn-permission-mode",
+          "spawn-env-exclude",
+          "spawn-mcp-deny",
+          "message-revival",
+          "events",
+          "watch",
           "model-override",
           "reasoning-effort-override"
         ]
@@ -33,10 +42,11 @@
         "message",
         "cancel",
         "stop",
+        "finish",
         "list",
         "capabilities"
       ],
-      "description": "Operation to perform: handoff, spawn, status, message, cancel/stop, list or capabilities."
+      "description": "Operation to perform: handoff, spawn, status, message, cancel/stop, finish, list or capabilities."
     },
     "operationId": {
       "type": "string",
@@ -113,6 +123,91 @@
       ],
       "description": "Executor isolation: inherit the caller environment (default) or isolated."
     },
+    "spawn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Carrier options for a spawned executor; persisted and re-applied to every resumed or revived turn.",
+      "properties": {
+        "persistence": {
+          "enum": [
+            "one-shot",
+            "persistent"
+          ],
+          "description": "one-shot (default) exits after the turn queue drains; persistent stays alive in idle between turns."
+        },
+        "surface": {
+          "enum": [
+            "headless",
+            "web"
+          ],
+          "description": "Carrier surface; defaults are feasibility-gated per harness."
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "DSH profile name; unsupported on other harnesses."
+        },
+        "permissionMode": {
+          "enum": [
+            "bypassPermissions",
+            "dontAsk"
+          ],
+          "description": "Claude permission mode; interactive modes are refused."
+        },
+        "allowedTools": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "description": "Tool allow-list used with permissionMode dontAsk."
+        },
+        "disallowedTools": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "description": "Tools the carrier must refuse even when installed (for example Skill(gclear))."
+        },
+        "envExclude": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "description": "Extra environment variable names removed before launch; the built-in defaults are always removed."
+        },
+        "mcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Extra MCP servers to deny; default message-class denials cannot be re-enabled.",
+          "properties": {
+            "deny": {
+              "type": "array",
+              "maxItems": 64,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "description": "Additional MCP server names to remove (case-insensitive)."
+            }
+          }
+        }
+      }
+    },
     "count": {
       "type": "integer",
       "minimum": 1,
@@ -123,13 +218,38 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 300000,
-      "description": "Maximum wait in milliseconds for a stop confirmation."
+      "description": "Maximum wait in milliseconds for a stop/finish confirmation."
     },
     "reason": {
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
       "description": "Human-readable reason recorded with the operation."
+    },
+    "logTail": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Bounded log tail for status; events are normalized (event v1), lines are raw log lines.",
+      "properties": {
+        "tail": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Maximum number of entries (default 50)."
+        },
+        "cursor": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte cursor returned by a previous call; at a line boundary."
+        },
+        "format": {
+          "enum": [
+            "events",
+            "lines"
+          ],
+          "description": "events (default) or raw lines."
+        }
+      }
     }
   },
   "required": [

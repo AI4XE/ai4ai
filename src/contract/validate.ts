@@ -1,8 +1,10 @@
 import { FEATURES } from './version.js';
 import {
-  AVAILABILITY, AUTOCOMPACT_SOURCES, CONTEXT_VERIFICATION, FIELD_STATE_KEYS, HANDOFF_MODES, HANDOFF_PHASES, HARNESSES, ISOLATION,
-  LEGACY_PROOF_MECHANISM, LIFECYCLE_STATES, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, PROOF_MECHANISMS, SOURCE_LABELS, STATES, SURFACES,
+  AVAILABILITY, AUTOCOMPACT_SOURCES, CONTEXT_VERIFICATION, EVENT_KINDS, EVENT_LEVELS, EVENT_ROLES, FIELD_STATE_KEYS, FIELD_STATE_VALUES, HANDOFF_MODES, HANDOFF_PHASES, HARNESSES, ISOLATION,
+  LEGACY_PROOF_MECHANISM, LIFECYCLE_STATES, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, PERMISSION_MODES, PERSISTENCE_MODES, PROCESS_STATES, PROOF_MECHANISMS,
+  SOURCE_LABELS, SPAWN_SURFACES, STATES, SURFACES, TURN_OUTCOMES,
 } from './states.js';
+import type { FieldStateValue } from './states.js';
 import type {
   CapabilityDeclaration, ContextInfo, Identity, Issue, Notice, Request, Result,
   Validation,
@@ -17,8 +19,13 @@ const done = <T>(value: unknown, issues: Issue[]): Validation<T> => issues.lengt
 
 const REQUEST_KEYS = [
   'requiredFeatures', 'operation', 'operationId', 'target', 'owner', 'mode', 'surface',
-  'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'timeoutMs', 'reason',
+  'task', 'model', 'reasoningEffort', 'policy', 'spawn', 'isolation', 'count', 'timeoutMs', 'reason', 'logTail',
 ] as const;
+
+const SPAWN_KEYS = ['persistence', 'surface', 'profile', 'permissionMode', 'allowedTools', 'disallowedTools', 'envExclude', 'mcp'] as const;
+const LOG_TAIL_KEYS = ['tail', 'cursor', 'format'] as const;
+const boundedList = (value: unknown, maxItems = 64): boolean => Array.isArray(value)
+  && value.length <= maxItems && new Set(value).size === value.length && value.every(item => text(item, 4096));
 
 /** Requests are closed: unknown fields never silently mutate a session. */
 export function validateRequest(value: unknown, features: readonly string[] = FEATURES): Validation<Request> {
@@ -52,6 +59,37 @@ export function validateRequest(value: unknown, features: readonly string[] = FE
   }
   if (value.count !== undefined && (!Number.isSafeInteger(value.count) || Number(value.count) < 1 || Number(value.count) > 16)) issues.push(problem('count', 'schema', 'Expected an integer from 1 to 16'));
   if (value.timeoutMs !== undefined && (!Number.isSafeInteger(value.timeoutMs) || Number(value.timeoutMs) < 0 || Number(value.timeoutMs) > 300000)) issues.push(problem('timeoutMs', 'schema', 'Expected an integer from 0 to 300000'));
+  if (value.spawn !== undefined) {
+    if (!object(value.spawn)) issues.push(problem('spawn', 'schema', 'Expected spawn options'));
+    else {
+      for (const key of Object.keys(value.spawn)) if (!(SPAWN_KEYS as readonly string[]).includes(key)) issues.push(problem(`spawn.${key}`, 'unknown-field', 'Unknown spawn option'));
+      if (value.spawn.persistence !== undefined && !member(value.spawn.persistence, PERSISTENCE_MODES)) issues.push(problem('spawn.persistence', 'schema', 'Unknown persistence mode'));
+      if (value.spawn.surface !== undefined && !member(value.spawn.surface, SPAWN_SURFACES)) issues.push(problem('spawn.surface', 'schema', 'Unknown spawn surface'));
+      if (value.spawn.profile !== undefined && !text(value.spawn.profile, 256)) issues.push(problem('spawn.profile', 'schema', 'Expected a bounded profile name'));
+      if (value.spawn.permissionMode !== undefined && !member(value.spawn.permissionMode, PERMISSION_MODES)) issues.push(problem('spawn.permissionMode', 'schema', 'Unknown permission mode'));
+      for (const key of ['allowedTools', 'disallowedTools', 'envExclude'] as const) {
+        if (value.spawn[key] !== undefined && !boundedList(value.spawn[key])) issues.push(problem(`spawn.${key}`, 'schema', 'Expected a distinct bounded string list'));
+      }
+      if (value.spawn.permissionMode === 'dontAsk' && value.spawn.allowedTools === undefined) issues.push(problem('spawn.allowedTools', 'required', 'dontAsk requires an explicit allowedTools list'));
+      if (value.spawn.allowedTools !== undefined && value.spawn.permissionMode !== 'dontAsk') issues.push(problem('spawn.allowedTools', 'not-applicable', 'allowedTools is only meaningful with permissionMode dontAsk'));
+      if (value.spawn.mcp !== undefined) {
+        if (!object(value.spawn.mcp)) issues.push(problem('spawn.mcp', 'schema', 'Expected an MCP deny object'));
+        else {
+          for (const key of Object.keys(value.spawn.mcp)) if (key !== 'deny') issues.push(problem(`spawn.mcp.${key}`, 'unknown-field', 'Unknown MCP option'));
+          if (value.spawn.mcp.deny !== undefined && !boundedList(value.spawn.mcp.deny)) issues.push(problem('spawn.mcp.deny', 'schema', 'Expected a distinct bounded string list'));
+        }
+      }
+    }
+  }
+  if (value.logTail !== undefined) {
+    if (!object(value.logTail)) issues.push(problem('logTail', 'schema', 'Expected a log tail request'));
+    else {
+      for (const key of Object.keys(value.logTail)) if (!(LOG_TAIL_KEYS as readonly string[]).includes(key)) issues.push(problem(`logTail.${key}`, 'unknown-field', 'Unknown log tail option'));
+      if (value.logTail.tail !== undefined && (!Number.isSafeInteger(value.logTail.tail) || Number(value.logTail.tail) < 1 || Number(value.logTail.tail) > 1000)) issues.push(problem('logTail.tail', 'schema', 'Expected an integer from 1 to 1000'));
+      if (value.logTail.cursor !== undefined && (!Number.isSafeInteger(value.logTail.cursor) || Number(value.logTail.cursor) < 0)) issues.push(problem('logTail.cursor', 'schema', 'Expected a non-negative integer cursor'));
+      if (value.logTail.format !== undefined && !['events', 'lines'].includes(String(value.logTail.format))) issues.push(problem('logTail.format', 'schema', 'Unknown log tail format'));
+    }
+  }
 
   // Operation-specific applicability mirrors REQUEST_SCHEMA's if/then blocks.
   const has = (key: string): boolean => value[key] !== undefined;
@@ -61,23 +99,23 @@ export function validateRequest(value: unknown, features: readonly string[] = FE
   if (operation === 'handoff') {
     if (!has('target')) issues.push(problem('target', 'required', 'handoff requires target "self" or an owned executor id'));
     if (!has('task')) issues.push(problem('task', 'required', 'handoff requires handoff material'));
-    notApplicable(['owner', 'count', 'isolation', 'policy']);
+    notApplicable(['owner', 'count', 'isolation', 'policy', 'spawn', 'logTail']);
   } else if (operation === 'spawn') {
     if (!has('task')) issues.push(problem('task', 'required', 'spawn requires task material'));
-    notApplicable(['target', 'owner', 'mode', 'surface']);
+    notApplicable(['target', 'owner', 'mode', 'surface', 'logTail']);
   } else if (operation === 'status') {
-    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface']);
+    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn']);
   } else if (operation === 'message') {
     if (!has('target')) issues.push(problem('target', 'required', 'message requires an owned target'));
     if (!has('task')) issues.push(problem('task', 'required', 'message requires text'));
-    notApplicable(['owner', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface']);
-  } else if (operation === 'cancel' || operation === 'stop') {
-    if (!has('target')) issues.push(problem('target', 'required', 'cancel/stop requires an owned target'));
-    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface']);
+    notApplicable(['owner', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'logTail']);
+  } else if (operation === 'cancel' || operation === 'stop' || operation === 'finish') {
+    if (!has('target')) issues.push(problem('target', 'required', `${String(operation)} requires an owned target`));
+    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'logTail']);
   } else if (operation === 'list') {
-    notApplicable(['target', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs']);
+    notApplicable(['target', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs', 'spawn', 'logTail']);
   } else if (operation === 'capabilities') {
-    notApplicable(['target', 'owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs']);
+    notApplicable(['target', 'owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs', 'spawn', 'logTail']);
   }
   return done<Request>(value, issues);
 }
@@ -93,21 +131,28 @@ export function validateIdentity(value: unknown): Validation<Identity> {
 }
 
 const CONTEXT_FIELDS = ['window', 'used', 'percent', 'percentSource', 'sources'] as const;
+// Removed in 0.0.7 after the field convergence decision. Older executor records
+// may still carry them; they are accepted and ignored on read, never emitted.
+const LEGACY_CONTEXT_FIELDS = ['usedWithOutput', 'percentWithOutput'] as const;
 export function validateContext(value: unknown): Validation<ContextInfo> {
   if (!object(value)) return { ok: false, issues: [problem('$', 'schema', 'Expected context info')] };
   const issues: Issue[] = [];
-  for (const key of Object.keys(value)) if (!(CONTEXT_FIELDS as readonly string[]).includes(key)) issues.push(problem(key, 'unknown-field', 'Unknown context field'));
+  for (const key of Object.keys(value)) {
+    if ((LEGACY_CONTEXT_FIELDS as readonly string[]).includes(key)) continue;
+    if (!(CONTEXT_FIELDS as readonly string[]).includes(key)) issues.push(problem(key, 'unknown-field', 'Unknown context field'));
+  }
   for (const key of ['window', 'used'] as const) {
     if (!(key in value)) issues.push(problem(key, 'required', 'Expected window and used'));
     else if (value[key] !== null && (!Number.isSafeInteger(value[key]) || Number(value[key]) < 0)) issues.push(problem(key, 'schema', 'Expected a non-negative integer or null'));
   }
-  if (value.percent !== undefined && value.percent !== null) {
-    const percent = value.percent;
+  for (const key of ['percent'] as const) {
+    if (value[key] === undefined || value[key] === null) continue;
+    const percent = value[key];
     // Percent is a 0-100 ratio with one decimal; other precisions indicate a
     // mixed/unknown unit and must be normalized by the adapter instead.
     if (typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100
       || Math.abs(percent * 10 - Math.round(percent * 10)) > 1e-9) {
-      issues.push(problem('percent', 'schema', 'Expected a 0-100 number with one decimal or null'));
+      issues.push(problem(key, 'schema', 'Expected a 0-100 number with one decimal or null'));
     }
   }
   if (value.percentSource !== undefined && value.percentSource !== null && !member(value.percentSource, PERCENT_SOURCE)) issues.push(problem('percentSource', 'schema', 'Unknown percent source'));
@@ -115,6 +160,7 @@ export function validateContext(value: unknown): Validation<ContextInfo> {
     if (!object(value.sources)) issues.push(problem('sources', 'schema', 'Expected a source map'));
     else {
       for (const key of Object.keys(value.sources)) {
+        if ((LEGACY_CONTEXT_FIELDS as readonly string[]).includes(key)) continue;
         if (!['window', 'used', 'percent'].includes(key)) issues.push(problem(`sources.${key}`, 'unknown-field', 'Unknown context source'));
         else if (value.sources[key] !== null && !member(value.sources[key], SOURCE_LABELS)) issues.push(problem(`sources.${key}`, 'schema', 'Unknown source label'));
       }
@@ -157,7 +203,14 @@ export function validateCapability(value: unknown): Validation<CapabilityDeclara
     if (!Number.isSafeInteger(value.spawn.maxConcurrent) || Number(value.spawn.maxConcurrent) < 1) issues.push(problem('spawn.maxConcurrent', 'schema', 'Expected a positive integer'));
     if (!member(value.spawn.isolation, AVAILABILITY)) issues.push(problem('spawn.isolation', 'schema', 'Unknown availability'));
     if (value.spawn.availability === 'supported' && value.spawn.lifecycle !== 'detached') issues.push(problem('spawn.lifecycle', 'contract', 'Supported spawn requires detached lifecycle'));
+    if (!Array.isArray(value.spawn.persistenceModes) || value.spawn.persistenceModes.length === 0 || value.spawn.persistenceModes.some(mode => !member(mode, PERSISTENCE_MODES))) issues.push(problem('spawn.persistenceModes', 'schema', 'Expected a non-empty persistence mode list'));
+    if (!Array.isArray(value.spawn.surfaces) || value.spawn.surfaces.some(surface => !member(surface, SPAWN_SURFACES))) issues.push(problem('spawn.surfaces', 'schema', 'Expected a spawn surface list'));
+    if (!Array.isArray(value.spawn.permissionModes) || value.spawn.permissionModes.some(mode => !member(mode, PERMISSION_MODES))) issues.push(problem('spawn.permissionModes', 'schema', 'Expected a permission mode list'));
+    if (!member(value.spawn.mcpFilter, AVAILABILITY)) issues.push(problem('spawn.mcpFilter', 'schema', 'Unknown availability'));
   } else issues.push(problem('spawn', 'required', 'Expected spawn capabilities'));
+  if (object(value.observation)) {
+    if (!member(value.observation.events, EVENT_LEVELS)) issues.push(problem('observation.events', 'schema', 'Unknown event level'));
+  } else issues.push(problem('observation', 'required', 'Expected observation capabilities'));
   if (object(value.status)) {
     for (const key of ['availability', 'model', 'reasoningEffort', 'context'] as const) if (!member(value.status[key], AVAILABILITY)) issues.push(problem(`status.${key}`, 'schema', 'Unknown availability'));
     if (value.status.percentSource !== null && !member(value.status.percentSource, PERCENT_SOURCE)) issues.push(problem('status.percentSource', 'schema', 'Unknown percent source'));
@@ -172,6 +225,8 @@ const RESULT_KEYS = [
   'operation', 'operationId', 'status', 'reason', 'durable', 'target', 'executorId',
   'sessionId', 'surfaceChanged', 'state', 'handoff', 'model', 'reasoningEffort', 'lastActivityAt', 'lastActivityAtSource', 'stateSource', 'exitCode', 'signal', 'session', 'modelVerification', 'verification',
   'context', 'unavailable', 'notices', 'error', 'proof', 'capabilities', 'executors', 'fieldStates', 'autoCompact',
+  'processState', 'processStateReason', 'turns', 'lastOperationId', 'lastTurnOutcome', 'queuedTurns', 'lastTurnAt',
+  'turnStartedAt', 'idleSince', 'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail',
 ] as const;
 
 /** Results are closed too, so a misspelled field cannot masquerade as evidence. */
@@ -222,8 +277,10 @@ export function validateResult(value: unknown): Validation<Result> {
     else {
       for (const [key, state] of Object.entries(value.fieldStates)) {
         if (!(FIELD_STATE_KEYS as readonly string[]).includes(key)) issues.push(problem(`fieldStates.${key}`, 'unknown-field', 'Unknown field-state key'));
-        if (!['unsupported', 'unavailable', 'unknown'].includes(String(state))) issues.push(problem(`fieldStates.${key}`, 'schema', 'Unknown field state'));
-        if (Array.isArray(value.unavailable) && !value.unavailable.includes(key)) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A missing field must also appear in unavailable'));
+        if (!(FIELD_STATE_VALUES as readonly string[]).includes(String(state))) issues.push(problem(`fieldStates.${key}`, 'schema', 'Unknown field state'));
+        if (state === 'disabled') {
+          if (Array.isArray(value.unavailable) && value.unavailable.includes(key)) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A disabled field is not missing and must not appear in unavailable'));
+        } else if (Array.isArray(value.unavailable) && !value.unavailable.includes(key)) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A missing field must also appear in unavailable'));
         if (value.unavailable === undefined) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A field state map requires the unavailable list it derives from'));
       }
     }
@@ -240,6 +297,51 @@ export function validateResult(value: unknown): Validation<Result> {
   }
   if (value.exitCode !== undefined && value.exitCode !== null && !Number.isSafeInteger(value.exitCode)) issues.push(problem('exitCode', 'schema', 'Expected an integer or null'));
   if (value.signal !== undefined && value.signal !== null && !text(value.signal, 64)) issues.push(problem('signal', 'schema', 'Expected a signal name or null'));
+  if (value.processState !== undefined && !member(value.processState, PROCESS_STATES)) issues.push(problem('processState', 'schema', 'Unknown process state'));
+  if (value.processStateReason !== undefined) {
+    if (!text(value.processStateReason, 4096)) issues.push(problem('processStateReason', 'schema', 'Expected bounded text'));
+    else if (value.processState === undefined) issues.push(problem('processStateReason', 'inconsistent', 'A process-state reason requires the process state'));
+  }
+  for (const key of ['turns', 'queuedTurns', 'queuePosition'] as const) {
+    if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || Number(value[key]) < 0)) issues.push(problem(key, 'schema', 'Expected a non-negative integer'));
+  }
+  if (value.lastOperationId !== undefined && value.lastOperationId !== null && (!text(value.lastOperationId, 128) || !ID.test(value.lastOperationId))) issues.push(problem('lastOperationId', 'schema', 'Expected a bounded identifier or null'));
+  if (value.lastTurnOutcome !== undefined && value.lastTurnOutcome !== null && !member(value.lastTurnOutcome, TURN_OUTCOMES)) issues.push(problem('lastTurnOutcome', 'schema', 'Unknown turn outcome'));
+  for (const key of ['lastTurnAt', 'turnStartedAt', 'idleSince'] as const) {
+    if (value[key] !== undefined && value[key] !== null && !text(value[key], 64)) issues.push(problem(key, 'schema', 'Expected an ISO timestamp or null'));
+  }
+  if (value.turnId !== undefined && (!text(value.turnId, 128) || !ID.test(value.turnId))) issues.push(problem('turnId', 'schema', 'Expected a bounded identifier'));
+  if (value.persistence !== undefined && !member(value.persistence, PERSISTENCE_MODES)) issues.push(problem('persistence', 'schema', 'Unknown persistence mode'));
+  if (value.runtimeVersion !== undefined && value.runtimeVersion !== null && !text(value.runtimeVersion, 256)) issues.push(problem('runtimeVersion', 'schema', 'Expected a version string or null'));
+  if (value.mcpFiltered !== undefined) {
+    if (!object(value.mcpFiltered) || !Array.isArray(value.mcpFiltered.names) || value.mcpFiltered.names.some(name => !text(name, 256))
+      || !Number.isSafeInteger(value.mcpFiltered.count) || Number(value.mcpFiltered.count) < 0) {
+      issues.push(problem('mcpFiltered', 'schema', 'Expected MCP names and a count'));
+    }
+  }
+  if (value.logTail !== undefined) {
+    if (!object(value.logTail)) issues.push(problem('logTail', 'schema', 'Expected a log tail'));
+    else {
+      for (const key of Object.keys(value.logTail)) if (!['format', 'events', 'lines', 'nextCursor', 'reset'].includes(key)) issues.push(problem(`logTail.${key}`, 'unknown-field', 'Unknown log tail field'));
+      if (!['events', 'lines'].includes(String(value.logTail.format))) issues.push(problem('logTail.format', 'schema', 'Unknown log tail format'));
+      if (!Number.isSafeInteger(value.logTail.nextCursor) || Number(value.logTail.nextCursor) < 0) issues.push(problem('logTail.nextCursor', 'schema', 'Expected a non-negative integer cursor'));
+      if (value.logTail.reset !== undefined && typeof value.logTail.reset !== 'boolean') issues.push(problem('logTail.reset', 'schema', 'Expected boolean'));
+      if (value.logTail.format === 'events' && value.logTail.events !== undefined) {
+        if (!Array.isArray(value.logTail.events)) issues.push(problem('logTail.events', 'schema', 'Expected an event list'));
+        else value.logTail.events.forEach((event, i) => {
+          if (!object(event) || !Number.isSafeInteger(event.seq) || !text(event.ts, 64) || !member(event.kind, EVENT_KINDS)
+            || (event.role !== undefined && !member(event.role, EVENT_ROLES))
+            || (event.text !== undefined && !text(event.text, 4096))
+            || (event.detail !== undefined && !text(event.detail, 4096))
+            || (event.tool !== undefined && !text(event.tool, 256))
+            || (event.phase !== undefined && !text(event.phase, 64))) issues.push(problem(`logTail.events[${i}]`, 'schema', 'Invalid normalized event'));
+        });
+      }
+      if (value.logTail.format === 'lines' && value.logTail.lines !== undefined) {
+        if (!Array.isArray(value.logTail.lines) || value.logTail.lines.some(line => typeof line !== 'string' || line.length > 4096)) issues.push(problem('logTail.lines', 'schema', 'Expected bounded raw lines'));
+      }
+    }
+  }
   if (value.session !== undefined && value.session !== null) {
     if (!object(value.session)) issues.push(problem('session', 'schema', 'Expected a session pointer or null'));
     else {
@@ -323,14 +425,16 @@ export function result(
     tokens: null as number | null, ratio: null as number | null, source: 'unknown' as const,
     ...(options.autoCompact ?? {}),
   };
-  const fieldStates: Record<string, 'unsupported' | 'unavailable' | 'unknown'> = { ...(options.fieldStates ?? {}) };
-  if (autoCompact.tokens === null && autoCompact.ratio === null) fieldStates['context.autoCompact'] = fieldStates['context.autoCompact'] ?? 'unavailable';
+  const fieldStates: Record<string, FieldStateValue> = { ...(options.fieldStates ?? {}) };
+  if (autoCompact.tokens === null && autoCompact.ratio === null && fieldStates['context.autoCompact'] !== 'disabled') fieldStates['context.autoCompact'] = fieldStates['context.autoCompact'] ?? 'unavailable';
   if ((options.model ?? null) === null) fieldStates.model = fieldStates.model ?? 'unavailable';
   if ((options.reasoningEffort ?? null) === null) fieldStates.reasoningEffort = fieldStates.reasoningEffort ?? 'unavailable';
   if (context.window === null) fieldStates['context.window'] = fieldStates['context.window'] ?? 'unavailable';
   if (context.used === null) fieldStates['context.used'] = fieldStates['context.used'] ?? 'unavailable';
   if (context.percent === null) fieldStates['context.percent'] = fieldStates['context.percent'] ?? 'unavailable';
-  const unavailable = [...new Set([...(options.unavailable ?? []), ...Object.keys(fieldStates)])];
+  // Output-inclusive occupancy is only reported when the native usage carries
+  // output tokens; a null value is an explicit, non-blocking unavailability.
+  const unavailable = [...new Set([...(options.unavailable ?? []), ...Object.keys(fieldStates).filter(key => fieldStates[key] !== 'disabled')])];
   return { ...composed, context, unavailable, fieldStates, autoCompact };
 }
 
