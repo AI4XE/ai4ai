@@ -125,17 +125,18 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
       }),
       declaration({
         harness: 'opencode', os, interface: 'headless',
-        // Served-session truth (OpenCode 2.3.2): the in-harness tool loads, so
-        // self restart/compact work, but the plugin `prompt` hook is not invoked
-        // for prompts submitted through `opencode run --server` /
-        // /api/session/{id}/prompt. An executor-target request therefore stays
-        // pending and the model sees the control envelope. The V2 API has no
-        // safe empty-window restart primitive (`/revert` restores file
-        // snapshots). Executor restart/compact are NOT declared until the hook
-        // path is fixed; explicit rotation remains available and honored.
-        // Evidence: docs/dev/research/v0.0.8/evidence/linux/opencode/defect/.
-        reason: 'A detached opencode executor loads the in-harness tool, so self restart/compact work. Executor-target restart/compact are not declared on 2.3.2 served sessions: the plugin prompt hook does not run for served/API prompts, so the durable request is never consumed; use explicit rotation for a headless executor. The TUI session keeps restart/compact.',
-        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['rotation'] as ('compact' | 'restart' | 'rotation')[] } },
+        // Served-session truth (OpenCode 2.3.2): the persistent per-executor
+        // `opencode serve` loads the in-harness plugin, so an executor-target
+        // wake turn reaches the plugin `prompt` hook and the durable request is
+        // consumed for both restart (empty replacement window) and compact
+        // (native summary). The earlier "prompt hook does not run" observation
+        // was a cold-cache startup race: the first wake turn arrived before the
+        // plugin registered. The carrier now waits for the plugin to report
+        // `active` before submitting a turn and refuses an envelope otherwise.
+        // Linux evidence: executor-target restart/compact completed in the same
+        // session with the task admitted and answered.
+        reason: 'A persistent opencode executor is backed by one per-executor `opencode serve`; the in-harness plugin handles the wake turn, so executor-target restart and compact complete in the same session. The carrier waits for plugin registration before submitting a turn, because a cold plugin cache can answer the port before hooks exist. Rotation stays available as the explicit alternative.',
+        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
         ...common,
         ...(verified ? { evidence: `matrix:opencode/${os}/headless/2026-11-24` } : {}),
       }),

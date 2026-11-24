@@ -19,6 +19,8 @@ import { readFile, rename, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
+import { controlEnvelopeOperationId } from '../../core/control-envelope.js';
+import { waitForAi4aiPlugin } from './readiness.js';
 
 const args = process.argv.slice(2);
 const valueOf = (name: string): string | undefined => {
@@ -115,6 +117,33 @@ async function startServer(): Promise<ServerRecord> {
 
 let server = await readServer();
 if (!server) server = await startServer();
+
+// The server answers on its port before the in-harness plugin is registered.
+// A control envelope submitted in that window is executed as ordinary model
+// input, so the durable request would never be consumed. Only a wake envelope
+// needs the wait: ordinary turns stay fast when no plugin is installed, and a
+// 1.x server never loads project plugins.
+const envelopeOperationId = controlEnvelopeOperationId(message);
+if (envelopeOperationId) {
+  const readiness = major >= 2
+    ? await waitForAi4aiPlugin({ url: server.url, password: server.password })
+    : { ready: false, waitedMs: 0, detail: `OpenCode ${major}.x does not load project plugins in a served session` };
+  if (executorDirectory) {
+    await writeFile(path.join(executorDirectory, 'plugin-readiness.json'), JSON.stringify({
+      at: new Date().toISOString(), ...readiness,
+    }, null, 2) + '\n').catch(() => undefined);
+  }
+  if (!readiness.ready) {
+    process.stderr.write(`opencode carrier refused the control envelope: ${readiness.detail}\n`);
+    if (executorDirectory) {
+      await writeFile(path.join(executorDirectory, 'intake-error.json'), JSON.stringify({
+        at: new Date().toISOString(),
+        message: `The control envelope was not submitted: ${readiness.detail}`,
+      }, null, 2) + '\n').catch(() => undefined);
+    }
+    process.exit(1);
+  }
+}
 
 const runArgs = ['run', '--format', 'json', '--auto'];
 // 1.x attaches with --attach and takes --password; 2.x uses --server and does
