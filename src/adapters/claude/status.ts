@@ -2,7 +2,7 @@ import type { AutoCompact, ContextInfo } from '../../contract/types.js';
 import { contextFromUsage } from '../external.js';
 import { claudeTranscriptUsage } from '../../core/session-probe.js';
 import { envValue, probeClaudeSettings } from '../../core/config-probe.js';
-import { firstVerified, verifiedText, verifiedThreshold, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
+import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
 
 /**
  * Per-field status resolution for Claude Code (used by the external adapter and
@@ -30,7 +30,7 @@ export interface ClaudeStatusDetails {
   context: ContextInfo;
   autoCompact?: AutoCompact;
   modelVerification: 'reported' | 'configured-only' | 'unknown';
-  fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown'>;
+  fieldStates?: Record<string, 'unsupported' | 'unavailable' | 'unknown' | 'disabled'>;
   notices?: { code: string; impact: 'none'; action_required: false; message: string }[];
   unavailable: string[];
   runtimeVersion?: string | null;
@@ -82,6 +82,11 @@ export async function resolveClaudeStatus(workspace: string, sessionId: string |
     { value: window, source: windowSource ?? 'native' },
     { value: verifiedWindow(envNumber('CLAUDE_CODE_MAX_CONTEXT_TOKENS')), source: 'env' },
     { value: verifiedWindow(Number(windowSettings.env[0]?.value)), source: windowSettings.env[0]?.source ?? 'config' },
+    // `CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `autoCompactWindow` are a WINDOW, not
+    // a threshold; they are the last window layer, never used as tokens.
+    { value: verifiedWindow(envNumber('CLAUDE_CODE_AUTO_COMPACT_WINDOW')), source: 'env' },
+    { value: verifiedWindow(Number(autoSettings.env[0]?.value)), source: autoSettings.env[0]?.source ?? 'config' },
+    { value: verifiedWindow(settings.autoCompactWindow?.value ?? null), source: settings.autoCompactWindow?.source ?? 'config' },
   ]);
   // Env before config: CLAUDE_CODE_EFFORT_LEVEL overrides settings effortLevel.
   const reasoningEffortField = firstVerified<string>([
@@ -89,11 +94,13 @@ export async function resolveClaudeStatus(workspace: string, sessionId: string |
     { value: envValue('CLAUDE_CODE_EFFORT_LEVEL'), source: 'env' },
     { value: settings.effortLevel?.value ?? null, source: settings.effortLevel?.source ?? 'config' },
   ]);
-  const autoField = firstVerified<number>([
-    { value: verifiedThreshold(envNumber('CLAUDE_CODE_AUTO_COMPACT_WINDOW')), source: 'env' },
-    { value: verifiedThreshold(Number(autoSettings.env[0]?.value)), source: autoSettings.env[0]?.source ?? 'config' },
-    { value: settings.autoCompactWindow?.value ?? null, source: settings.autoCompactWindow?.source ?? 'config' },
+  const runSettings = await byKey('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE').catch(() => ({ env: [] as { value: string; source: 'config:project' | 'config:user' }[] }));
+  const disableSettings = await byKey('DISABLE_AUTO_COMPACT').catch(() => ({ env: [] as { value: string; source: 'config:project' | 'config:user' }[] }));
+  const pctField = firstVerified<number>([
+    { value: envNumber('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'), source: 'env' },
+    { value: Number(runSettings.env[0]?.value), source: runSettings.env[0]?.source ?? 'config' },
   ]);
+  const disabledValue = envValue('DISABLE_AUTO_COMPACT') ?? disableSettings.env[0]?.value ?? null;
 
   const usedValue = used;
   const windowValue = windowField?.value ?? null;
@@ -109,33 +116,37 @@ export async function resolveClaudeStatus(workspace: string, sessionId: string |
     percent: context.percentSource === 'native' ? 'native' : context.percent !== null ? 'derived' : null,
   };
 
-  // INFRA-085 A: sanitize the auto-compact ratio. A configured threshold above
-  // the observed window cannot be expressed as a (0,1] ratio; report the ratio
-  // as null with a notice instead of invalidating the whole status or clamping
-  // to a false 100%.
+  // Auto-compaction truth (D13). Claude auto-compacts by default; a missing
+  // explicit threshold must never be reported as `unavailable`. The native
+  // `autocompact_state.threshold` is not exposed to this path, so:
+  //   - DISABLE_AUTO_COMPACT -> `disabled` (feature exists, configuration off);
+  //   - a PCT override with a known window -> a derived threshold;
+  //   - otherwise enabled=true with a null threshold and `unknown` (truthful:
+  //     the default threshold exists but is not observable here).
+  // `CLAUDE_CODE_AUTO_COMPACT_WINDOW` was already consumed as a window above.
   const notices: { code: string; impact: 'none'; action_required: false; message: string }[] = [];
+  const autoDisabled = typeof disabledValue === 'string' && disabledValue !== '' && disabledValue !== '0' && disabledValue.toLowerCase() !== 'false';
   let autoCompact: AutoCompact | undefined;
-  if (autoField) {
-    const tokens = verifiedThreshold(autoField.value);
+  const fieldStates: Record<string, 'unsupported' | 'unavailable' | 'unknown' | 'disabled'> = {};
+  if (autoDisabled) {
+    fieldStates['context.autoCompact'] = 'disabled';
+  } else {
+    let tokens: number | null = null;
     let ratio: number | null = null;
-    if (tokens !== null && windowValue !== null && windowValue > 0) {
-      const raw = tokens / windowValue;
-      if (raw > 0 && raw <= 1) ratio = Math.round(raw * 1000) / 1000;
-      else if (raw > 1) {
-        notices.push({
-          code: 'auto-compact-threshold-exceeds-window', impact: 'none', action_required: false,
-          message: 'The configured auto-compact threshold exceeds the observed context window; the ratio is reported as unavailable while the threshold and window values remain valid.',
-        });
-      }
+    let source: AutoCompact['source'] = 'default';
+    if (pctField && windowValue !== null && windowValue > 0 && pctField.value! > 0 && pctField.value! <= 100) {
+      tokens = Math.round((windowValue * pctField.value!) / 100);
+      ratio = Math.round((tokens / windowValue) * 1000) / 1000;
+      source = pctField.source as AutoCompact['source'];
     }
-    autoCompact = { tokens, ratio, source: autoField.source as AutoCompact['source'] };
+    autoCompact = { tokens, ratio, source, enabled: true, enforced: null, nativeSource: null };
+    if (tokens === null) fieldStates['context.autoCompact'] = 'unknown';
   }
 
   const unavailable: string[] = [];
   if (!modelField) unavailable.push('model');
   if (windowValue === null) unavailable.push('context.window');
   if (usedValue === null) unavailable.push('context.used');
-  const fieldStates: Record<string, 'unsupported' | 'unavailable' | 'unknown'> = {};
   if (!reasoningEffortField) fieldStates.reasoningEffort = 'unavailable';
   return {
     model: modelField?.value ?? null,

@@ -36,6 +36,8 @@ export interface SpawnOptions {
   envExclude?: string[];
   /** Extra MCP server names to remove; defaults cannot be re-enabled. */
   mcp?: { deny?: string[] };
+  /** Internal origin marker: a rotation successor is seeded with the D29 text and must not adopt it as a delivery. */
+  origin?: 'rotation';
 }
 
 /** One normalized event (event v1). */
@@ -127,6 +129,32 @@ export interface AutoCompact {
   tokens: number | null;
   ratio: number | null;
   source: AutoCompactSource;
+  /** Whether the harness's auto-compaction feature is enabled for this session. */
+  enabled?: boolean | null;
+  /** Whether the harness enforces the threshold (native flag when available). */
+  enforced?: boolean | null;
+  /** The harness's own source label when it maps onto the contract vocabulary. */
+  nativeSource?: string | null;
+}
+
+/** Structured alternatives a failed handoff offers instead of silently switching. */
+export interface HandoffAlternatives {
+  modes?: import('./states.js').HandoffMode[];
+  message?: string;
+}
+
+/** Rotation lineage: predecessor executor/generation and the new lineage depth. */
+export interface RotationLineage {
+  predecessorExecutorId: string;
+  predecessorGeneration: string;
+  lineageGeneration: number;
+  operationId: string;
+  taskHash?: string;
+  predecessorSession?: string | null;
+  predecessorStopped?: boolean;
+  stopExitCode?: number | null;
+  stopSignal?: string | null;
+  transferredAt?: string;
 }
 
 export interface Verification {
@@ -238,6 +266,33 @@ export interface Result {
   signal?: string | null;
   /** Pointer to the persisted session store; content is never returned. */
   session?: SessionPointer | null;
+  /** Mechanism actually executed for a handoff (also present on `proof`). */
+  mechanism?: StoredProofMechanism;
+  /** True only when the native session identity changed (rotation / legacy new-session). */
+  sessionChanged?: boolean;
+  /** Native source session of a handoff. */
+  sourceSession?: string | null;
+  /** Native successor session of a handoff (equals source except rotation). */
+  successorSession?: string | null;
+  sourceGeneration?: string | null;
+  successorGeneration?: string | null;
+  /** Successor identity for a handoff (requires generation). */
+  successor?: Identity;
+  /** Rotation executor ids (predecessor is stopped, successor becomes the owner). */
+  predecessorExecutorId?: string | null;
+  successorExecutorId?: string | null;
+  /** Rotation lineage record. */
+  lineage?: RotationLineage;
+  /** True when the predecessor was confirmed stopped during rotation. */
+  predecessorStopped?: boolean | null;
+  /** Structured alternatives when a requested mode is unavailable. */
+  alternatives?: import('./states.js').HandoffMode[];
+  /** Whether the original task continued after a compact (observation only). */
+  continued?: boolean | null;
+  /** True when an idle executor had no work to continue (not a failure). */
+  idleAfter?: boolean | null;
+  /** Last error observed for a durable in-flight request. */
+  lastError?: ContractError | null;
   modelVerification: ModelVerification;
   verification: Verification;
   /** Per-field context; present for status/list where observed state is reported. */
@@ -264,7 +319,12 @@ export interface CapabilityDeclaration {
   operations: Partial<Record<Operation, Availability>>;
   handoff: {
     availability: Availability;
+    /** Legacy union retained for older consumers: `restart|compact` only. */
     modes: HandoffMode[];
+    /** Modes available when the caller hands off its own session. */
+    self?: { modes: import('./states.js').HandoffMode[] };
+    /** Modes available when the caller hands off an owned headless executor. */
+    executor?: { modes: import('./states.js').HandoffMode[] };
     modelOverride: Availability;
     reasoningEffortOverride: Availability;
     crossSurface: Availability;
@@ -287,6 +347,8 @@ export interface CapabilityDeclaration {
     reasoningEffort: Availability;
     context: Availability;
     percentSource: PercentSource | null;
+    /** Mandatory cell: whether `autoCompact` is reported truthfully on this surface. */
+    autoCompact?: Availability;
   };
   experimental: string[];
   reason: string;

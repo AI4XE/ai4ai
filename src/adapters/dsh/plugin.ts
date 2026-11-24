@@ -11,6 +11,7 @@ import { TOOL_DESCRIPTION, normalizeToolRequest } from '../../contract/tool.js';
 import { reconcileDshStatus, resolveDshStatus, type DshNativeStatus } from './status.js';
 import { sessionActivity, sessionPointer } from '../../core/session-probe.js';
 import { effectiveDshSelection, foldDshSelection } from '../../core/dsh-selection.js';
+import { taskDelivery } from '../../core/handoff-delivery.js';
 
 interface NativeMessage { id: string; role: string; content: { type: string; text?: string; id?: string; toolCallId?: string }[]; toolCallId?: string; isError?: boolean; source?: { kind: string; ai4ai?: JournalRecord } }
 interface NativeEvent { seq: number; type: string; time?: number; data: NativeMessage & { name?: string; message?: NativeMessage; isError?: boolean }; sourceEventSeqs?: number[] }
@@ -338,7 +339,7 @@ export function apply(ctx: DshContext): () => void {
       const applied: JournalRecord = { ...record, phase: 'applied', proof, proofMechanism, reason: 'Fresh context applied in the same session; successor binding recorded' };
       const continuation: NativeMessage = {
         id: randomUUID(), role: 'user',
-        content: [{ type: 'text', text: `AI4AI handoff applied. Continue the caller-provided task in this fresh context. Native system instructions, permissions and policies still apply.\n\n${record.task}` }],
+        content: [{ type: 'text', text: taskDelivery(record.task, `ai4ai-context-${record.operationId}`) }],
         source: { kind: SOURCE, ai4ai: applied },
       };
       for (const retained of span.retained) continuation.content.push({ type: 'text', text: 'Later user input (preserve and act on it):' }, ...retained.content);

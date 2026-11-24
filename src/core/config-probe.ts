@@ -496,9 +496,11 @@ function mergeOpenCode(documents: { value: Record<string, unknown>; source: Open
 export function openCodeAutoCompact(
   compaction: OpenCodeCompaction | null,
   window: number | null,
-): { autoCompact?: { tokens: number; ratio: number | null; source: OpenCodeSource | 'default' }; fieldState?: 'disabled' | 'unsupported' } {
+): { autoCompact?: { tokens: number; ratio: number | null; source: OpenCodeSource | 'default' }; fieldState?: 'disabled' | 'unavailable' } {
   if (compaction?.auto?.value === false) return { fieldState: 'disabled' };
-  if (window === null || window <= 0) return { fieldState: 'unsupported' };
+  // The feature exists; only the window (and therefore the size-based
+  // threshold) is unknown. That is `unavailable`, never `unsupported`.
+  if (window === null || window <= 0) return { fieldState: 'unavailable' };
   const buffer = compaction?.buffer ?? null;
   const raw = buffer?.value;
   const percent = typeof raw === 'string' ? Number.parseFloat(raw) : null;
@@ -617,6 +619,10 @@ export interface DshConfig {
   reasoningEffort: ConfigField<string> | null;
   window: ConfigField<number> | null;
   autoCompactRatio: ConfigField<number> | null;
+  /** `compaction-basic` fixed overhead tokens (subtracted from the window). */
+  autoCompactOverhead: number | null;
+  /** `compaction-basic` reserved buffer tokens (subtracted from the window). */
+  autoCompactBuffer: number | null;
   /** True when the active profile disables `compaction-basic` (no auto-compaction). */
   autoCompactDisabled: boolean;
 }
@@ -727,7 +733,7 @@ async function dshBundleCompactionDisabled(profile: DshProfile, dshEntry?: strin
  */
 export async function probeDshConfig(dshHome?: string, options: { profile?: DshProfile; dshEntry?: string } = {}): Promise<DshConfig> {
   const profile = options.profile ?? 'headless';
-  const empty: DshConfig = { model: null, reasoningEffort: null, window: null, autoCompactRatio: null, autoCompactDisabled: profile === 'web' };
+  const empty: DshConfig = { model: null, reasoningEffort: null, window: null, autoCompactRatio: null, autoCompactOverhead: null, autoCompactBuffer: null, autoCompactDisabled: profile === 'web' };
   const home = dshHome || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
   const text = await readConfig(path.join(home, 'profiles', profile, 'cordis.patch.yml'));
   let root: YamlValue = [];
@@ -761,6 +767,10 @@ export async function probeDshConfig(dshHome?: string, options: { profile?: DshP
   }
   const ratio = typeof compaction?.thresholdRatio === 'number' && compaction.thresholdRatio > 0 && compaction.thresholdRatio <= 1
     ? compaction.thresholdRatio : null;
+  const overhead = typeof compaction?.overhead === 'number' && Number.isSafeInteger(compaction.overhead) && compaction.overhead >= 0
+    ? compaction.overhead : null;
+  const buffer = typeof compaction?.buffer === 'number' && Number.isSafeInteger(compaction.buffer) && compaction.buffer >= 0
+    ? compaction.buffer : null;
   // An unconfigured compaction-basic entry still runs with the plugin's
   // documented default; read it from the installed runtime instead of guessing.
   const autoCompactRatio: ConfigField<number> | null = autoCompactDisabled
@@ -773,6 +783,34 @@ export async function probeDshConfig(dshHome?: string, options: { profile?: DshP
     reasoningEffort: reasoningEffort ? { value: reasoningEffort, source: 'config:user' } : null,
     window: window !== null ? { value: window, source: 'config:user' } : null,
     autoCompactRatio,
+    autoCompactOverhead: overhead,
+    autoCompactBuffer: buffer,
     autoCompactDisabled,
   };
+}
+
+/**
+ * DSH effective auto-compaction threshold.
+ *
+ * DSH `compaction-basic` triggers at
+ * `floor(min(window * ratio, window - overhead - buffer))`, not simply
+ * `window * ratio`. Missing overhead/buffer are treated as 0 (the plugin's
+ * unconfigured default) and the source is recorded by the caller. An unknown
+ * window yields no numeric threshold.
+ */
+export function dshAutoCompact(
+  config: DshConfig | null,
+  window: number | null,
+): { tokens: number | null; ratio: number | null; source: ConfigSource | 'default' } | null {
+  if (!config || config.autoCompactDisabled) return null;
+  if (window === null || window <= 0) return config.autoCompactRatio
+    ? { tokens: null, ratio: config.autoCompactRatio.value, source: config.autoCompactRatio.source }
+    : null;
+  const ratioConfig = config.autoCompactRatio;
+  const ratio = ratioConfig?.value ?? null;
+  if (ratio === null) return null;
+  const byRatio = Math.floor(window * ratio);
+  const byBudget = window - (config.autoCompactOverhead ?? 0) - (config.autoCompactBuffer ?? 0);
+  const tokens = Math.max(1, Math.min(byRatio, byBudget));
+  return { tokens, ratio: Math.round((tokens / window) * 1000) / 1000, source: ratioConfig!.source };
 }

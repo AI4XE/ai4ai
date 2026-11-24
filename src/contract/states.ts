@@ -96,28 +96,58 @@ export function handoffOutcome(phase: string, options: { appliedIsTerminal?: boo
   }
 }
 
-export const HANDOFF_MODES = ['compact', 'restart'] as const;
+/**
+ * Handoff modes. A self handoff supports `restart` (default) and `compact`;
+ * an owned-executor handoff additionally supports `rotation`, which stops the
+ * predecessor and spawns a successor (the only mechanism that changes the
+ * native session). Rotation is never valid for `target: "self"`.
+ */
+export const HANDOFF_MODES = ['compact', 'restart', 'rotation'] as const;
 export type HandoffMode = typeof HANDOFF_MODES[number];
+
+/**
+ * Modes an older capability consumer understands. The legacy single
+ * `handoff.modes` field stays within this set so a v0.0.7 validator never sees
+ * an unknown mode; `rotation` is exposed only through `handoff.executor.modes`.
+ */
+export const LEGACY_HANDOFF_MODES = ['compact', 'restart'] as const;
+export type LegacyHandoffMode = typeof LEGACY_HANDOFF_MODES[number];
+export const SELF_HANDOFF_MODES = ['compact', 'restart'] as const;
+export const EXECUTOR_HANDOFF_MODES = ['compact', 'restart', 'rotation'] as const;
 
 /**
  * Proof mechanisms a current adapter may produce. `surface-replacement` is the
  * zero-summary, same-session restart; `native-compaction` is the explicit
- * compact opt-in where the harness summarized history. `new-session` is a
- * legacy read-only value: historical journals may contain it, but no adapter
- * produces it because a handoff must never change the session identity.
+ * compact opt-in where the harness summarized history; `session-rotation` is
+ * the explicit executor renewal that stops the predecessor and spawns a
+ * successor in a new native session. `new-session` is a legacy read-only value:
+ * historical journals may contain it, but no adapter produces it.
  */
-export const PROOF_MECHANISMS = ['surface-replacement', 'native-compaction'] as const;
+export const PROOF_MECHANISMS = ['surface-replacement', 'native-compaction', 'session-rotation'] as const;
 export type ProofMechanism = typeof PROOF_MECHANISMS[number];
 export const LEGACY_PROOF_MECHANISM = 'new-session' as const;
 export type StoredProofMechanism = ProofMechanism | typeof LEGACY_PROOF_MECHANISM;
 
+/** Mechanisms that must keep the native session identity (same SID). */
+export const SAME_SESSION_MECHANISMS = ['surface-replacement', 'native-compaction'] as const;
+export const SESSION_CHANGING_MECHANISMS = ['session-rotation', LEGACY_PROOF_MECHANISM] as const;
+
 /**
  * `restart` is the default handoff mode: the new context contains only the
- * caller-supplied material, with no harness summary. `compact` remains an
- * explicit opt-in for users who want history compaction plus new material.
+ * caller-supplied material, with no harness summary. `compact` is an explicit
+ * opt-in that keeps a harness-generated history summary and resumes the task.
+ * `rotation` is an explicit executor-only renewal (stop + spawn).
  */
 export const DEFAULT_HANDOFF_MODE: HandoffMode = 'restart';
 export const handoffMode = (mode: HandoffMode | undefined): HandoffMode => mode ?? DEFAULT_HANDOFF_MODE;
+
+/** `sessionChanged` is derived from the mechanism, never stored independently. */
+export const sessionChangedOf = (mechanism: string | undefined): boolean =>
+  mechanism === 'session-rotation' || mechanism === LEGACY_PROOF_MECHANISM;
+
+/** Whether a mechanism preserves the native session (the same-session guard applies). */
+export const keepsSession = (mechanism: string | undefined): boolean =>
+  typeof mechanism === 'string' && (SAME_SESSION_MECHANISMS as readonly string[]).includes(mechanism);
 
 /** Interaction surfaces a handoff can preserve or explicitly switch to. */
 export const SURFACES = ['preserve', 'tui', 'headless', 'web'] as const;

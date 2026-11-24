@@ -189,7 +189,7 @@ export class DshAdapter extends ExternalExecutorAdapter {
     const headlessHandoff = 'supported' as const;
     const webLevel = 'supported' as const;
     const headless = {
-      handoff: { availability: headlessHandoff, modes: ['restart'] as ('compact' | 'restart')[] },
+      handoff: { availability: headlessHandoff, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: carrier, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -198,11 +198,11 @@ export class DshAdapter extends ExternalExecutorAdapter {
         mcpFilter: 'not-tested' as const,
       },
       events: 'normalized' as const,
-      status: { availability: carrier, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: carrier, percentSource: 'derived' as const },
+      status: { availability: carrier, model: carrier, reasoningEffort: carrier, context: carrier, percentSource: 'derived' as const, autoCompact: 'supported' as const },
       evidence: `matrix:dsh/${os}/headless/2026-11-22`,
     };
     const web = {
-      handoff: { availability: webLevel, modes: ['restart'] as ('compact' | 'restart')[] },
+      handoff: { availability: webLevel, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: webLevel, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -211,7 +211,7 @@ export class DshAdapter extends ExternalExecutorAdapter {
         mcpFilter: 'not-tested' as const,
       },
       events: 'normalized' as const,
-      status: { availability: webLevel, model: 'not-tested' as const, reasoningEffort: 'not-tested' as const, context: webLevel, percentSource: 'derived' as const },
+      status: { availability: webLevel, model: webLevel, reasoningEffort: webLevel, context: webLevel, percentSource: 'derived' as const, autoCompact: 'supported' as const },
       evidence: `matrix:dsh/${os}/web/2026-11-23`,
     };
     const webReason = linux

@@ -1,27 +1,33 @@
 import type { AdoptionProof, Identity } from '../contract/types.js';
 import type { NativeOutcome } from '../adapters/types.js';
-import { LEGACY_PROOF_MECHANISM, PROOF_MECHANISMS, type HandoffMode, type ProofMechanism, type StoredProofMechanism } from '../contract/states.js';
+import { LEGACY_PROOF_MECHANISM, PROOF_MECHANISMS, SAME_SESSION_MECHANISMS, sessionChangedOf, type HandoffMode, type ProofMechanism, type StoredProofMechanism } from '../contract/states.js';
 
 /**
  * Handoff finalization shared by every adapter, journal and watcher.
  *
- * A current handoff never changes the native session identity: `restart`
+ * A same-session handoff never changes the native session identity: `restart`
  * replaces the context in place and `compact` adds a native summary in place.
- * The only way to obtain a fresh identity is `spawn`, so a produced proof whose
- * successor session differs is a defect, never a success. `new-session` stays
- * readable for journals written by older releases; those records are exempt
- * from the same-session gate and are never produced again.
+ * The only mechanisms that change it are the explicit `session-rotation` and
+ * the legacy `new-session`; a `session-rotation` result is valid only when it
+ * reports `sessionChanged: true`. `new-session` stays readable for journals
+ * written by older releases and is never produced again.
  */
 
 export const isProducedMechanism = (value: unknown): value is ProofMechanism =>
   typeof value === 'string' && (PROOF_MECHANISMS as readonly string[]).includes(value);
 
+export const isSameSessionMechanism = (value: unknown): boolean =>
+  typeof value === 'string' && (SAME_SESSION_MECHANISMS as readonly string[]).includes(value);
+
 export const isLegacyMechanism = (value: unknown): boolean => value === LEGACY_PROOF_MECHANISM;
 
+/** `sessionChanged` for a proof/result mechanism. */
+export { sessionChangedOf };
+
 /** Old records stored only the mode; this reproduces the mechanism they implied. */
-export function legacyProofMechanism(mode: 'restart' | 'compact' | undefined): StoredProofMechanism {
+export function legacyProofMechanism(mode: HandoffMode | undefined): StoredProofMechanism {
   // Before 0.0.5, restart replaced the session (`/clear` or a new thread) and
-  // compact replaced the surface in place.
+  // compact replaced the surface in place. Rotation did not exist then.
   return mode === 'compact' ? 'surface-replacement' : LEGACY_PROOF_MECHANISM;
 }
 
@@ -62,7 +68,7 @@ export function finalizeHandoff(input: HandoffFinalizeInput): HandoffFinalizeRes
   const mechanism = explicit ?? input.proof?.mechanism ?? (input.mode ? legacyProofMechanism(input.mode) : undefined);
   const legacy = explicit === undefined;
   if (!input.proof) return { legacy, ...(mechanism ? { mechanism } : {}) };
-  if (mechanism && isProducedMechanism(mechanism)
+  if (isSameSessionMechanism(mechanism)
     && input.proof.source.session !== input.proof.successor.session) {
     return {
       legacy, mechanism,

@@ -4,6 +4,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { PRODUCT_VERSION } from '../../contract/version.js';
 
 /**
  * Minimal client for the local Codex app-server daemon.
@@ -314,7 +315,7 @@ export async function listThreads(): Promise<CodexThread[]> {
   if (!socket) return [];
   const daemon = await CodexDaemon.connect(socket);
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } });
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: PRODUCT_VERSION } });
     return await listAllThreads(daemon);
   } finally { daemon.close(); }
 }

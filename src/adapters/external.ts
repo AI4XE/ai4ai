@@ -159,6 +159,8 @@ export abstract class ExternalExecutorAdapter implements Adapter {
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
           ...(request.spawn ? { spawn: sanitizeSpawnOptions(request.spawn) } : {}),
+          origin: request.spawn?.origin === 'rotation' ? 'rotation' : 'spawn',
+          ...(request.spawn?.origin === 'rotation' ? { handoffSeed: true } : {}),
           persistence,
           epoch: 1,
           ...(mcpFiltered ? { mcpFiltered } : {}),
@@ -176,6 +178,7 @@ export abstract class ExternalExecutorAdapter implements Adapter {
           epoch: 1,
           initialTurnId,
           initialOperationId: request.operationId,
+          handoffSeed: request.spawn?.origin === 'rotation',
           resident: persistence === 'persistent' && this.carrierMode(request) === 'resident',
           cwd: ctx.identity.workspace, taskFile,
           ...(carrier.sessionRegex ? { sessionRegex: carrier.sessionRegex } : {}),
@@ -707,6 +710,7 @@ function sanitizeSpawnOptions(spawn: NonNullable<Request['spawn']>): NonNullable
   if (spawn.disallowedTools?.length) result.disallowedTools = [...spawn.disallowedTools];
   if (spawn.envExclude?.length) result.envExclude = [...spawn.envExclude];
   if (spawn.mcp?.deny?.length) result.mcp = { deny: [...spawn.mcp.deny] };
+  if (spawn.origin) result.origin = spawn.origin;
   return result;
 }
 

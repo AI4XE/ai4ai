@@ -62,6 +62,13 @@ export interface ExecutorRecord {
   state: string;
   createdAt: string;
   carrier: CarrierInfo;
+  /** How this executor came to exist: a caller spawn or an explicit rotation. */
+  origin?: 'spawn' | 'rotation';
+  /** True when the initial prompt is a handoff seed (not a delivery to adopt). */
+  handoffSeed?: boolean;
+  /** Rotation predecessor for audit; the predecessor record is never deleted. */
+  predecessorExecutorId?: string;
+  lineage?: import('../contract/types.js').RotationLineage;
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -92,6 +99,10 @@ function validExecutor(value: unknown): value is ExecutorRecord {
     && (r.lastTurnAt === undefined || typeof r.lastTurnAt === 'string')
     && (r.lastTurnOutcome === undefined || ['completed', 'failed', 'cancelled'].includes(r.lastTurnOutcome))
     && (r.queuedTurns === undefined || (Number.isSafeInteger(r.queuedTurns) && r.queuedTurns >= 0))
+    && (r.origin === undefined || r.origin === 'spawn' || r.origin === 'rotation')
+    && (r.handoffSeed === undefined || typeof r.handoffSeed === 'boolean')
+    && (r.predecessorExecutorId === undefined || typeof r.predecessorExecutorId === 'string')
+    && (r.lineage === undefined || (typeof r.lineage === 'object' && r.lineage !== null))
     && typeof r.createdAt === 'string' && !!r.carrier && r.carrier.detached === true && Array.isArray(r.carrier.command);
 }
 
@@ -249,7 +260,8 @@ export class Ai4aiStore {
   }
 
   async updateExecutor(executorId: string, patch: Partial<Pick<ExecutorRecord,
-    'state' | 'sessionId' | 'lastOperationId' | 'lastTurnAt' | 'lastTurnOutcome' | 'queuedTurns' | 'persistence' | 'epoch'>>): Promise<ExecutorRecord> {
+    'state' | 'sessionId' | 'lastOperationId' | 'lastTurnAt' | 'lastTurnOutcome' | 'queuedTurns' | 'persistence' | 'epoch'
+    | 'origin' | 'handoffSeed' | 'predecessorExecutorId' | 'lineage'>>): Promise<ExecutorRecord> {
     return this.lock(async () => {
       const file = this.executorFile();
       const existing = await this.readExecutors();

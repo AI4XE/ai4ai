@@ -32,7 +32,7 @@ export interface ClaudeRecord {
 }
 
 export interface ClaudeCommand {
-  action: 'binding' | 'inspect' | 'request' | 'transition' | 'recover';
+  action: 'binding' | 'inspect' | 'request' | 'transition' | 'recover' | 'bind';
   caller?: Identity;
   instance?: string;
   request?: unknown;
@@ -44,6 +44,9 @@ export interface ClaudeCommand {
   successor?: Identity;
   mechanism?: 'restart' | 'compact';
   proofMechanism?: StoredProofMechanism;
+  /** Durable binding write (bind): session + generation token. */
+  session?: string;
+  generation?: string;
   usage?: { window?: number | null; used?: number | null; percent?: number | null; model?: string | null; reasoningEffort?: string | null };
 }
 

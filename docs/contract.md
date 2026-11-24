@@ -75,7 +75,7 @@ A pending handoff cancelled before application returns `cancelled`. For `cancel`
 - `operation`: `handoff`, `spawn`, `status`, `message`, `cancel`, `stop`, `finish`, `list`, `capabilities`.
 - `operationId`: caller-chosen idempotency key.
 - `target`: `"self"` or an owned executor id (`handoff`, `status`, `message`, `cancel`, `stop`, `finish`).
-- `mode`: `compact` | `restart` (`restart` is the default and replaces the context in place with the material only; `compact` is an explicit opt-in that uses the harness summarizer and is refused where the capability declaration does not list it).
+- `mode`: `compact` | `restart` | `rotation` (`restart` is the default and replaces the context in place with the material only; `compact` is an explicit opt-in that uses the harness summarizer and is refused where the capability declaration does not list it).
 - `surface`: `preserve` | `tui` | `headless` | `web`; default `preserve`. A silent surface change is forbidden.
 - `task`: seed material for `handoff`, `spawn`, `message`.
 - `model`, `reasoningEffort`: optional overrides. The default is to pass nothing and inherit the harness configuration.
@@ -283,7 +283,8 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
     "mode": {
       "enum": [
         "compact",
-        "restart"
+        "restart",
+        "rotation"
       ],
       "description": "Handoff mode: restart (default) starts a fresh context containing only the task material with no summary; compact is an explicit opt-in that keeps a harness-generated history summary."
     },
@@ -422,6 +423,12 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "description": "Additional MCP server names to remove (case-insensitive)."
             }
           }
+        },
+        "origin": {
+          "enum": [
+            "rotation"
+          ],
+          "description": "Internal: marks a rotation successor seeded with the handoff delivery text."
         }
       }
     },
@@ -484,8 +491,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
       },
       "then": {
         "required": [
-          "target",
-          "task"
+          "target"
         ],
         "not": {
           "anyOf": [
@@ -521,6 +527,61 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             }
           ]
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "handoff"
+          },
+          "target": {
+            "const": "self"
+          }
+        },
+        "required": [
+          "operation",
+          "target"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mode": {
+            "not": {
+              "const": "rotation"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "handoff"
+          },
+          "target": {
+            "not": {
+              "const": "self"
+            }
+          },
+          "mode": {
+            "enum": [
+              "restart",
+              "rotation"
+            ]
+          }
+        },
+        "required": [
+          "operation",
+          "target",
+          "mode"
+        ]
+      },
+      "then": {
+        "required": [
+          "task"
+        ]
       }
     },
     {
@@ -1343,6 +1404,228 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         "unknown"
       ]
     },
+    "mechanism": {
+      "enum": [
+        "surface-replacement",
+        "native-compaction",
+        "session-rotation",
+        "new-session"
+      ]
+    },
+    "sessionChanged": {
+      "type": "boolean"
+    },
+    "sourceSession": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "successorSession": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sourceGeneration": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "successorGeneration": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "successor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harness": {
+          "enum": [
+            "claude-code",
+            "codex",
+            "opencode",
+            "dsh"
+          ]
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "surface": {
+          "enum": [
+            "tui",
+            "headless",
+            "web"
+          ]
+        },
+        "session": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "harness",
+        "workspace",
+        "surface",
+        "session",
+        "generation",
+        "agent"
+      ]
+    },
+    "predecessorExecutorId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "successorExecutorId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "predecessorExecutorId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "predecessorGeneration": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "lineageGeneration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "taskHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "predecessorSession": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "predecessorStopped": {
+          "type": "boolean"
+        },
+        "stopExitCode": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stopSignal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transferredAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "predecessorExecutorId",
+        "predecessorGeneration",
+        "lineageGeneration",
+        "operationId"
+      ]
+    },
+    "predecessorStopped": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "alternatives": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "compact",
+          "restart",
+          "rotation"
+        ]
+      }
+    },
+    "continued": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "idleAfter": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "lastError": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ]
+        }
+      ]
+    },
     "verification": {
       "type": "object",
       "additionalProperties": false,
@@ -1544,6 +1827,24 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             "default",
             "unknown"
           ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "enforced": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "nativeSource": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1699,6 +2000,7 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
           "enum": [
             "surface-replacement",
             "native-compaction",
+            "session-rotation",
             "new-session"
           ]
         },
@@ -1775,6 +2077,46 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
                     "restart"
                   ]
                 }
+              },
+              "self": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "modes": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "compact",
+                        "restart",
+                        "rotation"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "modes"
+                ]
+              },
+              "executor": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "modes": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "compact",
+                        "restart",
+                        "rotation"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "modes"
+                ]
               },
               "modelOverride": {
                 "enum": [
@@ -1954,6 +2296,14 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
                     "type": "null"
                   }
                 ]
+              },
+              "autoCompact": {
+                "enum": [
+                  "supported",
+                  "limited",
+                  "unsupported",
+                  "not-tested"
+                ]
               }
             },
             "required": [
@@ -1961,7 +2311,8 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "model",
               "reasoningEffort",
               "context",
-              "percentSource"
+              "percentSource",
+              "autoCompact"
             ]
           },
           "experimental": {

@@ -14,6 +14,7 @@ import { openCodeSessionUsage, sessionActivity, sessionPointer } from '../../cor
 import { envValue, probeOpenCodeConfig, openCodeAutoCompact } from '../../core/config-probe.js';
 import { firstVerified, verifiedTokens } from '../../core/ladder.js';
 import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
+import { taskDelivery } from '../../core/handoff-delivery.js';
 import { contextFromUsage } from '../external.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 import { OpenCodeJournal, openCodeResult, type OpenCodeRecord } from './journal.js';
@@ -320,7 +321,7 @@ export async function setup(ctx: any): Promise<() => void> {
     // The task goes first; retained input is replayed as its own message after
     // adoption, so the successor does not have to choose between two
     // conflicting instructions in one prompt.
-    const text = `AI4AI handoff delivery ${record.compactID}. Adopt the caller-supplied task in this fresh context:\n${record.request.task ?? ''}\nNative system/security instructions remain authoritative.`;
+    const text = taskDelivery(record.request.task ?? '', record.compactID);
     try {
       const receipt = await ctx.session.synthetic({ sessionID: record.source.session, id: record.deliveryID, delivery: 'queue', text });
       if (receipt.id !== record.deliveryID) throw new Error('Native delivery receipt mismatch');

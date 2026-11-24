@@ -1,8 +1,8 @@
 import { FEATURES } from './version.js';
 import {
   AVAILABILITY, AUTOCOMPACT_SOURCES, CONTEXT_VERIFICATION, EVENT_KINDS, EVENT_LEVELS, EVENT_ROLES, FIELD_STATE_KEYS, FIELD_STATE_VALUES, HANDOFF_MODES, HANDOFF_PHASES, HARNESSES, ISOLATION,
-  LEGACY_PROOF_MECHANISM, LIFECYCLE_STATES, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, PERMISSION_MODES, PERSISTENCE_MODES, PROCESS_STATES, PROOF_MECHANISMS,
-  SOURCE_LABELS, SPAWN_SURFACES, STATES, SURFACES, TURN_OUTCOMES,
+  SAME_SESSION_MECHANISMS, LEGACY_HANDOFF_MODES, LEGACY_PROOF_MECHANISM, LIFECYCLE_STATES, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, PERMISSION_MODES, PERSISTENCE_MODES, PROCESS_STATES, PROOF_MECHANISMS,
+  SOURCE_LABELS, SPAWN_SURFACES, STATES, SURFACES, TURN_OUTCOMES, sessionChangedOf,
 } from './states.js';
 import type { FieldStateValue } from './states.js';
 import type {
@@ -22,7 +22,7 @@ const REQUEST_KEYS = [
   'task', 'model', 'reasoningEffort', 'policy', 'spawn', 'isolation', 'count', 'timeoutMs', 'reason', 'logTail',
 ] as const;
 
-const SPAWN_KEYS = ['persistence', 'surface', 'profile', 'permissionMode', 'allowedTools', 'disallowedTools', 'envExclude', 'mcp'] as const;
+const SPAWN_KEYS = ['persistence', 'surface', 'profile', 'permissionMode', 'allowedTools', 'disallowedTools', 'envExclude', 'mcp', 'origin'] as const;
 const LOG_TAIL_KEYS = ['tail', 'cursor', 'format'] as const;
 const boundedList = (value: unknown, maxItems = 64): boolean => Array.isArray(value)
   && value.length <= maxItems && new Set(value).size === value.length && value.every(item => text(item, 4096));
@@ -67,6 +67,7 @@ export function validateRequest(value: unknown, features: readonly string[] = FE
       if (value.spawn.surface !== undefined && !member(value.spawn.surface, SPAWN_SURFACES)) issues.push(problem('spawn.surface', 'schema', 'Unknown spawn surface'));
       if (value.spawn.profile !== undefined && !text(value.spawn.profile, 256)) issues.push(problem('spawn.profile', 'schema', 'Expected a bounded profile name'));
       if (value.spawn.permissionMode !== undefined && !member(value.spawn.permissionMode, PERMISSION_MODES)) issues.push(problem('spawn.permissionMode', 'schema', 'Unknown permission mode'));
+      if (value.spawn.origin !== undefined && value.spawn.origin !== 'rotation') issues.push(problem('spawn.origin', 'schema', 'Unknown spawn origin'));
       for (const key of ['allowedTools', 'disallowedTools', 'envExclude'] as const) {
         if (value.spawn[key] !== undefined && !boundedList(value.spawn[key])) issues.push(problem(`spawn.${key}`, 'schema', 'Expected a distinct bounded string list'));
       }
@@ -98,7 +99,19 @@ export function validateRequest(value: unknown, features: readonly string[] = FE
   };
   if (operation === 'handoff') {
     if (!has('target')) issues.push(problem('target', 'required', 'handoff requires target "self" or an owned executor id'));
-    if (!has('task')) issues.push(problem('task', 'required', 'handoff requires handoff material'));
+    const target = value.target;
+    const self = target === 'self';
+    const mode = (typeof value.mode === 'string' ? value.mode : 'restart') as (typeof HANDOFF_MODES)[number];
+    // Rotation stops the predecessor and spawns a successor; a session cannot
+    // rotate itself (there is no external supervisor to spawn the successor).
+    if (self && mode === 'rotation') issues.push(problem('mode', 'not-applicable', 'rotation is an executor-target mode; a session cannot rotate itself'));
+    if (!self) {
+      // An executor restart replaces its context with only the material, and a
+      // rotation seeds a successor from it: both need a caller-supplied task.
+      if (mode !== 'compact' && !has('task')) issues.push(problem('task', 'required', `executor-target ${mode} handoff requires handoff material`));
+    }
+    // A self restart may omit the task (D25: "Await the next instruction") and
+    // a compact task is always optional (D12).
     notApplicable(['owner', 'count', 'isolation', 'policy', 'spawn', 'logTail']);
   } else if (operation === 'spawn') {
     if (!has('task')) issues.push(problem('task', 'required', 'spawn requires task material'));
@@ -194,7 +207,15 @@ export function validateCapability(value: unknown): Validation<CapabilityDeclara
   }
   if (object(value.handoff)) {
     if (!member(value.handoff.availability, AVAILABILITY)) issues.push(problem('handoff.availability', 'schema', 'Unknown availability'));
-    if (!Array.isArray(value.handoff.modes) || value.handoff.modes.some(m => !member(m, HANDOFF_MODES))) issues.push(problem('handoff.modes', 'schema', 'Unknown mode list'));
+    // The legacy union never carries rotation, so a v0.0.7 validator can still
+    // read this declaration.
+    if (!Array.isArray(value.handoff.modes) || value.handoff.modes.some(m => !member(m, LEGACY_HANDOFF_MODES))) issues.push(problem('handoff.modes', 'schema', 'The legacy mode list may only contain restart and compact'));
+    for (const key of ['self', 'executor'] as const) {
+      const set = (value.handoff as Record<string, unknown>)[key];
+      if (set === undefined) continue;
+      if (!object(set) || !Array.isArray(set.modes) || set.modes.some(m => !member(m, HANDOFF_MODES))) issues.push(problem(`handoff.${key}.modes`, 'schema', 'Unknown mode list'));
+      else if (key === 'self' && set.modes.includes('rotation')) issues.push(problem('handoff.self.modes', 'contract', 'A self handoff cannot rotate the session'));
+    }
     for (const key of ['modelOverride', 'reasoningEffortOverride', 'crossSurface'] as const) if (!member(value.handoff[key], AVAILABILITY)) issues.push(problem(`handoff.${key}`, 'schema', 'Unknown availability'));
   } else issues.push(problem('handoff', 'required', 'Expected handoff capabilities'));
   if (object(value.spawn)) {
@@ -212,7 +233,10 @@ export function validateCapability(value: unknown): Validation<CapabilityDeclara
     if (!member(value.observation.events, EVENT_LEVELS)) issues.push(problem('observation.events', 'schema', 'Unknown event level'));
   } else issues.push(problem('observation', 'required', 'Expected observation capabilities'));
   if (object(value.status)) {
-    for (const key of ['availability', 'model', 'reasoningEffort', 'context'] as const) if (!member(value.status[key], AVAILABILITY)) issues.push(problem(`status.${key}`, 'schema', 'Unknown availability'));
+    for (const key of ['availability', 'model', 'reasoningEffort', 'context', 'autoCompact'] as const) {
+      if (value.status[key] === undefined && key === 'autoCompact') continue;
+      if (!member(value.status[key], AVAILABILITY)) issues.push(problem(`status.${key}`, 'schema', 'Unknown availability'));
+    }
     if (value.status.percentSource !== null && !member(value.status.percentSource, PERCENT_SOURCE)) issues.push(problem('status.percentSource', 'schema', 'Unknown percent source'));
   } else issues.push(problem('status', 'required', 'Expected status capabilities'));
   if (!Array.isArray(value.experimental) || value.experimental.some(e => typeof e !== 'string')) issues.push(problem('experimental', 'schema', 'Expected an experimental feature list'));
@@ -227,6 +251,9 @@ const RESULT_KEYS = [
   'context', 'unavailable', 'notices', 'error', 'proof', 'capabilities', 'executors', 'fieldStates', 'autoCompact',
   'processState', 'processStateReason', 'turns', 'lastOperationId', 'lastTurnOutcome', 'queuedTurns', 'lastTurnAt',
   'turnStartedAt', 'idleSince', 'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail',
+  'mechanism', 'sessionChanged', 'sourceSession', 'successorSession', 'sourceGeneration', 'successorGeneration',
+  'successor', 'predecessorExecutorId', 'successorExecutorId', 'lineage', 'predecessorStopped', 'alternatives',
+  'continued', 'idleAfter', 'lastError',
 ] as const;
 
 /** Results are closed too, so a misspelled field cannot masquerade as evidence. */
@@ -269,7 +296,11 @@ export function validateResult(value: unknown): Validation<Result> {
       if (ratio !== null && (typeof ratio !== 'number' || !Number.isFinite(ratio) || ratio <= 0 || ratio > 1)) issues.push(problem('autoCompact.ratio', 'schema', 'Expected a ratio in (0,1] or null'));
       if (!member(auto.source, AUTOCOMPACT_SOURCES)) issues.push(problem('autoCompact.source', 'schema', 'Unknown auto-compaction source'));
       if ((tokens !== null || ratio !== null) && auto.source === 'unknown') issues.push(problem('autoCompact.source', 'schema', 'A known threshold needs a real source'));
-      for (const key of Object.keys(auto)) if (!['tokens', 'ratio', 'source'].includes(key)) issues.push(problem(`autoCompact.${key}`, 'unknown-field', 'Unknown auto-compaction field'));
+      for (const key of ['enabled', 'enforced'] as const) {
+        if (auto[key] !== undefined && auto[key] !== null && typeof auto[key] !== 'boolean') issues.push(problem(`autoCompact.${key}`, 'schema', 'Expected boolean or null'));
+      }
+      if (auto.nativeSource !== undefined && auto.nativeSource !== null && !text(auto.nativeSource, 256)) issues.push(problem('autoCompact.nativeSource', 'schema', 'Expected a bounded native source label or null'));
+      for (const key of Object.keys(auto)) if (!['tokens', 'ratio', 'source', 'enabled', 'enforced', 'nativeSource'].includes(key)) issues.push(problem(`autoCompact.${key}`, 'unknown-field', 'Unknown auto-compaction field'));
     }
   }
   if (value.fieldStates !== undefined) {
@@ -381,11 +412,42 @@ export function validateResult(value: unknown): Validation<Result> {
       if (!successor.ok) issues.push(...successor.issues.map(p => ({ ...p, path: `proof.successor.${p.path}` })));
       if (!member(value.proof.mechanism, [...PROOF_MECHANISMS, LEGACY_PROOF_MECHANISM])) issues.push(problem('proof.mechanism', 'schema', 'Unknown handoff mechanism'));
       if (!text(value.proof.nativeEvidence, 4096)) issues.push(problem('proof.nativeEvidence', 'schema', 'Expected native adoption evidence'));
-      if (member(value.proof.mechanism, PROOF_MECHANISMS) && source.ok && successor.ok
+      // Only same-session mechanisms must preserve the native identity. A
+      // `session-rotation` (or legacy `new-session`) is exactly the operation
+      // that changes it, so the guard explicitly permits a different SID.
+      if (member(value.proof.mechanism, SAME_SESSION_MECHANISMS) && source.ok && successor.ok
         && source.value.session !== successor.value.session) {
         issues.push(problem('proof.successor.session', 'same-session', 'A handoff must preserve the native session identity; use spawn for a new session'));
       }
     }
+  }
+  // Handoff result metadata is derived from the mechanism, never contradictory.
+  const mechanism = (value.mechanism ?? (object(value.proof) ? value.proof.mechanism : undefined)) as string | undefined;
+  if (value.mechanism !== undefined && !member(value.mechanism, [...PROOF_MECHANISMS, LEGACY_PROOF_MECHANISM])) issues.push(problem('mechanism', 'schema', 'Unknown handoff mechanism'));
+  if (value.sessionChanged !== undefined) {
+    if (typeof value.sessionChanged !== 'boolean') issues.push(problem('sessionChanged', 'schema', 'Expected boolean'));
+    else if (mechanism !== undefined && value.sessionChanged !== sessionChangedOf(mechanism)) issues.push(problem('sessionChanged', 'inconsistent', 'sessionChanged must be derived from the mechanism'));
+  }
+  for (const key of ['sourceSession', 'successorSession', 'sourceGeneration', 'successorGeneration', 'predecessorExecutorId', 'successorExecutorId'] as const) {
+    if (value[key] !== undefined && value[key] !== null && !text(value[key], 4096)) issues.push(problem(key, 'schema', 'Expected bounded text or null'));
+  }
+  if (value.successor !== undefined) {
+    const checked = validateIdentity(value.successor);
+    if (!checked.ok) issues.push(...checked.issues.map(p => ({ ...p, path: `successor.${p.path}` })));
+  }
+  if (value.lineage !== undefined) {
+    const lineage = value.lineage;
+    if (!object(lineage) || !text(lineage.predecessorExecutorId, 128) || !text(lineage.predecessorGeneration, 4096)
+      || !Number.isSafeInteger(lineage.lineageGeneration) || Number(lineage.lineageGeneration) < 0 || !text(lineage.operationId, 128)) {
+      issues.push(problem('lineage', 'schema', 'Expected a rotation lineage record'));
+    }
+  }
+  if (value.alternatives !== undefined && (!Array.isArray(value.alternatives) || value.alternatives.some(mode => !member(mode, HANDOFF_MODES)))) issues.push(problem('alternatives', 'schema', 'Expected a list of handoff modes'));
+  for (const key of ['predecessorStopped', 'continued', 'idleAfter'] as const) {
+    if (value[key] !== undefined && value[key] !== null && typeof value[key] !== 'boolean') issues.push(problem(key, 'schema', 'Expected boolean or null'));
+  }
+  if (value.lastError !== undefined && value.lastError !== null) {
+    if (!object(value.lastError) || !text(value.lastError.code, 4096) || !text(value.lastError.message, 4096)) issues.push(problem('lastError', 'schema', 'Expected an error code and message or null'));
   }
   return done<Result>(value, issues);
 }
@@ -426,7 +488,13 @@ export function result(
     ...(options.autoCompact ?? {}),
   };
   const fieldStates: Record<string, FieldStateValue> = { ...(options.fieldStates ?? {}) };
-  if (autoCompact.tokens === null && autoCompact.ratio === null && fieldStates['context.autoCompact'] !== 'disabled') fieldStates['context.autoCompact'] = fieldStates['context.autoCompact'] ?? 'unavailable';
+  // A null threshold is only `unavailable` when the feature itself is off or
+  // unknown. When the harness reports auto-compaction enabled but no numeric
+  // threshold, `unknown` is the truthful state (never a false "unsupported").
+  if (autoCompact.tokens === null && autoCompact.ratio === null && fieldStates['context.autoCompact'] !== 'disabled') {
+    fieldStates['context.autoCompact'] = fieldStates['context.autoCompact']
+      ?? (autoCompact.enabled === true ? 'unknown' : 'unavailable');
+  }
   if ((options.model ?? null) === null) fieldStates.model = fieldStates.model ?? 'unavailable';
   if ((options.reasoningEffort ?? null) === null) fieldStates.reasoningEffort = fieldStates.reasoningEffort ?? 'unavailable';
   if (context.window === null) fieldStates['context.window'] = fieldStates['context.window'] ?? 'unavailable';

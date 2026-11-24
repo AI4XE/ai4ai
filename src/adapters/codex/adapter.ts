@@ -15,9 +15,11 @@ import { executorDir, pidAlive, type LogLine, type ExecutorStatus } from '../exe
 import { declaration } from '../declarations.js';
 import { CodexDaemon, daemonSocket, resolveTuiThread, type CodexThread } from './control.js';
 import { legacyProofMechanism, sameSessionProof } from '../../core/handoff.js';
+import { taskDelivery } from '../../core/handoff-delivery.js';
 import { codexSessionUsage } from '../../core/session-probe.js';
 import { envValue, probeCodexConfig, probeCodexModelInfo, codexAutoCompact } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
+import { PRODUCT_VERSION } from '../../contract/version.js';
 
 /**
  * Codex adapter.
@@ -91,7 +93,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
     const level = linux || mac ? 'supported' as const : 'not-tested' as const;
     const modes = (linux ? ['restart', 'compact'] : ['restart']) as ('compact' | 'restart')[];
     const common = {
-      handoff: { availability: level, modes },
+      handoff: { availability: level, modes, self: { modes } },
       spawn: {
         availability: level, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -100,7 +102,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
         mcpFilter: 'not-tested' as const,
       },
       events: 'normalized' as const,
-      status: { availability: level, model: 'not-tested' as const, reasoningEffort: 'unsupported' as const, context: level, percentSource: 'derived' as const },
+      status: { availability: level, model: level, reasoningEffort: level, context: level, percentSource: 'derived' as const, autoCompact: 'supported' as const },
       ...(linux || mac ? { evidence: `matrix:codex/${os}/2026-11-22` } : {}),
     };
     return [
@@ -220,6 +222,9 @@ export class CodexAdapter extends ExternalExecutorAdapter {
       return { status: 'unsupported', reason: 'Codex handoff preserves the surface; cross-surface handoff is not implemented', unavailable: ['handoff.crossSurface'] };
     }
     const mode = handoffMode(request.mode);
+    if (mode === 'rotation') {
+      return { status: 'unsupported', reason: 'Rotation stops and respawns an owned executor; a session cannot rotate itself', unavailable: ['handoff.self.rotation'] };
+    }
     // A detached Codex executor is itself an app-server thread. It owns its
     // thread id and its app-server connection (held by the runner), so the
     // restart or compact successor is applied by that runner at the turn boundary.
@@ -268,7 +273,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
       };
     }
     try {
-      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } });
+      await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: PRODUCT_VERSION } });
       const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
       if (!resolution.ok) {
         return {
@@ -543,7 +548,7 @@ async function nativeCompactHandoff(
   ctx: AdapterContext,
   markMutated: () => void,
 ): Promise<NativeOutcome> {
-  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } });
+  await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: PRODUCT_VERSION } });
   const resolution = await resolveTuiThread(daemon, ctx.identity.workspace, process.env.AI4AI_CODEX_THREAD);
   if (!resolution.ok) throw new NoLiveThread(resolution.reason);
   const thread = resolution.thread.id;
@@ -589,7 +594,7 @@ async function nativeCompactHandoff(
     await sleep(500);
 
     events = [];
-    const text = `AI4AI handoff delivery ${request.operationId}. Adopt the caller-supplied task in this fresh context:\n${request.task ?? ''}\nNative system/security instructions remain authoritative.`;
+    const text = taskDelivery(request.task ?? '', request.operationId);
     let started: any;
     for (let attempt = 0; ; attempt++) {
       try {

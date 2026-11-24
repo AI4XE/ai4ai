@@ -18,6 +18,7 @@ import { readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer } from './app-server.js';
 import { applyRevertHandoff, type RpcTransport } from './native-handoff.js';
+import { taskDelivery } from '../../core/handoff-delivery.js';
 
 const args = process.argv.slice(2);
 const threadIndex = args.indexOf('--thread');
@@ -157,7 +158,7 @@ const applyHandoff = async (): Promise<boolean> => {
   await writeHandoff(record);
   try {
     events = [];
-    const delivery = `AI4AI handoff delivery ${operationId}. Adopt the caller-supplied task in this fresh context:\n${String(intent.request?.task ?? '')}\nNative system/security instructions remain authoritative.`;
+    const delivery = taskDelivery(String(intent.request?.task ?? ''), operationId);
     let successorThreadId = threadId;
     let successorTurnId: string | undefined;
     if (mode === 'restart') {

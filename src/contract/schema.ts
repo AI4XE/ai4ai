@@ -1,7 +1,7 @@
 import { FEATURES } from './version.js';
 import {
   AVAILABILITY, CONTEXT_VERIFICATION, EVENT_KINDS, EVENT_LEVELS, EVENT_ROLES, HANDOFF_MODES, HANDOFF_PHASES, HARNESSES, ISOLATION, LIFECYCLE_STATES,
-  AUTOCOMPACT_SOURCES, FIELD_STATE_KEYS, FIELD_STATE_VALUES, LEGACY_PROOF_MECHANISM, PERMISSION_MODES, PERSISTENCE_MODES, PROCESS_STATES, PROOF_MECHANISMS,
+  AUTOCOMPACT_SOURCES, FIELD_STATE_KEYS, FIELD_STATE_VALUES, LEGACY_HANDOFF_MODES, LEGACY_PROOF_MECHANISM, PERMISSION_MODES, PERSISTENCE_MODES, PROCESS_STATES, PROOF_MECHANISMS,
   SOURCE_LABELS, MODEL_VERIFICATION, OPERATIONS, OSES, PERCENT_SOURCE, SPAWN_SURFACES, STATES, SURFACES, TURN_OUTCOMES,
 } from './states.js';
 
@@ -33,6 +33,7 @@ const spawnOptionsSchema = {
       description: 'Extra MCP servers to deny; default message-class denials cannot be re-enabled.',
       properties: { deny: stringList('Additional MCP server names to remove (case-insensitive).') },
     },
+    origin: { enum: ['rotation'], description: 'Internal: marks a rotation successor seeded with the handoff delivery text.' },
   },
 } as const;
 
@@ -85,9 +86,19 @@ export const REQUEST_SCHEMA = {
     {
       if: { properties: { operation: { const: 'handoff' } } },
       then: {
-        required: ['target', 'task'],
+        required: ['target'],
         not: { anyOf: [{ required: ['owner'] }, { required: ['count'] }, { required: ['isolation'] }, { required: ['policy'] }, { required: ['spawn'] }, { required: ['logTail'] }] },
       },
+    },
+    {
+      // A session cannot rotate itself; rotation is an executor-target mode.
+      if: { properties: { operation: { const: 'handoff' }, target: { const: 'self' } }, required: ['operation', 'target'] },
+      then: { properties: { mode: { not: { const: 'rotation' } } } },
+    },
+    {
+      // Executor-target restart/rotation require the continuation material.
+      if: { properties: { operation: { const: 'handoff' }, target: { not: { const: 'self' } }, mode: { enum: ['restart', 'rotation'] } }, required: ['operation', 'target', 'mode'] },
+      then: { required: ['task'] },
     },
     {
       if: { properties: { operation: { const: 'spawn' } } },
@@ -180,7 +191,17 @@ const capabilitySchema = {
       type: 'object', additionalProperties: false,
       properties: {
         availability: { enum: [...AVAILABILITY] },
-        modes: { type: 'array', uniqueItems: true, items: { enum: [...HANDOFF_MODES] } },
+        modes: { type: 'array', uniqueItems: true, items: { enum: [...LEGACY_HANDOFF_MODES] } },
+        self: {
+          type: 'object', additionalProperties: false,
+          properties: { modes: { type: 'array', uniqueItems: true, items: { enum: [...HANDOFF_MODES] } } },
+          required: ['modes'],
+        },
+        executor: {
+          type: 'object', additionalProperties: false,
+          properties: { modes: { type: 'array', uniqueItems: true, items: { enum: [...HANDOFF_MODES] } } },
+          required: ['modes'],
+        },
         modelOverride: { enum: [...AVAILABILITY] },
         reasoningEffortOverride: { enum: [...AVAILABILITY] },
         crossSurface: { enum: [...AVAILABILITY] },
@@ -214,8 +235,9 @@ const capabilitySchema = {
         reasoningEffort: { enum: [...AVAILABILITY] },
         context: { enum: [...AVAILABILITY] },
         percentSource: { anyOf: [{ enum: [...PERCENT_SOURCE] }, { type: 'null' }] },
+        autoCompact: { enum: [...AVAILABILITY] },
       },
-      required: ['availability', 'model', 'reasoningEffort', 'context', 'percentSource'],
+      required: ['availability', 'model', 'reasoningEffort', 'context', 'percentSource', 'autoCompact'],
     },
     experimental: { type: 'array', items: shortText },
     reason: shortText,
@@ -305,6 +327,45 @@ export const RESULT_SCHEMA = {
     signal: { type: ['string', 'null'] },
     session: sessionPointerSchema,
     modelVerification: { enum: [...MODEL_VERIFICATION] },
+    mechanism: { enum: [...PROOF_MECHANISMS, LEGACY_PROOF_MECHANISM] },
+    sessionChanged: { type: 'boolean' },
+    sourceSession: { type: ['string', 'null'] },
+    successorSession: { type: ['string', 'null'] },
+    sourceGeneration: { type: ['string', 'null'] },
+    successorGeneration: { type: ['string', 'null'] },
+    successor: IDENTITY_SCHEMA,
+    predecessorExecutorId: { anyOf: [{ ...id }, { type: 'null' }] },
+    successorExecutorId: { anyOf: [{ ...id }, { type: 'null' }] },
+    lineage: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        predecessorExecutorId: id,
+        predecessorGeneration: shortText,
+        lineageGeneration: { type: 'integer', minimum: 0 },
+        operationId: id,
+        taskHash: shortText,
+        predecessorSession: { type: ['string', 'null'] },
+        predecessorStopped: { type: 'boolean' },
+        stopExitCode: { type: ['integer', 'null'] },
+        stopSignal: { type: ['string', 'null'] },
+        transferredAt: shortText,
+      },
+      required: ['predecessorExecutorId', 'predecessorGeneration', 'lineageGeneration', 'operationId'],
+    },
+    predecessorStopped: { type: ['boolean', 'null'] },
+    alternatives: { type: 'array', uniqueItems: true, items: { enum: [...HANDOFF_MODES] } },
+    continued: { type: ['boolean', 'null'] },
+    idleAfter: { type: ['boolean', 'null'] },
+    lastError: {
+      anyOf: [
+        { type: 'null' },
+        {
+          type: 'object', additionalProperties: false,
+          properties: { code: shortText, message: shortText },
+          required: ['code', 'message'],
+        },
+      ],
+    },
     verification: {
       type: 'object', additionalProperties: false,
       properties: { model: { enum: [...MODEL_VERIFICATION] }, context: { enum: [...CONTEXT_VERIFICATION] } },
@@ -319,6 +380,9 @@ export const RESULT_SCHEMA = {
         tokens: { type: ['integer', 'null'], minimum: 1 },
         ratio: { type: ['number', 'null'], exclusiveMinimum: 0, maximum: 1 },
         source: { enum: [...AUTOCOMPACT_SOURCES] },
+        enabled: { type: ['boolean', 'null'] },
+        enforced: { type: ['boolean', 'null'] },
+        nativeSource: { type: ['string', 'null'] },
       },
       required: ['tokens', 'ratio', 'source'],
     },

@@ -47,6 +47,22 @@ export interface NativeOutcome {
   notices?: Notice[];
   error?: ContractError;
   proof?: AdoptionProof;
+  /** Executed handoff mechanism; `normalizeOutcome` derives sessionChanged from it. */
+  mechanism?: import('../contract/states.js').StoredProofMechanism;
+  sessionChanged?: boolean;
+  sourceSession?: string | null;
+  successorSession?: string | null;
+  sourceGeneration?: string | null;
+  successorGeneration?: string | null;
+  successor?: Identity;
+  predecessorExecutorId?: string | null;
+  successorExecutorId?: string | null;
+  lineage?: import('../contract/types.js').RotationLineage;
+  predecessorStopped?: boolean | null;
+  alternatives?: import('../contract/states.js').HandoffMode[];
+  continued?: boolean | null;
+  idleAfter?: boolean | null;
+  lastError?: ContractError | null;
 }
 
 export interface AdapterContext {

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { PRODUCT_VERSION } from '../../contract/version.js';
 
 export interface RpcError { code: number; message: string; data?: unknown }
 export type NotificationHandler = (method: string, params: Record<string, unknown>) => void;
@@ -82,7 +83,7 @@ export class CodexAppServer {
     this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
   }
 
-  async initialize(clientName = 'ai4ai', version = '0.0.7'): Promise<unknown> {
+  async initialize(clientName = 'ai4ai', version = PRODUCT_VERSION): Promise<unknown> {
     const result = await this.request('initialize', { clientInfo: { name: clientName, version } });
     this.notify('initialized');
     return result;

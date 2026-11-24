@@ -1,3 +1,6 @@
+/** The single product version source used by native client `initialize` strings. */
+export const PRODUCT_VERSION = '0.0.8';
+
 /** Features a caller may require explicitly. Unknown names fail closed. */
 export const FEATURES = [
   'handoff', 'spawn', 'status', 'message', 'cancel', 'stop', 'finish', 'list',

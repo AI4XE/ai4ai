@@ -66,7 +66,8 @@
     "mode": {
       "enum": [
         "compact",
-        "restart"
+        "restart",
+        "rotation"
       ],
       "description": "Handoff mode: restart (default) starts a fresh context containing only the task material with no summary; compact is an explicit opt-in that keeps a harness-generated history summary."
     },
@@ -205,6 +206,12 @@
               "description": "Additional MCP server names to remove (case-insensitive)."
             }
           }
+        },
+        "origin": {
+          "enum": [
+            "rotation"
+          ],
+          "description": "Internal: marks a rotation successor seeded with the handoff delivery text."
         }
       }
     },

@@ -1,6 +1,7 @@
 import type { Register, CoreEngineInterface } from 'claude-code';
 import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
 import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
+import { parseDelivery, isDeliveryText as isCanonicalDelivery, taskDelivery, idleDelivery } from '../../core/handoff-delivery.js';
 
 /**
  * The Claude hooks module is evaluated in a sandbox that allows relative
@@ -28,6 +29,10 @@ interface Runtime {
   delivery?: { text: string; operationId: string; marker: string; invalid: boolean; adopted: boolean };
   /** Native turn that admitted the delivery; its completion replays retained input. */
   admissionTurn?: string;
+  /** True while the native summarizer is running for a compact handoff. */
+  compacting?: boolean;
+  /** Rotation seed: the initial D29 text is a normal task, never a delivery. */
+  seed?: boolean;
   /** Real user input retained while the handoff window is open. */
   retained: RetainedInput;
 }
@@ -163,14 +168,32 @@ async function transition($: CoreEngineInterface, current: Runtime, phase: strin
   }
   return out;
 }
-async function bindNative($: CoreEngineInterface, s: Runtime): Promise<void> {
-  const hello = await rpcWith($, s.node, { action: 'binding', workspace: await $.session.cwd() }, s.bindingPath);
+/**
+ * Persist the per-session handoff binding. It is the primary generation
+ * authority: compact deliveries carry no transcript marker, and a crafted task
+ * body can never mint a generation by quoting a marker.
+ */
+async function writeBinding($: CoreEngineInterface, s: Runtime, record: HandoffRecord): Promise<void> {
+  if (!s.binding) return;
+  try {
+    await rpcWith($, s.node, {
+      caller: s.binding, action: 'bind',
+      session: record.source.session, generation: record.marker, marker: record.marker,
+      operationId: record.operationId, mechanism: record.mechanism,
+    }, s.bindingPath);
+  } catch { /* the journal record remains; binding is an optimization for compact */ }
+}
+
+async function bindNative($: CoreEngineInterface, s: Runtime): Promise<void> {  const hello = await rpcWith($, s.node, { action: 'binding', workspace: await $.session.cwd() }, s.bindingPath);
   s.instance = hello.instance;
   const session = await $.session.id();
   const surface = await currentSurface($);
   const provisional: Binding = { harness: 'claude-code', workspace: hello.workspace, surface, session, generation: 'original', agent: 'main' };
   const inspected = await rpcWith($, s.node, { caller: provisional, action: 'inspect' }, s.bindingPath).catch(() => undefined);
   s.binding = { ...provisional, generation: inspected?.generation ?? 'original' };
+  // The executor record (not the prompt text) decides whether this session is
+  // a rotation seed whose first D29 text is a normal task.
+  if (inspected?.handoffSeed === true) s.seed = true;
   if (inspected?.record) {
     s.active = inspected.record as HandoffRecord;
     await rpcWith($, s.node, { caller: s.binding, action: 'recover' }, s.bindingPath).catch(() => undefined);
@@ -183,7 +206,7 @@ function deliveryText(s: Runtime, text: string): boolean {
 }
 
 function isDeliveryText(text: string): boolean {
-  return text.startsWith('AI4AI handoff delivery ') || text.startsWith('The ai4ai plugin sent a message:\nAI4AI handoff delivery ');
+  return isCanonicalDelivery(text) || text.startsWith('AI4AI handoff delivery ') || text.startsWith('The ai4ai plugin sent a message:\nAI4AI handoff delivery ');
 }
 
 function admitted(s: Runtime): boolean {
@@ -215,6 +238,34 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
   try {
     if (s.active?.phase !== 'scheduled') return;
     const mode = s.active.mechanism ?? s.active.request.mode ?? 'restart';
+    if (mode === 'compact') {
+      // Native-first compact (D31/D34): let the harness's own summarizer run in
+      // place. The session.compact hook returns the native summary untouched
+      // (it only intercepts when a marker instruction is supplied), so the
+      // successor sees the summary and, when a task is supplied, that task as
+      // the next input. With no task nothing is delivered and the native
+      // continuation carries the original work.
+      try {
+        s.compacting = true;
+        await $.command.run({ command: 'compact' });
+      } finally {
+        s.compacting = false;
+      }
+      const applied = await transition($, s, 'applied', 'Native compaction completed in place; successor adoption pending', { proofMechanism: 'native-compaction' });
+      if (!applied?.record || applied.record.phase !== 'applied') return;
+      if (s.binding) s.binding = { ...s.binding, generation: s.active!.marker };
+      await writeBinding($, s, s.active!);
+      if (s.active?.request.task) {
+        const text = taskDelivery(s.active.request.task, s.active.marker);
+        s.delivery = { text, operationId: s.active.operationId, marker: s.active.marker, invalid: false, adopted: false };
+        await $.prompt.submit({ text });
+      } else {
+        // No delivery message: the native summary continues the work and the
+        // durable binding proves the handoff. Complete without an adoption turn.
+        await transition($, s, 'completed', 'Native compaction completed; the original task continues with no extra message');
+      }
+      return;
+    }
     if (mode !== 'restart') {
       // The native pump implements the zero-summary restart only. A compact
       // request must be refused by the worker before it reaches this point.
@@ -250,9 +301,14 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
       return;
     }
     if (s.binding) s.binding = { ...s.binding, generation: s.active.marker };
+    await writeBinding($, s, s.active);
+    // A restart with no task uses the canonical status message so the successor
+    // awaits the next instruction; a task restart delivers the task verbatim.
+    const text = s.active.request.task
+      ? taskDelivery(s.active.request.task, s.active.marker)
+      : idleDelivery(s.active.marker);
     const delivery = {
-      text: `AI4AI handoff delivery ${s.active.marker}. Adopt the caller-supplied task in this fresh context. Carry out this task now:\n${s.active.request.task ?? ''}\nNative system/security instructions remain authoritative. Query ai4ai status if you need context or model details.`,
-      operationId: s.active.operationId, marker: s.active.marker, invalid: false, adopted: false,
+      text, operationId: s.active.operationId, marker: s.active.marker, invalid: false, adopted: false,
     };
     s.delivery = delivery;
     await $.prompt.submit({ text: delivery.text });
@@ -271,7 +327,7 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
 
 /** Native Claude Code mods: in-place handoff without a summarizer, daemon or history fork. */
 export const register: Register = on => {
-  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', appliedHere: false, retained: new RetainedInput() };
+  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', appliedHere: false, retained: new RetainedInput(), seed: process.env.AI4AI_HANDOFF_SEED === '1' };
   let tail: Promise<unknown> = Promise.resolve();
   const serial = <T>(fn: () => Promise<T>): Promise<T> => { const pending = tail.then(fn); tail = pending.catch(() => undefined); return pending; };
 
@@ -308,7 +364,7 @@ export const register: Register = on => {
       if (!s.binding || await $.session.id() !== s.binding.session) await bindNative($, s);
       s.busy = true;
       s.turnId = e.turnId;
-      if (isDeliveryText(e.text)) {
+      if (isDeliveryText(e.text) && !(s.seed && !s.delivery)) {
         s.admissionTurn = e.turnId;
         if (!deliveryText(s, e.text) || !admitted(s)) { await $.turn.abort({ turnId: e.turnId }); return; }
         // Adoption is real: the successor turn is executing in the replaced context.
@@ -396,7 +452,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($: any, e: any, next: any) => {
     const origin = e.origin ?? {};
     const own = origin.kind === 'plugin' && origin.name === $.plugin.name;
-    const isDelivery = own && String(e.text ?? '').startsWith('AI4AI handoff delivery ');
+    const isDelivery = own && isDeliveryText(String(e.text ?? ''));
     const ownCompact = e.command?.name === 'compact' && e.command.args === s.active?.marker && s.pumping;
     try {
       if (isDelivery) {

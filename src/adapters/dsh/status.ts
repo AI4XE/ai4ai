@@ -2,7 +2,7 @@ import type { AutoCompact, ContextInfo } from '../../contract/types.js';
 import type { FieldStateValue } from '../../contract/states.js';
 import { contextFromUsage } from '../external.js';
 import { dshSessionUsage } from '../../core/session-probe.js';
-import { probeDshConfig, type DshProfile } from '../../core/config-probe.js';
+import { probeDshConfig, dshAutoCompact, type DshProfile } from '../../core/config-probe.js';
 import { firstVerified, verifiedText, verifiedTokens, verifiedWindow } from '../../core/ladder.js';
 import { envValue, dshRuntimeVersion } from '../../core/config-probe.js';
 
@@ -78,12 +78,9 @@ export async function resolveDshStatus(workspace: string, sessionId: string | un
     used: usedValue !== null ? usedSource : null,
     percent: context.percent !== null ? 'derived' : null,
   };
-  const autoCompact = !config?.autoCompactDisabled && config?.autoCompactRatio
-    ? {
-      tokens: windowValue ? Math.round(windowValue * config.autoCompactRatio.value) : null,
-      ratio: config.autoCompactRatio.value,
-      source: config.autoCompactRatio.source,
-    }
+  const derivedAuto = dshAutoCompact(config, windowValue);
+  const autoCompact = derivedAuto
+    ? { ...derivedAuto, enabled: true, enforced: null, nativeSource: 'compaction-basic' }
     : undefined;
 
   const unavailable: string[] = [];

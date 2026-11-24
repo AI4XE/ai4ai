@@ -114,12 +114,12 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
         mcpFilter: 'not-tested' as const,
       },
       events: 'normalized' as const,
-      status: { availability: level, model: level, reasoningEffort: 'unsupported' as const, context: verified ? 'supported' as const : 'not-tested' as const, percentSource: 'derived' as const },
+      status: { availability: level, model: level, reasoningEffort: level, context: verified ? 'supported' as const : 'not-tested' as const, percentSource: 'derived' as const, autoCompact: 'supported' as const },
     };
     return [
       declaration({
         harness: 'opencode', os, interface: 'tui', reason,
-        handoff: { availability: level, modes: ['restart'] as ('compact' | 'restart')[] },
+        handoff: { availability: level, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
         ...common,
         ...(verified ? { evidence: `matrix:opencode/${os}/tui/2026-11-21` } : {}),
       }),

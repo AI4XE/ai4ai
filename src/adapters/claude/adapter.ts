@@ -48,7 +48,7 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
         : 'The mods plugin and the detached carrier are implemented; native Windows is out of scope (WSL counts as Linux) and was not exercised.';
     const carrier = linux || mac ? 'supported' as const : 'not-tested' as const;
     const common = {
-      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart'] as ('compact' | 'restart')[] },
+      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: carrier, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -57,7 +57,7 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
         mcpFilter: 'supported' as const,
       },
       events: 'normalized' as const,
-      status: { availability: carrier, model: carrier, reasoningEffort: 'unsupported' as const, context: carrier, percentSource: 'derived' as const },
+      status: { availability: carrier, model: carrier, reasoningEffort: carrier, context: carrier, percentSource: 'derived' as const, autoCompact: 'supported' as const },
       ...(linux || mac ? { evidence: `matrix:claude-code/${os}/2026-11-22` } : {}),
     };
     return [

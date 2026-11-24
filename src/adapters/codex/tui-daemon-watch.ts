@@ -17,6 +17,8 @@ import { Ai4aiStore } from '../../core/store.js';
 import { result } from '../../contract/validate.js';
 import { sameSessionProof } from '../../core/handoff.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
+import { PRODUCT_VERSION } from '../../contract/version.js';
+import { taskDelivery } from '../../core/handoff-delivery.js';
 
 interface Payload {
   home: string;
@@ -57,8 +59,8 @@ async function main(): Promise<void> {
     onMessage: listener => daemon.onMessage(listener),
   };
   try {
-    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: '0.0.7' } }, 10000);
-    const delivery = `AI4AI handoff delivery ${marker}. Adopt the caller-supplied task in this fresh context:\n${request.task ?? ''}\nNative system/security instructions remain authoritative.`;
+    await daemon.call('initialize', { clientInfo: { name: 'ai4ai', version: PRODUCT_VERSION } }, 10000);
+    const delivery = taskDelivery(request.task ?? '', marker);
     const outcome = await applyRevertHandoff(transport, {
       threadId,
       deliveryText: delivery,

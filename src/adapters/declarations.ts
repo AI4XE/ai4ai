@@ -8,7 +8,10 @@ export interface DeclarationInput {
   interface: 'tui' | 'headless' | 'web';
   handoff?: {
     availability?: Availability;
+    /** Legacy union declared to older consumers (restart|compact only). */
     modes?: HandoffMode[];
+    self?: { modes?: HandoffMode[] };
+    executor?: { modes?: HandoffMode[] };
     modelOverride?: Availability;
     reasoningEffortOverride?: Availability;
     crossSurface?: Availability;
@@ -22,7 +25,7 @@ export interface DeclarationInput {
     permissionModes?: PermissionMode[];
     mcpFilter?: Availability;
   };
-  status?: { availability?: Availability; model?: Availability; reasoningEffort?: Availability; context?: Availability; percentSource?: 'native' | 'derived' | null };
+  status?: { availability?: Availability; model?: Availability; reasoningEffort?: Availability; context?: Availability; percentSource?: 'native' | 'derived' | null; autoCompact?: Availability };
   events?: EventLevel;
   experimental?: string[];
   reason: string;
@@ -55,7 +58,14 @@ export function declaration(input: DeclarationInput): CapabilityDeclaration {
     },
     handoff: {
       availability,
-      modes: handoff.modes ?? ['compact', 'restart'],
+      // The legacy union never includes `rotation`: an older validator would
+      // reject it. Rotation is exposed only through `executor.modes`.
+      modes: (handoff.modes ?? ['compact', 'restart']).filter(mode => mode !== 'rotation'),
+      self: { modes: handoff.self?.modes ?? (handoff.modes ?? ['compact', 'restart']).filter(mode => mode !== 'rotation') },
+      // Rotation is implemented generically by the core for every headless
+      // executor; same-session executor modes must be declared explicitly by
+      // the adapter that implements them.
+      executor: { modes: handoff.executor?.modes ?? ['rotation'] },
       modelOverride: handoff.modelOverride ?? 'unsupported',
       reasoningEffortOverride: handoff.reasoningEffortOverride ?? 'unsupported',
       crossSurface: handoff.crossSurface ?? 'unsupported',
@@ -77,6 +87,7 @@ export function declaration(input: DeclarationInput): CapabilityDeclaration {
       reasoningEffort: status.reasoningEffort ?? 'unsupported',
       context: status.context ?? 'not-tested',
       percentSource: status.percentSource ?? null,
+      autoCompact: status.autoCompact ?? 'not-tested',
     },
     experimental: input.experimental ?? [],
     reason: input.reason,

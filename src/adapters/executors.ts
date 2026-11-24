@@ -38,6 +38,8 @@ export interface LaunchSpec {
   resident?: boolean;
   /** The native session this turn must stay in (same-session guard). */
   expectedSessionId?: string;
+  /** Rotation seed: the first turn is the D29 delivery text as a normal task. */
+  handoffSeed?: boolean;
 }
 
 export interface ExecutorStatus {
@@ -300,6 +302,7 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
     ...(spec.initialOperationId ? { initialOperationId: spec.initialOperationId } : {}),
     ...(spec.resident ? { resident: true } : {}),
     ...(spec.expectedSessionId ? { expectedSessionId: spec.expectedSessionId } : {}),
+    ...(spec.handoffSeed ? { handoffSeed: true } : {}),
   });
   // The task file the supervisor feeds on stdin is the plain prompt.
   await writeFile(path.join(directory, 'task.prompt'), task);
@@ -314,7 +317,7 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
   // the caller's directory. Harnesses such as OpenCode resolve their project
   // config through PWD, so a detached executor started with --workspace from
   // another directory would load the wrong config and fail every provider call.
-  const fullEnv = { ...env, PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory };
+  const fullEnv = { ...env, PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory, ...(spec.handoffSeed ? { AI4AI_HANDOFF_SEED: '1' } : {}) };
   await writeAtomic(path.join(directory, 'launch.json'), { runtime, supervisor, at: new Date().toISOString() });
   const child = spawn(runtime, [supervisor, '--dir', directory], {
     detached: true,

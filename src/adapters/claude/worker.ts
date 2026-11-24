@@ -5,7 +5,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { bytes, ownership } from '../../install/scope.js';
+import { atomicJson, bytes, digest, ownership } from '../../install/scope.js';
 import { containsWorkspace, parseBinding } from '../../install/binding.js';
 import { result, validateRequest } from '../../contract/validate.js';
 import { handoffMode, handoffOutcome } from '../../contract/states.js';
@@ -42,6 +42,27 @@ if (command.action === 'binding') {
   process.exit(0);
 }
 
+/** Per-session durable handoff binding (marker/generation authority). */
+function sessionBindingFile(session: string): string {
+  return path.join(binding.home!, '.ai4ai', 'claude', 'bindings', `${digest(`claude\0${session}`)}.json`);
+}
+
+if (command.action === 'bind') {
+  const session = typeof command.session === 'string' ? command.session : undefined;
+  const marker = typeof command.marker === 'string' ? command.marker : undefined;
+  if (!session || !marker) throw new Error('Binding write requires session and marker');
+  const value = {
+    product: 'ai4ai', format: 2, session, generation: command.generation ?? marker,
+    marker, operationId: command.operationId ?? null, mechanism: command.mechanism ?? null,
+    at: new Date().toISOString(),
+  };
+  const file = sessionBindingFile(session);
+  const before = await bytes(file);
+  await atomicJson(path.join(binding.home!, '.ai4ai', 'claude'), file, value, before === undefined ? undefined : digest(before));
+  console.log(JSON.stringify({ binding: value }));
+  process.exit(0);
+}
+
 const caller = command.caller;
 if (!caller || caller.harness !== 'claude-code' || caller.workspace !== binding.workspace || caller.agent !== 'main' || !['tui', 'headless'].includes(caller.surface)) {
   throw new Error(`Native worker scope mismatch: ${JSON.stringify({ harness: caller?.harness, workspaceMatch: caller?.workspace === binding.workspace, agent: caller?.agent, surface: caller?.surface, session: caller?.session })}`);
@@ -67,9 +88,28 @@ if (command.action === 'inspect') {
   const markers = command.marker ? [command.marker] : [];
   const known = new Set([...records].flatMap(record => [record.source.generation, record.successor?.generation]).filter((value): value is string => typeof value === 'string' && markers.includes(value)));
   if (known.size > 1) throw new Error('Ambiguous current native generation; no execution authority inferred');
+  // The durable binding is the primary generation source (compact deliveries
+  // carry no transcript marker); the journal remains the fallback.
+  let bound: string | undefined;
+  try {
+    const rawBinding = await bytes(sessionBindingFile(caller.session));
+    if (rawBinding) {
+      const value = JSON.parse(rawBinding.toString()) as { session?: unknown; generation?: unknown };
+      if (value.session === caller.session && typeof value.generation === 'string' && value.generation) bound = value.generation;
+    }
+  } catch { /* no binding yet */ }
+  // A rotation successor is seeded with the delivery text; its record (not the
+  // task body) is the authority that the first turn is a normal task.
+  let handoffSeed = false;
+  try {
+    const executorId = process.env.AI4AI_EXECUTOR_ID;
+    if (executorId) handoffSeed = (await store.executors()).some(record => record.executorId === executorId && record.handoffSeed === true);
+  } catch { /* store unavailable */ }
   console.log(JSON.stringify({
     ...(active ? { record: active } : {}),
-    generation: [...known][0] ?? 'original',
+    generation: [...known][0] ?? bound ?? 'original',
+    ...(bound ? { binding: bound } : {}),
+    ...(handoffSeed ? { handoffSeed: true } : {}),
     consecutive: active?.phase === 'pending' || active?.phase === 'scheduled',
   }));
   process.exit(0);
@@ -221,24 +261,23 @@ if (request.operation === 'handoff' && request.target === 'self') {
     console.log(JSON.stringify({ result: result(request, 'unsupported', 'Compaction is switched off in this session (DISABLE_COMPACT); the in-place restart handoff needs it', { unavailable: ['handoff.restart'], error: { code: 'claude-compaction-disabled', message: 'DISABLE_COMPACT is set for this session' } }) }));
     process.exit(0);
   }
-  // This version declares restart only. `compact` means a native summary,
-  // which Claude does not implement here; refuse it instead of silently
-  // running the zero-summary replacement under a compact label.
-  if (request.mode === 'compact') {
-    console.log(JSON.stringify({ result: result(request, 'unsupported', 'Claude Code handoff implements restart only in this version; native compaction plus task delivery is not available', { unavailable: ['handoff.compact'] }) }));
-    process.exit(0);
-  }
+  // Both self modes are implemented. `compact` lets the harness's own
+  // summarizer run in place (and, with a task, delivers it as the next input);
+  // `restart` keeps the canonical zero-summary replacement window.
   const mechanism = handoffMode(request.mode);
-  if (!request.task) {
-    console.log(JSON.stringify({ result: result(request, 'unsupported', 'A restart handoff needs task material: the new context contains only that material', { unavailable: ['handoff.task'] }) }));
+  if (mechanism === 'rotation') {
+    console.log(JSON.stringify({ result: result(request, 'unsupported', 'Rotation stops and respawns an owned executor; a session cannot rotate itself', { unavailable: ['handoff.self.rotation'] }) }));
     process.exit(0);
   }
+  const proofMechanism = mechanism === 'compact' ? 'native-compaction' as const : 'surface-replacement' as const;
   const marker = `ai4ai-context-${randomUUID()}`;
   const record: ClaudeRecord = {
     format: 2, operationId: request.operationId, fingerprint: fingerprint(request), request, source: caller, marker, phase: 'pending',
     mechanism,
-    proofMechanism: 'surface-replacement',
-    reason: 'Finish this turn; the native compact hook replaces this context in place with the caller task material (no summary model is called)',
+    proofMechanism,
+    reason: mechanism === 'compact'
+      ? 'Finish this turn; the native summarizer compacts this context in place and the caller task (if any) becomes the next input'
+      : 'Finish this turn; the native compact hook replaces this context in place with the caller task material (no summary model is called)',
   };
   await journal.transaction(caller, async (_rows, commit) => commit(record));
   console.log(JSON.stringify({ result: response(record), record }));
