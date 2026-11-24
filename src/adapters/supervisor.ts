@@ -67,6 +67,26 @@ interface Spec {
   /** Same-session guard: every turn must report this native session id. */
   expectedSessionId?: string;
 }
+/**
+ * Build the explicit carrier environment. `spec.env` holds non-secret carrier
+ * knobs; allowlisted provider credentials (D37) were filtered out of the spec
+ * and travel in the supervisor's own environment, re-admitted here by name.
+ */
+function carrierEnv(spec: Spec): Record<string, string> {
+  const explicit: Record<string, string> = { ...(spec.env ?? {}) };
+  try {
+    const names = JSON.parse(process.env.AI4AI_CARRIER_ENV_KEYS ?? '[]') as unknown;
+    if (Array.isArray(names)) {
+      for (const name of names) {
+        if (typeof name !== 'string') continue;
+        const value = process.env[name];
+        if (typeof value === 'string' && value.length > 0) explicit[name] = value;
+      }
+    }
+  } catch { /* malformed marker: keep the non-secret knobs only */ }
+  return explicit;
+}
+
 interface Turn {
   inputFile?: string;
   turnId?: string;
@@ -269,7 +289,7 @@ function runTurnPerTurn(command: string, args: string[], inputFile: string | und
   return new Promise(resolve => {
     const child = spawn(command, args, {
       cwd: spec.cwd,
-      env: spawnEnvironment(process.env, { envExclude: spec.envExclude ?? [], explicit: spec.env ?? {} }),
+      env: spawnEnvironment(process.env, { envExclude: spec.envExclude ?? [], explicit: carrierEnv(spec) }),
       stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true, detached: process.platform !== 'win32',
       ...(verbatim ? { windowsVerbatimArguments: true } : {}),
     });
@@ -330,7 +350,7 @@ let residentCarrier: Resident | undefined;
 function spawnResident(): Resident {
   const child = spawn(spec.command, spec.args, {
     cwd: spec.cwd,
-    env: spawnEnvironment(process.env, { envExclude: spec.envExclude ?? [], explicit: spec.env ?? {} }),
+    env: spawnEnvironment(process.env, { envExclude: spec.envExclude ?? [], explicit: carrierEnv(spec) }),
     stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true, detached: process.platform !== 'win32',
     ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
@@ -560,5 +580,19 @@ await writeHeartbeat(directory, {
   token: heartbeatToken, pid: process.pid, startedAt: heartbeatStartedAt, updatedAt: new Date().toISOString(), stoppedAt: endedAt,
   ...(ownIdentity.startToken ? { startToken: ownIdentity.startToken } : {}),
 }).catch(() => undefined);
+// A per-executor OpenCode server outlives turns by design; stop it when the
+// supervisor ends so no server is orphaned. Verify the recorded identity first.
+try {
+  const server = JSON.parse(await readFile(file('opencode-server.json'), 'utf8')) as { pid?: number };
+  if (server.pid && Number.isSafeInteger(server.pid) && server.pid > 0) {
+    const identity = processIdentity(server.pid);
+    if (identity.alive !== false) {
+      try { process.kill(server.pid, 'SIGTERM'); } catch { /* already gone */ }
+      await delay(1500);
+      try { process.kill(server.pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }
+  await rm(file('opencode-server.json'), { force: true }).catch(() => undefined);
+} catch { /* no managed server */ }
 await new Promise<void>(resolve => log.end(() => resolve()));
 process.exit(exitCode);

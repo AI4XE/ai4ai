@@ -23,6 +23,7 @@ export const DEFAULT_ENV_STRIP_EXACT: readonly string[] = [
   'AI_AGENT',
   'TMUX',
   'TMUX_PANE',
+  'AI4AI_CARRIER_ENV_KEYS',
 ];
 
 /** Prefix families removed from every spawned executor. */

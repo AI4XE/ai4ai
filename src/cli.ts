@@ -18,6 +18,9 @@ import { readStatus, executorDir, type ExecutorStatus } from './adapters/executo
 import { livenessOf } from './adapters/external.js';
 import { lifecycleOfStatus, processStateOf } from './adapters/executors.js';
 import { readEventTail } from './core/events.js';
+import { readTranscriptTail } from './core/transcript.js';
+import { verifyAdoption } from './core/adoption.js';
+import { activitySummary } from './core/activity.js';
 import { forceKillTree, verifyIdentity } from './core/process-identity.js';
 import { withExecutorLock } from './core/executor-lock.js';
 
@@ -31,9 +34,9 @@ interface Parsed {
 
 const VALUE_FLAGS = [
   'harness', 'scope', 'workspace', 'home', 'profile', 'package-root', 'contract', 'operation', 'task', 'target', 'mode', 'session', 'surface', 'operation-id', 'timeout', 'model', 'reasoning-effort', 'count',
-  'executor', 'until', 'condition', 'cursor', 'tail', 'format', 'interval', 'spawn', 'persistence', 'permission-mode', 'allowed-tools', 'disallowed-tools', 'env-exclude', 'mcp-deny', 'spawn-surface', 'spawn-profile', 'log-tail', 'log-cursor', 'log-format', 'isolation', 'policy',
+  'executor', 'until', 'condition', 'cursor', 'tail', 'format', 'interval', 'spawn', 'persistence', 'permission-mode', 'allowed-tools', 'disallowed-tools', 'env-exclude', 'mcp-deny', 'spawn-surface', 'spawn-profile', 'log-tail', 'log-cursor', 'log-format', 'isolation', 'policy', 'limit', 'session',
 ];
-const BOOLEAN_FLAGS = ['yes', 'json', 'dry-run', 'help', 'version', 'any'];
+const BOOLEAN_FLAGS = ['yes', 'json', 'dry-run', 'help', 'version', 'any', 'transcript', 'follow'];
 const CLI_OPERATIONS = ['handoff', 'spawn', 'status', 'message', 'cancel', 'stop', 'finish', 'list', 'capabilities'] as const;
 
 /** Usage/configuration error: exit code 2, distinct from runtime failures (1). */
@@ -435,6 +438,83 @@ async function runEvents(parsed: Parsed): Promise<void> {
   console.log(JSON.stringify(tail, null, 2));
 }
 
+/** PARITY-037: opt-in bounded/redacted transcript tail. */
+async function runTranscript(parsed: Parsed): Promise<void> {
+  const { home, workspace } = await managedContext(parsed);
+  const executorId = flag(parsed, 'executor');
+  const harness = flag(parsed, 'harness') as 'claude-code' | 'codex' | 'opencode' | 'dsh' | undefined;
+  let session = flag(parsed, 'session');
+  let harnessId = harness;
+  if (executorId) {
+    const store = await Ai4aiStore.open(home);
+    const record = (await store.executors()).find(candidate => candidate.executorId === executorId);
+    if (!record) throw new UsageError(`Unknown executor: ${executorId}`);
+    session = session ?? record.sessionId;
+    harnessId = harnessId ?? record.harness;
+  }
+  if (!harnessId) throw new UsageError('transcript requires --harness or --executor');
+  if (!session) throw new UsageError('transcript requires --session or an executor with a recorded session');
+  const tail = await readTranscriptTail(harnessId, workspace, session, {
+    ...(flag(parsed, 'limit') !== undefined ? { limit: Number(flag(parsed, 'limit')) } : {}),
+    ...(flag(parsed, 'cursor') !== undefined ? { cursor: Number(flag(parsed, 'cursor')) } : {}),
+  });
+  if (!tail) throw new UsageError('The session store could not be resolved');
+  console.log(JSON.stringify(tail, null, 2));
+}
+
+/** PARITY-038: caller-invoked adoption verification. */
+async function runAdoption(parsed: Parsed): Promise<void> {
+  const { home, workspace } = await managedContext(parsed);
+  const executorId = flag(parsed, 'executor');
+  const operationId = flag(parsed, 'operation-id');
+  if (!executorId) throw new UsageError('adoption requires --executor <id>');
+  if (!operationId) throw new UsageError('adoption requires --operation-id <id>');
+  const store = await Ai4aiStore.open(home);
+  const report = await verifyAdoption({
+    home, workspace, store, executorId, operationId,
+    ...(parsed.flags.has('transcript') ? { transcript: true } : {}),
+    ...(flag(parsed, 'limit') !== undefined ? { limit: Number(flag(parsed, 'limit')) } : {}),
+  });
+  console.log(JSON.stringify(report, null, 2));
+  if (!report.adopted) process.exitCode = 1;
+}
+
+/** PARITY-042: read-only activity summary. */
+async function runActivity(parsed: Parsed): Promise<void> {
+  const { home, workspace } = await managedContext(parsed);
+  const executorId = flag(parsed, 'executor');
+  if (!executorId) throw new UsageError('activity requires --executor <id>');
+  const store = await Ai4aiStore.open(home);
+  const record = (await store.executors()).find(candidate => candidate.executorId === executorId);
+  if (!record) throw new UsageError(`Unknown executor: ${executorId}`);
+  const summary = await activitySummary({
+    home, workspace, executorId, harness: record.harness,
+    ...(flag(parsed, 'limit') !== undefined ? { events: { tail: Number(flag(parsed, 'limit')) } } : {}),
+  });
+  console.log(JSON.stringify(summary, null, 2));
+}
+
+/** PARITY-043: read-only follow loop over the normalized event tail. */
+async function runEventsFollow(parsed: Parsed): Promise<void> {
+  const { home } = await managedContext(parsed);
+  const executorId = flag(parsed, 'executor');
+  if (!executorId) throw new UsageError('events requires --executor <id>');
+  const store = await Ai4aiStore.open(home);
+  const record = (await store.executors()).find(candidate => candidate.executorId === executorId);
+  if (!record) throw new UsageError(`Unknown executor: ${executorId}`);
+  const timeoutSeconds = Number(flag(parsed, 'timeout') ?? 300);
+  const intervalMs = Math.max(200, Number(flag(parsed, 'interval') ?? 1000));
+  let cursor = Number(flag(parsed, 'cursor') ?? 0);
+  const deadline = Date.now() + Math.max(1, timeoutSeconds) * 1000;
+  for (;;) {
+    const tail = await readEventTail(home, executorId, record.harness, { cursor, tail: 1000 });
+    cursor = tail.nextCursor;
+    if ((tail.events?.length ?? 0) > 0) console.log(JSON.stringify(tail));
+    if (Date.now() >= deadline) { process.exitCode = 3; return; }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+}
+
 function printReport(report: unknown, json: boolean): void {
   if (json) { console.log(JSON.stringify(report, null, 2)); return; }
   const value = report as {
@@ -464,7 +544,7 @@ async function main(): Promise<void> {
   if (parsed.command === 'help' || flag(parsed, 'help')) {
     console.log(`AI4AI - AI Harness Extension Kit
 
-Usage: ai4ai <init|status|upgrade|uninstall|capabilities|detect|op|session|watch|events|sweep> [options]
+Usage: ai4ai <init|status|upgrade|uninstall|capabilities|detect|op|session|watch|events|transcript|adoption|activity|sweep> [options]
 
 Contract operations: ai4ai session --operation <handoff|spawn|status|message|cancel|stop|finish|list|capabilities> --harness <id> [--task <text>] [--target <self|id>]
 (ai4ai op is an alias of ai4ai session.)
@@ -546,7 +626,13 @@ support is declared per harness and never implied.`);
   }
   if (parsed.command === 'watch') { await runWatch(parsed); return; }
   if (parsed.command === 'sweep') { await runSweep(parsed); return; }
-  if (parsed.command === 'events') { await runEvents(parsed); return; }
+  if (parsed.command === 'events') {
+    if (parsed.flags.has('follow')) { await runEventsFollow(parsed); return; }
+    await runEvents(parsed); return;
+  }
+  if (parsed.command === 'transcript') { await runTranscript(parsed); return; }
+  if (parsed.command === 'adoption') { await runAdoption(parsed); return; }
+  if (parsed.command === 'activity') { await runActivity(parsed); return; }
   throw new Error(`Unknown command: ${parsed.command}`);
 }
 

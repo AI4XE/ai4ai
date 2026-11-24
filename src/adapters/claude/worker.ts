@@ -17,7 +17,11 @@ import type { Identity, Request, Result } from '../../contract/types.js';
 import { ClaudeJournal, response, type ClaudeCommand, type ClaudeRecord } from './journal.js';
 import { ClaudeAdapter } from './adapter.js';
 import { resolveClaudeStatus } from './status.js';
+import { harnessCredentialReport, resolveClaudeCredentials } from '../../core/credentials.js';
 import { sessionActivity, sessionPointer } from '../../core/session-probe.js';
+import {
+  clearHandoffRequest, readHandoffRequest, writeHandoffStatus, type ExecutorHandoffStatus,
+} from '../../core/executor-request.js';
 
 const root = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
 
@@ -47,6 +51,16 @@ function sessionBindingFile(session: string): string {
   return path.join(binding.home!, '.ai4ai', 'claude', 'bindings', `${digest(`claude\0${session}`)}.json`);
 }
 
+if (command.action === 'debug') {
+  const dir = process.env.AI4AI_EXECUTOR_DIR;
+  if (dir) {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(path.join(dir, 'plugin-debug.json'), JSON.stringify(command.debug ?? null, null, 2)).catch(() => undefined);
+  }
+  console.log(JSON.stringify({ ok: true }));
+  process.exit(0);
+}
+
 if (command.action === 'bind') {
   const session = typeof command.session === 'string' ? command.session : undefined;
   const marker = typeof command.marker === 'string' ? command.marker : undefined;
@@ -70,6 +84,26 @@ if (!caller || caller.harness !== 'claude-code' || caller.workspace !== binding.
 
 const journal = new ClaudeJournal(binding.home!);
 const store = await Ai4aiStore.open(binding.home!);
+
+/** Mirror an executor-side transition into the orchestrator-readable status. */
+async function publishStatus(record: ClaudeRecord, extra: Partial<ExecutorHandoffStatus> = {}): Promise<void> {
+  const directory = process.env.AI4AI_EXECUTOR_DIR;
+  if (!directory) return;
+  const phase = record.phase === 'pending' ? 'intent'
+    : record.phase === 'scheduled' ? 'scheduled'
+    : record.phase;
+  const status: ExecutorHandoffStatus = {
+    format: 2, kind: 'handoff-status', operationId: record.operationId,
+    phase: phase as ExecutorHandoffStatus['phase'],
+    ...(record.mechanism ? { mechanism: record.proofMechanism ?? (record.mechanism === 'compact' ? 'native-compaction' : 'surface-replacement') } : {}),
+    ...(record.source ? { source: record.source } : {}),
+    ...(record.successor ? { successor: record.successor, session: record.successor.session, generation: record.successor.generation } : {}),
+    ...(record.reason ? { reason: record.reason } : {}),
+    ...extra,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeHandoffStatus(directory, status).catch(() => undefined);
+}
 
 async function external(request: Request): Promise<Result> {
   return execute(request, {
@@ -119,7 +153,46 @@ if (command.action === 'recover') {
   if (!active) { console.log(JSON.stringify({})); process.exit(0); }
   const recovered: ClaudeRecord = { ...active, phase: 'unknown', reason: 'Native plugin restarted with an unfinished handoff; delivery is uncertain and never replayed automatically' };
   await journal.transaction(caller, async (_rows, commit) => commit(recovered));
+  await publishStatus(recovered);
   console.log(JSON.stringify({ record: recovered, result: response(recovered) }));
+  process.exit(0);
+}
+
+if (command.action === 'intake') {
+  const directory = process.env.AI4AI_EXECUTOR_DIR;
+  const request = directory ? await readHandoffRequest(directory) : undefined;
+  if (!request) { console.log(JSON.stringify({})); process.exit(0); }
+  const prior = journal.latest(records, request.operationId);
+  if (prior) {
+    await publishStatus(prior);
+    console.log(JSON.stringify({ record: prior, result: response(prior) }));
+    process.exit(0);
+  }
+  if (Date.parse(request.deadlineAt) < Date.now()) {
+    const expired: ClaudeRecord = {
+      format: 2, operationId: request.operationId, fingerprint: 'expired', source: caller, marker: request.marker,
+      request: { operation: 'handoff', operationId: request.operationId, target: 'self' },
+      phase: 'failed', reason: 'The executor-target handoff request expired before it could be applied',
+    };
+    await publishStatus(expired, { errorCode: 'handoff-timeout' }).catch(() => undefined);
+    console.log(JSON.stringify({ result: result(expired.request, 'failed', expired.reason, { error: { code: 'handoff-timeout', message: expired.reason } }) }));
+    process.exit(0);
+  }
+  const internal: Request = {
+    operation: 'handoff', operationId: request.operationId, target: 'self', mode: request.mode,
+    ...(request.task !== undefined ? { task: request.task } : {}),
+  };
+  const record: ClaudeRecord = {
+    format: 2, operationId: request.operationId, fingerprint: fingerprint(internal), request: internal,
+    source: caller, marker: request.marker, phase: 'pending',
+    mechanism: request.mode,
+    proofMechanism: request.mode === 'compact' ? 'native-compaction' : 'surface-replacement',
+    reason: 'External executor-target handoff accepted; applying at the next safe point',
+  };
+  await journal.transaction(caller, async (_rows, commit) => commit(record));
+  if (directory) await clearHandoffRequest(directory);
+  await publishStatus(record);
+  console.log(JSON.stringify({ record, result: response(record) }));
   process.exit(0);
 }
 
@@ -153,6 +226,7 @@ if (command.action === 'transition') {
       : {}),
   };
   await journal.transaction(caller, async (_rows, commit) => commit(next));
+  await publishStatus(next);
   console.log(JSON.stringify({ record: next, result: response(next) }));
   process.exit(0);
 }
@@ -210,6 +284,9 @@ if (request.operation === 'status' && (request.target === undefined || request.t
       model: details.model,
       reasoningEffort: details.reasoningEffort,
       modelVerification: details.modelVerification,
+      // D37: where the provider credentials came from (names/scopes only).
+      credentials: (await resolveClaudeCredentials({ workspace: caller.workspace }).catch(() => null))?.report
+        ?? harnessCredentialReport('claude-code', caller.workspace),
       verification: { model: details.modelVerification, context: details.context.percentSource === 'native' ? 'native' : 'derived' },
       context: details.context,
       ...(details.autoCompact ? { autoCompact: details.autoCompact } : {}),

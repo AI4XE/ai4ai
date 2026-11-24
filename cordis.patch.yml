@@ -2,3 +2,10 @@
 - insert:
     - id: ai4ai-session-capabilities
       name: ai4ai/dsh
+# ai4ai's compact handoff uses the native compaction service. The web app's
+# bundle disables it at the root; this bundle is applied last, so re-enabling it
+# here makes `handoff mode=compact` truthful on the web surface as well.
+- id: compaction-basic
+  disabled: false
+- id: command-compact
+  disabled: false

@@ -12,7 +12,7 @@ import { envValue } from '../../core/config-probe.js';
 import type { CapabilityDeclaration, Request } from '../../contract/types.js';
 import type { HarnessId, Os } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
-import type { LogLine, ExecutorStatus } from '../executors.js';
+import { resolveNodeRuntime, type LogLine, type ExecutorStatus } from '../executors.js';
 import { declaration } from '../declarations.js';
 
 /**
@@ -119,16 +119,16 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     return [
       declaration({
         harness: 'opencode', os, interface: 'tui', reason,
-        handoff: { availability: level, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
+        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
         ...common,
         ...(verified ? { evidence: `matrix:opencode/${os}/tui/2026-11-21` } : {}),
       }),
       declaration({
         harness: 'opencode', os, interface: 'headless',
-        reason: 'A detached opencode run executor cannot replace its own context in place; spawn and status use the same carrier. Use the interactive TUI for handoff.',
-        handoff: { availability: 'unsupported' as const, modes: [] },
+        reason: 'A detached opencode executor loads the same native plugin; restart and compact replace or summarize the window in place, and an executor-target request is consumed through the prompt/compaction hooks.',
+        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
         ...common,
-        ...(verified ? { evidence: `matrix:opencode/${os}/headless/2026-11-21` } : {}),
+        ...(verified ? { evidence: `matrix:opencode/${os}/headless/2026-11-24` } : {}),
       }),
     ];
   }
@@ -160,6 +160,24 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
   protected async carrier(request: Parameters<ExternalExecutorAdapter['spawn']>[0], ctx: AdapterContext, _executorId: string, resumeSessionId?: string): Promise<CarrierCommand> {
     const command = openCodeBinary(ctx.home);
     if (!command) throw new Error('OpenCode executable not found; set AI4AI_OPENCODE_BIN or put opencode on PATH');
+    // Persistent executors are backed by one per-executor `opencode serve`;
+    // each turn attaches to it, so the project plugin (and the ai4ai tool) is
+    // loaded inside the server rather than a throwaway `run` process.
+    if (request.spawn?.persistence === 'persistent') {
+      const runner = fileURLToPath(new URL('./serve-carrier.js', import.meta.url));
+      const model = request.model || process.env.AI4AI_OPENCODE_MODEL;
+      return {
+        command: resolveNodeRuntime(),
+        args: [runner, ...(resumeSessionId ? ['--session', resumeSessionId] : []), ...(model ? ['--model', model] : [])],
+        env: {
+          AI4AI_OPENCODE_BIN: command,
+          AI4AI_OPENCODE_CWD: ctx.identity.workspace,
+          AI4AI_OPENCODE_SURFACE: 'headless',
+          ...(model ? { AI4AI_OPENCODE_MODEL: model } : {}),
+        },
+        sessionRegex: '"session(?:ID|_id)"\\s*:\\s*"([^"]+)"',
+      };
+    }
     // OpenCode 1.x rejects `--standalone` and requires an existing session id
     // for `--session`; 2.x accepts both. Probe the binary instead of assuming.
     let major = 2;

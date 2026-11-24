@@ -7,6 +7,7 @@ import type { HarnessId, Os } from '../../contract/states.js';
 import type { ExecutorRecord } from '../../core/store.js';
 import type { LogLine, ExecutorStatus } from '../executors.js';
 import { declaration } from '../declarations.js';
+import { resolveAi4aiStoreHome } from '../../core/ai4ai-home.js';
 import { verifiedTokens } from '../../core/ladder.js';
 import { executorDir } from '../executors.js';
 import { readFile } from 'node:fs/promises';
@@ -189,7 +190,7 @@ export class DshAdapter extends ExternalExecutorAdapter {
     const headlessHandoff = 'supported' as const;
     const webLevel = 'supported' as const;
     const headless = {
-      handoff: { availability: headlessHandoff, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: headlessHandoff, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: carrier, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -202,7 +203,7 @@ export class DshAdapter extends ExternalExecutorAdapter {
       evidence: `matrix:dsh/${os}/headless/2026-11-22`,
     };
     const web = {
-      handoff: { availability: webLevel, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: webLevel, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: webLevel, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -215,10 +216,10 @@ export class DshAdapter extends ExternalExecutorAdapter {
       evidence: `matrix:dsh/${os}/web/2026-11-23`,
     };
     const webReason = linux
-      ? 'The Linux Web interface is an orchestration host, not an executor carrier: ai4ai_session self status/handoff completed inside the web session, and the adapted Parallax team flow ran from that session through ai4ai spawn -> persistent headless executors (dual-profile install), a forced rotation (stop, spawn, message), finish and the completion receipt. spawn.surface "web" stays structurally unsupported; detached carriers boot the headless profile. spawn model/effort overrides are unsupported.'
+      ? 'The Linux Web interface is an orchestration host, not an executor carrier: ai4ai_session self status/handoff completed inside the web session and the web app bundle disables compaction-basic and the ai4ai bundle re-enables it so self compact runs natively in the same session, and the adapted Parallax team flow ran from that session through ai4ai spawn -> persistent headless executors (dual-profile install), a forced rotation (stop, spawn, message), finish and the completion receipt. spawn.surface "web" stays structurally unsupported; detached carriers boot the headless profile. spawn model/effort overrides are unsupported.'
       : mac
-        ? 'The macOS Web interface is an orchestration host, not an executor carrier: self status/handoff completed inside the web session, and the adapted Parallax solo and team flows ran from that session through ai4ai spawn -> headless executors (dual-profile install) with message, stop/finish and the receipts. spawn.surface "web" stays structurally unsupported. spawn model/effort overrides are unsupported.'
-        : 'The native Windows Web interface is an orchestration host, not an executor carrier: self status/handoff completed inside the web session, and the adapted Parallax solo and team flows ran from that session through ai4ai spawn -> headless executors (dual-profile install) with message, stop/finish and the receipts. spawn.surface "web" stays structurally unsupported. spawn model/effort overrides are unsupported.';
+        ? 'The macOS Web interface is an orchestration host, not an executor carrier: self status/handoff completed inside the web session (the ai4ai bundle re-enables compaction-basic for native self compact), and the adapted Parallax solo and team flows ran from that session through ai4ai spawn -> headless executors (dual-profile install) with message, stop/finish and the receipts. spawn.surface "web" stays structurally unsupported. spawn model/effort overrides are unsupported.'
+        : 'The native Windows Web interface is an orchestration host, not an executor carrier: self status/handoff completed inside the web session (the ai4ai bundle re-enables compaction-basic for native self compact), and the adapted Parallax solo and team flows ran from that session through ai4ai spawn -> headless executors (dual-profile install) with message, stop/finish and the receipts. spawn.surface "web" stays structurally unsupported. spawn model/effort overrides are unsupported.';
     return [
       declaration({ harness: 'dsh', os, interface: 'headless', reason, ...headless }),
       declaration({ harness: 'dsh', os, interface: 'web', reason: webReason, ...web }),
@@ -237,7 +238,13 @@ export class DshAdapter extends ExternalExecutorAdapter {
     // DSH headless has no model/effort flags; the profile owns those choices.
     const headless = ['headless', '--json', '-'];
     if (resumeSessionId) headless.push('--session-id', resumeSessionId);
-    const env = { ...(process.env.DSH_HOME ? { DSH_HOME: process.env.DSH_HOME } : {}) };
+    const env: Record<string, string> = { DSH_SURFACE: 'headless' };
+    if (process.env.DSH_HOME) env.DSH_HOME = process.env.DSH_HOME;
+    // The ai4ai ledger store is AI4AI_HOME; pass it through so a detached
+    // executor and the in-harness plugin share one ledger (DSH_HOME is the
+    // DSH runtime home only).
+    if (process.env.AI4AI_HOME) env.AI4AI_HOME = process.env.AI4AI_HOME;
+    else env.AI4AI_HOME = resolveAi4aiStoreHome({ workspace: ctx.identity.workspace }).home;
     const sessionRegex = '"session(?:Id|ID|_id)"\\s*:\\s*"([^"]+)"';
     if (plan.entry) {
       return {

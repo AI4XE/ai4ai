@@ -55,6 +55,19 @@ ai4ai upgrade     # 重新注册
 ai4ai uninstall   # 卸载注册
 ```
 
+## Provider 凭据
+
+分离执行者保持**行为**隔离：不继承用户的 hooks、插件、权限或 MCP；但**凭据**不同。若 provider
+只在用户层配置，ai4ai 会按「显式请求 → 项目 settings → 用户 settings（`~/.claude/settings.json`
+或 `$CLAUDE_CONFIG_DIR/settings.json`）→ 进程环境」的顺序解析允许列表中的 `env`（Claude Code 为
+`ANTHROPIC_*`），并在启动时注入 carrier。不会写入用户任何文件，值不会进入 `spec.json`、日志或
+证据，`status` 只报告来源与键名。
+
+Codex / OpenCode / DeepSeek Harness 默认读取各自的用户 home；钉住隔离 home（`CODEX_HOME`、
+`OPENCODE_CONFIG`、`DSH_HOME`）即排除用户配置。
+
+设置 `AI4AI_CREDENTIAL_INHERITANCE=isolated` 可恢复严格的 project/local-only 行为（测试与多租户）。
+
 ## 主要功能
 
 同一套命令，跨 harness 一致（in-harness `session` 工具与 `ai4ai` CLI）：

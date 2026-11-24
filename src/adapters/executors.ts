@@ -317,7 +317,15 @@ export async function launch(spec: LaunchSpec): Promise<{ directory: string; sup
   // the caller's directory. Harnesses such as OpenCode resolve their project
   // config through PWD, so a detached executor started with --workspace from
   // another directory would load the wrong config and fail every provider call.
-  const fullEnv = { ...env, PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory, ...(spec.handoffSeed ? { AI4AI_HANDOFF_SEED: '1' } : {}) };
+  // Provider credentials (D37) reach the carrier through the supervisor's
+  // process environment, never through spec.json. `persistedEnv` removed them
+  // from the spec, so their names are handed over explicitly: the supervisor
+  // re-admits exactly these keys after its own policy filter.
+  const kept = persistedEnv(spec.env) ?? {};
+  const sensitiveExplicit = Object.keys(spec.env ?? {}).filter(key => !(key in kept));
+  const fullEnv = { ...env, PWD: spec.cwd, AI4AI_EXECUTOR_ID: spec.executorId, AI4AI_EXECUTOR_DIR: directory,
+    ...(spec.handoffSeed ? { AI4AI_HANDOFF_SEED: '1' } : {}),
+    ...(sensitiveExplicit.length ? { AI4AI_CARRIER_ENV_KEYS: JSON.stringify(sensitiveExplicit) } : {}) };
   await writeAtomic(path.join(directory, 'launch.json'), { runtime, supervisor, at: new Date().toISOString() });
   const child = spawn(runtime, [supervisor, '--dir', directory], {
     detached: true,

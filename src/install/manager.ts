@@ -9,6 +9,7 @@ import { atomicJson, bytes, digest, ownership, selectedRoot, withScopeLock } fro
 import { installDsh, inspectDshProfiles, type DshProfileInspection } from './dsh-installer.js';
 import type { HarnessId, Os } from '../contract/states.js';
 import { currentOs } from '../core/operations.js';
+import { credentialIsolation, harnessCredentialReport, resolveClaudeCredentials, type CredentialReport } from '../core/credentials.js';
 
 export type InstallAction = 'install' | 'upgrade' | 'uninstall';
 export interface InstallActionReport {
@@ -33,6 +34,11 @@ export interface InstallReport {
   dryRun: boolean;
   actions: InstallActionReport[];
   dsh?: DshCoverage;
+  /**
+   * D37 provider-credential provenance for the doctor surface. Key names and
+   * scopes only; values are never read into the report.
+   */
+  credentials?: Partial<Record<HarnessId, CredentialReport>>;
 }
 
 export interface InstallOptions {
@@ -242,6 +248,13 @@ async function pluginRevision(directory: string): Promise<string> {
   return hash.digest('hex').slice(0, 12);
 }
 
+/** The native OpenCode config key is `plugin`; accept the legacy `plugins` on read. */
+function openCodePluginList(config: Record<string, unknown>): string[] | undefined {
+  const value = config.plugin ?? config.plugins;
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
 /** Drop only ai4ai's own local OpenCode specs from a config file. */
 async function removePriorOpenCodeSpecs(file: string): Promise<void> {
   const raw = await bytes(file);
@@ -252,11 +265,12 @@ async function removePriorOpenCodeSpecs(file: string): Promise<void> {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
     config = parsed as Record<string, unknown>;
   } catch { return; }
-  if (!Array.isArray(config.plugins)) return;
-  const plugins = (config.plugins as unknown[]).filter((value): value is string => typeof value === 'string');
-  const remaining = plugins.filter(value => !/\/opencode-plugin-repo(?:-[0-9a-f]+)?$/.test(value));
-  if (remaining.length === plugins.length) return;
-  await writeFile(file, JSON.stringify({ ...config, plugins: remaining }, null, 2) + '\n');
+  const current = openCodePluginList(config);
+  if (current === undefined) return;
+  const remaining = current.filter(value => !/\/opencode-plugin-repo(?:-[0-9a-f]+)?$/.test(value));
+  if (remaining.length === current.length) return;
+  const { plugins: _legacy, ...rest } = config;
+  await writeFile(file, JSON.stringify({ ...rest, plugin: remaining }, null, 2) + '\n');
 }
 
 async function registerOpenCode(runtime: string, home: string, dryRun: boolean, env: NodeJS.ProcessEnv, workspace: string, scope: 'user' | 'project'): Promise<InstallActionReport> {
@@ -311,11 +325,10 @@ async function registerOpenCode(runtime: string, home: string, dryRun: boolean, 
         return { harness: 'opencode', action: 'install', state: 'failed', reason: 'Existing opencode.json is not a JSON object; no overwrite performed', target: file };
       }
     }
-    const plugins = Array.isArray(config.plugins)
-      ? (config.plugins as unknown[]).filter((value): value is string => typeof value === 'string' && !/\/opencode-plugin-repo(?:-[0-9a-f]+)?$/.test(value))
-      : [];
+    const plugins = (openCodePluginList(config) ?? []).filter(value => !/\/opencode-plugin-repo(?:-[0-9a-f]+)?$/.test(value));
     if (!plugins.includes(spec)) plugins.push(spec);
-    await writeFile(file, JSON.stringify({ ...config, plugins }, null, 2) + '\n');
+    const { plugins: _legacy, ...rest } = config;
+    await writeFile(file, JSON.stringify({ ...rest, plugin: plugins }, null, 2) + '\n');
     return { harness: 'opencode', action: 'install', state: 'installed', reason: 'Project-scoped OpenCode plugin registered in the workspace config', target: spec };
   }
   // User scope: remove a previous ai4ai spec first, or OpenCode would load two
@@ -340,9 +353,10 @@ async function unregisterOpenCodeProject(workspace: string, spec: string | undef
   } catch {
     return { harness: 'opencode', action: 'uninstall', state: 'unknown', reason: 'Existing opencode.json is not a JSON object; no rewrite performed', target: file };
   }
-  const plugins = Array.isArray(config.plugins) ? (config.plugins as unknown[]).filter((value): value is string => typeof value === 'string') : [];
+  const plugins = openCodePluginList(config) ?? [];
   const remaining = spec ? plugins.filter(value => value !== spec) : plugins.filter(value => !value.startsWith('git+file://'));
-  await writeFile(file, JSON.stringify({ ...config, plugins: remaining }, null, 2) + '\n');
+  const { plugins: _legacy, ...rest } = config;
+  await writeFile(file, JSON.stringify({ ...rest, plugin: remaining }, null, 2) + '\n');
   return { harness: 'opencode', action: 'uninstall', state: 'uninstalled', reason: 'Project-scoped OpenCode plugin registration removed', target: file };
 }
 
@@ -536,6 +550,23 @@ export async function install(options: InstallOptions): Promise<InstallReport> {
   });
 }
 
+async function credentialReports(
+  workspace: string,
+  detections: Detection[],
+  env: NodeJS.ProcessEnv,
+): Promise<Partial<Record<HarnessId, CredentialReport>>> {
+  const reports: Partial<Record<HarnessId, CredentialReport>> = {};
+  for (const detection of detections) {
+    if (!detection.installed) continue;
+    if (detection.harness === 'claude-code') {
+      reports['claude-code'] = (await resolveClaudeCredentials({ workspace, processEnv: env, isolation: credentialIsolation(env) })).report;
+    } else {
+      reports[detection.harness] = harnessCredentialReport(detection.harness, workspace, env);
+    }
+  }
+  return reports;
+}
+
 export async function statusReport(options: InstallOptions = { action: 'install' }): Promise<InstallReport & { detections: Detection[]; registered: HarnessId[] }> {
   const detections = await detectHarnesses(options);
   const home = homeFor(options);
@@ -556,6 +587,7 @@ export async function statusReport(options: InstallOptions = { action: 'install'
     product: 'ai4ai', version: await version(root), home,
     scope: options.scope ?? 'user', dryRun: false, actions: [], detections, registered,
     ...(relevant ? { dsh: coverage } : {}),
+    credentials: await credentialReports(options.workspace ?? process.cwd(), detections, options.env ?? process.env),
   };
 }
 

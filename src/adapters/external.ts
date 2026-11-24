@@ -15,9 +15,13 @@ import {
   turnPlacement, type ExecutorLiveness, type ExecutorStatus, type LogLine,
 } from './executors.js';
 import { sessionActivity, sessionPointer } from '../core/session-probe.js';
+import { harnessCredentialReport, type CredentialReport } from '../core/credentials.js';
 import { readEventTail } from '../core/events.js';
 import { queuedTurns, queuePositionOf, readTurns } from '../core/turns.js';
 import { withExecutorLock } from '../core/executor-lock.js';
+import {
+  controlEnvelope, readHandoffRequest, readHandoffStatus, writeHandoffRequest, type ExecutorHandoffRequest,
+} from '../core/executor-request.js';
 
 /** Best-effort registry reconciliation; test doubles may not implement it. */
 const updateRecord = (store: AdapterContext['store'], executorId: string, patch: Parameters<AdapterContext['store']['updateExecutor']>[1]): Promise<unknown> =>
@@ -45,6 +49,8 @@ export interface StatusDetails {
   fieldStates?: Record<string, FieldStateValue>;
   unavailable?: string[];
   runtimeVersion?: string | null;
+  /** D37 provenance of the provider credentials (names/scopes only, never values). */
+  credentials?: CredentialReport;
   notices?: { code: string; impact: 'none'; action_required: false; message: string }[];
 }
 
@@ -99,12 +105,147 @@ export abstract class ExternalExecutorAdapter implements Adapter {
     return file;
   }
 
-  async handoff(request: Request, _ctx: AdapterContext): Promise<NativeOutcome> {
-    return {
-      status: 'unsupported',
-      reason: 'External process control cannot replace a live context in place; self-handoff is provided by the installed in-harness plugin',
-      unavailable: ['handoff.external'],
-    };
+  /**
+   * Executor-target same-session handoff (restart/compact).
+   *
+   * The orchestrator cannot drive the executor's in-harness component directly.
+   * It records a durable request and wakes a live executor with an invisible
+   * control turn; the plugin/runner validates and applies it at a safe point,
+   * then writes the status that `reconcileHandoff` returns.
+   *
+   * A terminal or session-less executor is `handoff-unreachable` with the
+   * explicit rotation alternative; rotation itself is executed by the core,
+   * never silently substituted here.
+   */
+  async handoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
+    const target = request.target;
+    if (!target || target === 'self') {
+      return {
+        status: 'unsupported',
+        reason: 'External process control cannot replace a live context in place; self-handoff is provided by the installed in-harness plugin',
+        unavailable: ['handoff.external'],
+      };
+    }
+    const mode = request.mode ?? 'restart';
+    if (mode === 'rotation') {
+      return { status: 'failed', reason: 'rotation is executed by the core rotation path', error: { code: 'invalid-request', message: 'rotation must be handled by the core' } };
+    }
+    const record = await this.executorFor(request, ctx);
+    if (!record) return { status: 'unauthorized', reason: 'Target is not owned by this caller' };
+    if (record.surface !== 'headless') {
+      return { status: 'unsupported', reason: 'Executor-target handoff is headless-only', unavailable: ['handoff.executor.surface'] };
+    }
+    return withExecutorLock(executorDir(ctx.home, record.executorId), async () => {
+      const observed = await this.observe(record, ctx);
+      if (observed.processState === 'orphaned') {
+        return { status: 'failed', reason: 'The executor is orphaned; sweep it before handing off', error: { code: 'executor-orphaned', message: 'Supervisor dead, child alive' } } as NativeOutcome;
+      }
+      if (!(observed.state === 'running' || observed.state === 'idle') || observed.liveness.supervisorAlive !== true) {
+        return {
+          status: 'failed', durable: true, state: observed.state,
+          reason: 'The executor is not live; a same-session handoff needs a running or idle supervisor. Use an explicit rotation if the task must continue.',
+          error: { code: 'handoff-unreachable', message: `Executor state ${observed.state}, supervisor alive=${String(observed.liveness.supervisorAlive)}` },
+          alternatives: ['rotation'],
+        } as NativeOutcome;
+      }
+      const sessionId = observed.status.sessionId ?? record.sessionId;
+      // A repeated query for the same operationId must not enqueue another wake
+      // turn: the executor adopts and clears the durable request once, and a
+      // second wake would find nothing and fail the executor. Re-querying is
+      // the contract's idempotent read path, not a second transition.
+      const queued = await readHandoffRequest(executorDir(ctx.home, record.executorId));
+      if (queued?.operationId === request.operationId) {
+        return {
+          status: 'pending', durable: true, state: 'running', ...(sessionId ? { sessionId } : {}),
+          handoff: { phase: 'pending' },
+          reason: 'The handoff request is already queued for the executor; re-query the same operationId to reconcile',
+        } as NativeOutcome;
+      }
+      if (queued && queued.operationId !== request.operationId) {
+        return {
+          status: 'failed', durable: true, state: observed.state,
+          reason: 'Another executor-target handoff is pending on this executor; wait for it or reconcile it first',
+          error: { code: 'handoff-in-progress', message: `Pending operation ${queued.operationId}` },
+          alternatives: ['rotation'],
+        } as NativeOutcome;
+      }
+      const now = new Date();
+      const handoffRequest: ExecutorHandoffRequest = {
+        format: 2, kind: 'handoff-request', operationId: request.operationId, mode,
+        ...(request.task !== undefined ? { task: request.task } : {}),
+        marker: `ai4ai-context-${randomUUID()}`,
+        caller: ctx.identity, requestedAt: now.toISOString(),
+        deadlineAt: new Date(now.getTime() + Math.min(Math.max(request.timeoutMs ?? 120000, 5000), 600000)).toISOString(),
+      };
+      await writeHandoffRequest(executorDir(ctx.home, record.executorId), handoffRequest);
+      // Wake the executor. The envelope is consumed by the in-harness component
+      // before any model input; the carrier never sees it.
+      const controlFile = await this.writeTask(ctx, record.executorId, `handoff-control-${request.operationId}.prompt`, controlEnvelope(request.operationId));
+      const turnId = `turn-${randomUUID()}`;
+      // The wake turn must resume the recorded native session; a queued turn
+      // without a carrier command would fall back to the spawn args and create
+      // a new session (observed with the OpenCode served carrier).
+      const resume = this.resumeRequest(record, request);
+      const wakeCarrier = await this.carrier(resume, ctx, record.executorId, sessionId);
+      await enqueueTurn(ctx.home, record.executorId, {
+        inputFile: path.basename(controlFile),
+        turnId,
+        operationId: `${request.operationId}:wake`,
+        command: wakeCarrier.command,
+        args: wakeCarrier.args,
+        ...(wakeCarrier.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        ...(sessionId ? { expectedSessionId: sessionId } : {}),
+      });
+      await updateRecord(ctx.store, record.executorId, { state: 'running', lastOperationId: request.operationId });
+      return {
+        status: 'pending', durable: true, state: 'running', sessionId: sessionId ?? undefined,
+        handoff: { phase: 'pending' },
+        reason: `The ${mode} handoff request was delivered to the executor at its next safe point`,
+        notices: [{
+          code: 'executor-handoff-request', impact: 'none', action_required: false,
+          message: `The in-harness ${this.harness} component will ${mode} the context; re-query the same operationId to reconcile.`,
+        }],
+      } as NativeOutcome;
+    }, { operation: `handoff:${request.operationId}` });
+  }
+
+  /** Reconcile an executor-target handoff from the in-harness status file. */
+  async reconcileHandoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome | undefined> {
+    if (!request.target || request.target === 'self') return undefined;
+    const record = await this.executorFor(request, ctx);
+    if (!record) return undefined;
+    const status = await readHandoffStatus(executorDir(ctx.home, record.executorId));
+    if (!status || status.operationId !== request.operationId) return undefined;
+    const base = { durable: true, sessionId: status.session ?? record.sessionId } as Record<string, unknown>;
+    // A successor turn that completed after the native transition is adoption:
+    // some hosts do not emit a second hook the plugin can use to write
+    // `completed`, so reconcile from the supervisor-owned turn ledger.
+    if (status.phase === 'applied') {
+      const turns = await readTurns(ctx.home, record.executorId, 200);
+      const since = Number.isFinite(Date.parse(status.updatedAt)) ? Date.parse(status.updatedAt) : 0;
+      const adopted = turns.some(turn => turn.outcome === 'completed' && turn.endedAt !== undefined && Date.parse(turn.endedAt) >= since);
+      if (adopted) {
+        const proof = status.source && status.successor
+          ? { source: status.source, successor: status.successor, mechanism: status.mechanism ?? 'surface-replacement', nativeEvidence: `executor:${record.executorId}:turn-ledger` }
+          : undefined;
+        return { ...base, status: 'completed', state: 'completed', handoff: { phase: 'completed' }, reason: 'The successor turn completed after the native transition', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}) } as NativeOutcome;
+      }
+    }
+    const proof = status.source && status.successor
+      ? { source: status.source, successor: status.successor, mechanism: status.mechanism ?? 'surface-replacement', nativeEvidence: `executor:${record.executorId}:${status.phase}` }
+      : undefined;
+    switch (status.phase) {
+      case 'completed':
+        return { ...base, status: 'completed', state: 'completed', handoff: { phase: 'completed' }, reason: status.reason ?? 'The executor completed the handoff', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}), ...(status.continued !== undefined ? { continued: status.continued } : {}), ...(status.idleAfter !== undefined ? { idleAfter: status.idleAfter } : {}) } as NativeOutcome;
+      case 'applied':
+        return { ...base, status: 'applied', state: 'running', handoff: { phase: 'applied' }, reason: status.reason ?? 'The executor applied the handoff; delivery pending', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}) } as NativeOutcome;
+      case 'failed':
+        return { ...base, status: 'failed', state: 'failed', reason: status.reason ?? 'The executor failed the handoff', error: { code: status.errorCode ?? 'executor-handoff-failed', message: status.reason ?? 'handoff failed' } } as NativeOutcome;
+      case 'cancelled':
+        return { ...base, status: 'cancelled', state: 'cancelled', reason: status.reason ?? 'The executor cancelled the handoff' } as NativeOutcome;
+      default:
+        return { ...base, status: 'pending', state: 'running', handoff: { phase: 'pending' }, reason: status.reason ?? `The executor is applying the handoff (${status.phase})` } as NativeOutcome;
+    }
   }
 
   /** Refuse carrier options the harness does not implement, loudly. */
@@ -272,6 +413,7 @@ export abstract class ExternalExecutorAdapter implements Adapter {
       ...(details.unavailable ? { unavailable: details.unavailable } : {}),
       ...(details.notices ? { notices: details.notices } : {}),
       ...(details.runtimeVersion !== undefined ? { runtimeVersion: details.runtimeVersion } : {}),
+      credentials: details.credentials ?? harnessCredentialReport(this.harness, ctx.identity.workspace),
       ...(record.persistence ? { persistence: record.persistence } : {}),
       ...(record.mcpFiltered ? { mcpFiltered: record.mcpFiltered } : {}),
       turns: observed.status.turns ?? turns.length,

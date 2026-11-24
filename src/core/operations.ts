@@ -44,7 +44,7 @@ const PASSTHROUGH = [
   'lastActivityAt', 'lastActivityAtSource', 'stateSource', 'exitCode', 'signal', 'session',
   'autoCompact', 'fieldStates', 'error', 'proof', 'processState', 'processStateReason', 'turns',
   'lastOperationId', 'lastTurnOutcome', 'queuedTurns', 'lastTurnAt', 'turnStartedAt', 'idleSince',
-  'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail',
+  'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail', 'credentials',
   'mechanism', 'sessionChanged', 'sourceSession', 'successorSession', 'sourceGeneration',
   'successorGeneration', 'successor', 'predecessorExecutorId', 'successorExecutorId', 'lineage',
   'predecessorStopped', 'alternatives', 'continued', 'idleAfter', 'lastError',

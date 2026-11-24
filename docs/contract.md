@@ -1853,6 +1853,72 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         "source"
       ]
     },
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "isolation": {
+          "enum": [
+            "inherit",
+            "isolated"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "source": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "key",
+              "source"
+            ]
+          }
+        },
+        "masked": {
+          "const": true
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        }
+      },
+      "required": [
+        "isolation",
+        "source",
+        "keys",
+        "masked"
+      ]
+    },
     "fieldStates": {
       "type": "object",
       "propertyNames": {

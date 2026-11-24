@@ -386,6 +386,25 @@ export const RESULT_SCHEMA = {
       },
       required: ['tokens', 'ratio', 'source'],
     },
+    credentials: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        isolation: { enum: ['inherit', 'isolated'] },
+        source: shortText,
+        keys: { type: 'array', uniqueItems: true, items: shortText },
+        fields: {
+          type: 'array',
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: { key: shortText, source: shortText },
+            required: ['key', 'source'],
+          },
+        },
+        masked: { const: true },
+        notes: { type: 'array', items: shortText },
+      },
+      required: ['isolation', 'source', 'keys', 'masked'],
+    },
     fieldStates: {
       type: 'object',
       propertyNames: { enum: [...FIELD_STATE_KEYS] },

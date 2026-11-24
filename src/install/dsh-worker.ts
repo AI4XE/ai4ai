@@ -79,4 +79,4 @@ async function execute(): Promise<NativeMutationResult> {
     return { nativeStarted, exitCode: null, ...(nativeStarted ? { diagnostics: error instanceof Error ? error.message : 'Native mutation failed' } : { refused: error instanceof Error ? error.message : 'Native mutation refused before write' }) };
   } finally { if (timer) clearTimeout(timer); }
 }
-void execute().then(receipt => { process.stdout.write(JSON.stringify(receipt)); });
+void execute().then(receipt => { process.stdout.write(JSON.stringify(receipt), () => process.exit(0)); }, () => process.exit(1));

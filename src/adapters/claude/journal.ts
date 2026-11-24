@@ -32,7 +32,7 @@ export interface ClaudeRecord {
 }
 
 export interface ClaudeCommand {
-  action: 'binding' | 'inspect' | 'request' | 'transition' | 'recover' | 'bind';
+  action: 'binding' | 'inspect' | 'request' | 'transition' | 'recover' | 'bind' | 'intake' | 'debug';
   caller?: Identity;
   instance?: string;
   request?: unknown;
@@ -44,6 +44,8 @@ export interface ClaudeCommand {
   successor?: Identity;
   mechanism?: 'restart' | 'compact';
   proofMechanism?: StoredProofMechanism;
+  /** Temporary probe payload (debug). */
+  debug?: unknown;
   /** Durable binding write (bind): session + generation token. */
   session?: string;
   generation?: string;

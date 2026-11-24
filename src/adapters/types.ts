@@ -33,6 +33,7 @@ export interface NativeOutcome {
   queuePosition?: number;
   persistence?: PersistenceMode;
   runtimeVersion?: string | null;
+  credentials?: Result['credentials'];
   mcpFiltered?: { names: string[]; count: number };
   logTail?: LogTail;
   exitCode?: number | null;

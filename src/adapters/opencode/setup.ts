@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { realpath } from 'node:fs/promises';
+import { realpath, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { bytes, ownership } from '../../install/scope.js';
 import { resolveBindingFile } from '../../install/binding.js';
 import { result, validateRequest } from '../../contract/validate.js';
@@ -15,6 +16,9 @@ import { envValue, probeOpenCodeConfig, openCodeAutoCompact } from '../../core/c
 import { firstVerified, verifiedTokens } from '../../core/ladder.js';
 import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
 import { taskDelivery } from '../../core/handoff-delivery.js';
+import {
+  clearHandoffRequest, controlEnvelopeOperationId, readHandoffRequest, writeHandoffStatus, type ExecutorHandoffStatus,
+} from '../../core/executor-request.js';
 import { contextFromUsage } from '../external.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 import { OpenCodeJournal, openCodeResult, type OpenCodeRecord } from './journal.js';
@@ -97,10 +101,54 @@ export async function setup(ctx: any): Promise<() => void> {
 
   const identity = (sessionID: string, messages: any[]): Identity => {
     const window = latestWindow(messages);
+    // A served headless executor sets AI4AI_OPENCODE_SURFACE; the interactive
+    // TUI leaves it unset and keeps `tui`. Never claim a surface without the
+    // native signal.
+    const surface = process.env.AI4AI_OPENCODE_SURFACE === 'headless' ? 'headless' : 'tui';
     return {
-      harness: 'opencode', workspace: binding.workspace, surface: 'tui', session: sessionID,
+      harness: 'opencode', workspace: binding.workspace, surface, session: sessionID,
       generation: window?.id ?? 'original', agent: sessionID,
     };
+  };
+
+  /** Mirror the executor-side outcome for the orchestrator's reconcile. */
+  const publishStatus = async (record: OpenCodeRecord, extra: Partial<ExecutorHandoffStatus> = {}): Promise<void> => {
+    const directory = process.env.AI4AI_EXECUTOR_DIR;
+    if (!directory) return;
+    const phase = record.phase === 'pending' ? 'intent' : record.phase;
+    await writeHandoffStatus(directory, {
+      format: 2, kind: 'handoff-status', operationId: record.operationId,
+      phase: phase as ExecutorHandoffStatus['phase'],
+      mechanism: record.proofMechanism === 'native-compaction' ? 'native-compaction' : 'surface-replacement',
+      source: record.source,
+      ...(record.successor ? { successor: record.successor, session: record.successor.session, generation: record.successor.generation } : {}),
+      reason: record.reason,
+      ...extra,
+      updatedAt: new Date().toISOString(),
+    }).catch(() => undefined);
+  };
+
+  /** Consume a durable executor-target handoff request before the model turn. */
+  const intakeExternal = async (sessionID: string): Promise<boolean> => {
+    const directory = process.env.AI4AI_EXECUTOR_DIR;
+    if (!directory) return false;
+    const request = await readHandoffRequest(directory);
+    if (!request) return false;
+    const messages = await ctx.session.context({ sessionID });
+    const caller = identity(sessionID, messages);
+    const out = await journal.request(caller, {
+      operation: 'handoff', operationId: request.operationId, target: 'self', mode: request.mode,
+      ...(request.task !== undefined ? { task: request.task } : {}),
+    });
+    if (out.record) {
+      sessions.set(sessionID, out.record);
+      await publishStatus(out.record);
+      const scheduled = await journal.transition(caller, out.record.operationId, ['pending'], 'scheduled', 'External executor-target handoff accepted; the native transition is scheduled for the idle boundary');
+      sessions.set(sessionID, scheduled);
+      await publishStatus(scheduled);
+    }
+    await clearHandoffRequest(directory);
+    return true;
   };
 
   /**
@@ -250,6 +298,26 @@ export async function setup(ctx: any): Promise<() => void> {
   });
 
   await ctx.session.hook('prompt', (event: any) => serial(async () => {
+    // The invisible wake envelope is consumed before any model input.
+    if (controlEnvelopeOperationId(event.prompt?.text)) {
+      try { await intakeExternal(event.sessionID); }
+      catch (error) {
+        // The intake must never break the turn, but a silent failure leaves the
+        // durable request pending forever. Record a bounded diagnostic beside
+        // the executor so reconcile can explain it.
+        const dir = process.env.AI4AI_EXECUTOR_DIR;
+        if (dir) {
+          try {
+            await writeFile(path.join(dir, 'intake-error.json'), JSON.stringify({
+              at: new Date().toISOString(),
+              message: String((error as { message?: unknown })?.message ?? error).slice(0, 2000),
+            }, null, 2) + '\n');
+          } catch { /* diagnostics must never break the turn */ }
+        }
+      }
+      event.prompt = { ...(event.prompt ?? {}), text: '' };
+      return;
+    }
     const record = await recordFor(event.sessionID);
     if (!record || terminal(record)) return;
     if (event.messageID === record.deliveryID) {
@@ -265,18 +333,30 @@ export async function setup(ctx: any): Promise<() => void> {
 
   await ctx.session.hook('compaction', (event: any) => serial(async () => {
     const previous = event.result;
-    event.result = { summary: 'AI4AI compaction admission unavailable; original window retained.', native: { messages: event.messages }, metadata: { ai4aiRejected: true } };
     const messages = await ctx.session.context({ sessionID: event.sessionID });
     const running = messages.filter((message: any) => message.type === 'compaction' && message.status === 'running');
     const record = await recordFor(event.sessionID);
     if (!record || terminal(record) || record.phase !== 'scheduled' || running.length !== 1 || running[0].id !== record.compactID) {
+      // Not our scheduled compaction: keep the native result untouched.
       if (!running.some((m: any) => typeof m.id === 'string' && m.id.startsWith('msg_ai4ai_compact_'))) event.result = previous;
+      else event.result = { summary: 'AI4AI compaction admission unavailable; original window retained.', native: { messages: event.messages }, metadata: { ai4aiRejected: true } };
       return;
     }
+    if (record.mechanism === 'compact') {
+      // Keep the harness's own summary. The task (if any) is delivered as the
+      // next input; without a task the native continuation carries the work.
+      event.result = previous;
+      const applied = await journal.transition(record.source, record.operationId, ['scheduled'], 'applied', 'Native summary produced; successor input pending');
+      sessions.set(event.sessionID, applied);
+      await publishStatus(applied, { continued: true });
+      return;
+    }
+    event.result = { summary: 'AI4AI compaction admission unavailable; original window retained.', native: { messages: event.messages }, metadata: { ai4aiRejected: true } };
     const applied = await journal.transition(record.source, record.operationId, ['scheduled'], 'applied', 'Native fresh window supplied; task delivery pending');
     // The in-memory record is the authority for later hooks: without this
     // update the idle hook still sees `scheduled` and never delivers the task.
     sessions.set(event.sessionID, applied);
+    await publishStatus(applied);
     event.result = { summary: 'Caller requested a fresh native execution context; task is delivered separately.', native: { messages: [] }, metadata: { ai4aiMarker: record.compactID } };
   }).then(() => undefined));
 
@@ -316,7 +396,29 @@ export async function setup(ctx: any): Promise<() => void> {
       await replayRetainedInput(event.sessionID, record);
       return;
     }
+    if (record.phase === 'scheduled') {
+      // A handoff scheduled from a prompt/control turn runs its native
+      // transition at this idle boundary, which is the safe compaction point.
+      try {
+        const receipt = await ctx.session.compact({ sessionID: event.sessionID, id: record.compactID, delivery: 'queue' });
+        if (receipt.id !== record.compactID) throw new Error('Native compact receipt mismatch');
+      } catch (error) {
+        const failed = await journal.transition(record.source, record.operationId, ['scheduled'], 'failed', `Native transition could not be scheduled: ${error instanceof Error ? error.message : String(error)}`);
+        sessions.set(event.sessionID, failed);
+        await publishStatus(failed, { errorCode: 'opencode-transition-failed' });
+      }
+      return;
+    }
     if (record.phase !== 'applied' || delivered.has(record.operationId)) return;
+    if (record.mechanism === 'compact' && !record.request.task) {
+      // No task: the native summary continues the original work and nothing is
+      // delivered. Completion is the summary itself, not an adoption turn.
+      const completed = await journal.transition(record.source, record.operationId, ['applied'], 'completed', 'Native compaction completed; the original task continues with no extra message');
+      sessions.set(event.sessionID, completed);
+      await publishStatus(completed, { continued: true });
+      await replayRetainedInput(event.sessionID, completed);
+      return;
+    }
     delivered.add(record.operationId);
     // The task goes first; retained input is replayed as its own message after
     // adoption, so the successor does not have to choose between two
@@ -338,9 +440,11 @@ export async function setup(ctx: any): Promise<() => void> {
       const messages = await ctx.session.context({ sessionID: event.sessionID });
       const wasDelivered = messages.some((message: any) => message.id === record.deliveryID);
       const window = latestWindow(messages);
-      if (wasDelivered && window?.id === record.compactID) {
+      const summaryMatches = record.mechanism === 'compact' || window?.id === record.compactID;
+      if (wasDelivered && summaryMatches) {
         const completed = await journal.transition(record.source, record.operationId, ['applied'], 'completed', 'Successor admitted the synthetic task in the replaced window');
         sessions.set(event.sessionID, completed);
+        await publishStatus(completed);
         // The task is already in the fresh window; queued input follows as a
         // separate synthetic message once the handoff is complete.
         await replayRetainedInput(event.sessionID, completed);

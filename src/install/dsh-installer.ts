@@ -1,4 +1,4 @@
-import { mkdir, readdir, lstat, readFile, copyFile, realpath, readlink } from 'node:fs/promises';
+import { mkdir, readdir, lstat, readFile, writeFile, copyFile, realpath, readlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,7 +94,10 @@ async function sourceSnapshot(source: string): Promise<Omit<Snapshot, 'directory
 async function verify(directory: string, entries: FileEntry[], extra: string[] = []): Promise<boolean> {
   const expected = [...entries.map(e => e.file), ...extra].sort();
   try {
-    const actual = await files(directory);
+    // pnpm materializes its own `node_modules/.bin` shims inside the linked
+    // package. They are package-manager metadata, not snapshot payload, so
+    // they are ignored when comparing the owned file set.
+    const actual = (await files(directory)).filter(file => !file.startsWith('node_modules/'));
     if (JSON.stringify(expected) !== JSON.stringify(actual)) return false;
     for (const entry of entries) { const data = await bytes(path.join(directory, entry.file)); if (!data || digest(data) !== entry.sha256) return false; }
     return true;
@@ -287,9 +290,45 @@ async function native(command: NativeCommand, request: NativeMutationRequest, be
   });
 }
 
+/**
+ * Prepare a DSH profile for a native `pnpm add`.
+ *
+ * A profile created by the launcher is a pnpm workspace root, and `pnpm add`
+ * refuses to write the workspace root unless `ignore-workspace-root-check` is
+ * set. DSH's own plugin manager does not set it, so a fresh profile install
+ * fails with `ERR_PNPM_ADDING_TO_ROOT`. Bootstrap the profile with the
+ * launcher's read-only `--dump-config` (which materializes the template) and
+ * merge the setting without disturbing any other line.
+ */
+async function prepareProfile(home: string, profile: string, command: NativeCommand): Promise<void> {
+  const directory = path.join(home, 'profiles', profile);
+  await contained(home, directory);
+  if (!existsSync(directory)) {
+    await new Promise<void>(resolve => {
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const finish = (): void => { if (settled) return; settled = true; if (timer !== undefined) clearTimeout(timer); resolve(); };
+      const child = spawn(command.file, [...(command.prefixArgs ?? []), '--profile', profile, '--dump-config'], {
+        env: { ...(command.env ?? process.env), DSH_HOME: home }, stdio: 'ignore', shell: false,
+      });
+      timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } finish(); }, 60000);
+      child.once('close', finish);
+      child.once('error', finish);
+    });
+    if (!existsSync(directory)) return;
+  }
+  await contained(home, directory);
+  const file = path.join(directory, '.npmrc');
+  await contained(home, file);
+  let text = '';
+  try { text = await readFile(file, 'utf8'); } catch { /* a missing file starts empty */ }
+  if (/^\s*ignore-workspace-root-check\s*=\s*true\s*$/m.test(text)) return;
+  const next = `${text.replace(/\s+$/, '')}${text.trim() ? '\n' : ''}ignore-workspace-root-check=true\n`;
+  await writeFile(file, next, { mode: 0o600 });
+}
+
 /** Install only in the explicitly selected DSH profile through its native package manager. */
-export async function installDsh(options: InstallOptions): Promise<InstallResult> {
-  profileName(options.profile);
+export async function installDsh(options: InstallOptions): Promise<InstallResult> {  profileName(options.profile);
   const home = await selectedRoot(options.home);
   await guardProfileDestinations(home, options.profile);
   const owned = await ownership(home);
@@ -364,6 +403,7 @@ export async function installDsh(options: InstallOptions): Promise<InstallResult
     if (state.active?.id === next.id && state.phase === 'installed') return response('already-installed', 'Owned native registration and installed bytes already match', true, target);
     const previous = state;
     await save({ ...state, phase: 'mutating', action: 'install', pending: next });
+    await prepareProfile(home, options.profile, options.command);
     let outcome: NativeMutationResult;
     try { outcome = await native(options.command, { home, profile: options.profile, args: ['add', next.spec], token: owned.owner.token, timeoutMs: options.command.timeoutMs ?? 180000, ...(previous.active ? { expected: previous.active } : {}) }, async pid => { await save({ ...state, nativePid: pid }); }); } catch (error) {
       if (error instanceof NativeLaunchError) { await save(previous); return response('failed', `Native mutation did not start: ${error.message}`); }

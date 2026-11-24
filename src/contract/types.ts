@@ -257,6 +257,8 @@ export interface Result {
   runtimeVersion?: string | null;
   /** MCP servers copied into the executor after filtering. */
   mcpFiltered?: { names: string[]; count: number };
+  /** D37 provider-credential provenance: scope and key names only, never values. */
+  credentials?: { isolation: 'inherit' | 'isolated'; source: string; keys: string[]; fields?: { key: string; source: string }[]; masked: true; notes?: string[] };
   /** Bounded log/event tail (status with `logTail`). */
   logTail?: LogTail;
   /** Provenance of the observed state: native > session > unknown. */

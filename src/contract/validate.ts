@@ -253,7 +253,7 @@ const RESULT_KEYS = [
   'turnStartedAt', 'idleSince', 'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail',
   'mechanism', 'sessionChanged', 'sourceSession', 'successorSession', 'sourceGeneration', 'successorGeneration',
   'successor', 'predecessorExecutorId', 'successorExecutorId', 'lineage', 'predecessorStopped', 'alternatives',
-  'continued', 'idleAfter', 'lastError',
+  'continued', 'idleAfter', 'lastError', 'credentials',
 ] as const;
 
 /** Results are closed too, so a misspelled field cannot masquerade as evidence. */

@@ -21,8 +21,8 @@ export interface OpenCodeRecord {
   sourceCall: string;
   phase: OpenCodePhase;
   reason: string;
-  /** The native handoff replaces the window without a summary model call. */
-  mechanism?: 'restart';
+  /** The native handoff replaces the window (restart) or keeps a native summary (compact). */
+  mechanism?: 'restart' | 'compact';
   /** Explicit proof mechanism; absent on records written before 0.0.5. */
   proofMechanism?: 'surface-replacement' | 'native-compaction' | 'new-session';
   successor?: Identity;
@@ -99,7 +99,7 @@ export class OpenCodeJournal {
       }
       if (request.operation !== 'handoff') return { result: result(request, 'unsupported', 'This OpenCode plugin implements in-session handoff only; use the external CLI for executors') };
       if (request.target !== 'self') return { result: result(request, 'unsupported', 'Only self-handoff is implemented in the in-session plugin') };
-      if (request.mode === 'compact') return { result: result(request, 'unsupported', 'OpenCode handoff replaces the window with only the task material; a history summary (compact) is not implemented') };
+
       // Revisions accumulate in the ledger: only the latest revision of an
       // operation id decides whether a handoff is still unresolved.
       const active = activeRecord(records, record => ['completed', 'cancelled', 'failed', 'unknown'].includes(record.phase));
@@ -109,7 +109,8 @@ export class OpenCodeJournal {
         format: 2, operationId: request.operationId, fingerprint: fingerprint(request), request, source: identity,
         compactID: `msg_ai4ai_compact_${token}`, deliveryID: `msg_ai4ai_task_${token}`,
         sourceMessage: native?.messageID ?? '', sourceCall: native?.callID ?? '', phase: 'pending',
-        mechanism: 'restart', proofMechanism: 'surface-replacement',
+        mechanism: request.mode === 'compact' ? 'compact' : 'restart',
+        proofMechanism: request.mode === 'compact' ? 'native-compaction' : 'surface-replacement',
         reason: 'Finish the source turn; the native replacement supplies a fresh window containing only the task material',
       };
       await commit(record);

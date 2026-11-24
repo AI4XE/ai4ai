@@ -2,6 +2,7 @@ import type { Register, CoreEngineInterface } from 'claude-code';
 import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
 import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
 import { parseDelivery, isDeliveryText as isCanonicalDelivery, taskDelivery, idleDelivery } from '../../core/handoff-delivery.js';
+import { controlEnvelopeOperationId } from '../../core/control-envelope.js';
 
 /**
  * The Claude hooks module is evaluated in a sandbox that allows relative
@@ -33,6 +34,8 @@ interface Runtime {
   compacting?: boolean;
   /** Rotation seed: the initial D29 text is a normal task, never a delivery. */
   seed?: boolean;
+  /** Turn that only carries the invisible executor-target handoff envelope. */
+  controlTurn?: string;
   /** Real user input retained while the handoff window is open. */
   retained: RetainedInput;
 }
@@ -201,12 +204,35 @@ async function bindNative($: CoreEngineInterface, s: Runtime): Promise<void> {  
 }
 
 function deliveryText(s: Runtime, text: string): boolean {
-  const suffix = "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
-  return !!s.delivery && (text === s.delivery.text || text === `The ai4ai plugin sent a message:\n${s.delivery.text}${suffix}`);
+  if (!s.delivery) return false;
+  return text === s.delivery.text || unwrapHostDelivery(text) === s.delivery.text;
+}
+
+/** Bounded control-token extraction across host event shapes (never stringifies the whole event). */
+const CONTROL_TOKEN = /\[\[ai4ai-control:handoff:([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\]\]/;
+function controlOperationOf(value: unknown): string | undefined {
+  if (typeof value === 'string') return CONTROL_TOKEN.exec(value)?.[1];
+  if (Array.isArray(value)) { for (const item of value) { const hit = controlOperationOf(item); if (hit) return hit; } return undefined; }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return controlOperationOf(record.text) ?? controlOperationOf(record.content) ?? controlOperationOf(record.message);
+  }
+  return undefined;
+}
+
+const HOST_WRAPPER_PREFIX = 'The ai4ai plugin sent a message:\n';
+const HOST_WRAPPER_SUFFIX = "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+
+/** Strip the host's plugin-submit wrapper so the canonical D29 text is parsed. */
+function unwrapHostDelivery(text: string): string {
+  if (!text.startsWith(HOST_WRAPPER_PREFIX)) return text;
+  let body = text.slice(HOST_WRAPPER_PREFIX.length);
+  if (body.endsWith(HOST_WRAPPER_SUFFIX)) body = body.slice(0, -HOST_WRAPPER_SUFFIX.length);
+  return body;
 }
 
 function isDeliveryText(text: string): boolean {
-  return isCanonicalDelivery(text) || text.startsWith('AI4AI handoff delivery ') || text.startsWith('The ai4ai plugin sent a message:\nAI4AI handoff delivery ');
+  return isCanonicalDelivery(unwrapHostDelivery(text)) || text.startsWith('AI4AI handoff delivery ') || text.startsWith('The ai4ai plugin sent a message:\nAI4AI handoff delivery ');
 }
 
 function admitted(s: Runtime): boolean {
@@ -327,7 +353,7 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
 
 /** Native Claude Code mods: in-place handoff without a summarizer, daemon or history fork. */
 export const register: Register = on => {
-  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', appliedHere: false, retained: new RetainedInput(), seed: process.env.AI4AI_HANDOFF_SEED === '1' };
+  const s: Runtime = { instance: '', node: '', busy: false, pumping: false, turnId: '', appliedHere: false, retained: new RetainedInput() };
   let tail: Promise<unknown> = Promise.resolve();
   const serial = <T>(fn: () => Promise<T>): Promise<T> => { const pending = tail.then(fn); tail = pending.catch(() => undefined); return pending; };
 
@@ -361,9 +387,44 @@ export const register: Register = on => {
 
   on('turn.start', async ($: any, e: any, next: any) => {
     if (!e.agentId) await serial(async () => {
-      if (!s.binding || await $.session.id() !== s.binding.session) await bindNative($, s);
       s.busy = true;
       s.turnId = e.turnId;
+      // Temporary diagnostic: capture the host turn.start shape once per turn.
+      try {
+        const bounded = (value: unknown): unknown => {
+          try { return JSON.parse(JSON.stringify(value, (key, item) => typeof item === 'string' ? item.slice(0, 300) : item)); }
+          catch { return String(value).slice(0, 300); }
+        };
+        if (s.node) await rpcWith($, s.node, {
+          action: 'debug',
+          debug: { keys: Object.keys(e ?? {}), text: bounded(e.text), message: bounded(e.message), content: bounded(e.content), raw: bounded(e) },
+        }, s.bindingPath);
+      } catch { /* diagnostic only */ }
+      // Invisible executor-target handoff envelope: consume the durable
+      // request, schedule the transition and abort before the model sees it.
+      // Detection runs before binding so a binding hiccup can never leak the
+      // envelope into the model turn.
+      const controlOperation = controlEnvelopeOperationId(e.text)
+        ?? controlEnvelopeOperationId(e.message?.content)
+        ?? controlEnvelopeOperationId((e.message?.content ?? [])[0]?.text)
+        ?? (typeof e.text === 'string' && e.text.includes('[[ai4ai-control:handoff:')
+          ? controlEnvelopeOperationId(e.text.slice(e.text.indexOf('[[ai4ai-control:handoff:'))) : undefined);
+      if (controlOperation) {
+        s.controlTurn = e.turnId;
+        try {
+          if (!s.binding) await bindNative($, s);
+          const out = await rpc($, s.node, { action: 'intake', caller: s.binding }, s.bindingPath);
+          if (out?.record) {
+            s.active = out.record;
+            await transition($, s, 'scheduled', 'External executor-target handoff accepted; applying at this safe point');
+          }
+        } catch (error: any) {
+          dbg($, 'handoff intake failed: ' + String(error?.message ?? error));
+        }
+        await $.turn.abort({ turnId: e.turnId });
+        return;
+      }
+      if (!s.binding || await $.session.id() !== s.binding.session) await bindNative($, s);
       if (isDeliveryText(e.text) && !(s.seed && !s.delivery)) {
         s.admissionTurn = e.turnId;
         if (!deliveryText(s, e.text) || !admitted(s)) { await $.turn.abort({ turnId: e.turnId }); return; }
@@ -384,6 +445,14 @@ export const register: Register = on => {
     let replayNow = false;
     if (!e.agentId) await serial(async () => {
       dbg($, `turn.complete reason=${String(e.reason)} aborted=${String(e.isAborted)} phase=${String(s.active?.phase)}`);
+      // The control turn carries no model work: its completion is the safe
+      // point that applies the queued external handoff.
+      if (s.controlTurn !== undefined && s.controlTurn === e.turnId) {
+        delete s.controlTurn;
+        s.busy = false;
+        if (s.active?.phase === 'scheduled') pumpNow = true;
+        return;
+      }
       if (s.active?.phase === 'pending') {
         if (e.isAborted || e.reason !== 'answer') await transition($, s, 'cancelled', 'Source turn stopped, refused or failed; handoff cancelled');
         else {

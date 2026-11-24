@@ -12,6 +12,7 @@ import type { ExecutorRecord } from '../../core/store.js';
 import { executorDir, type LogLine, type ExecutorStatus } from '../executors.js';
 import { declaration } from '../declarations.js';
 import { filterMcpConfig } from '../../core/mcp-filter.js';
+import { harnessCredentialReport, readCredentialReport, resolveClaudeCredentials, writeCredentialReport } from '../../core/credentials.js';
 
 /**
  * Claude Code adapter.
@@ -42,13 +43,13 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
     const mac = os === 'darwin';
     // macOS proves both the handoff and the detached carrier in this release.
     const reason = linux
-      ? 'The mods plugin loads and the zero-summary restart replaces the context in place through the native compact hook while keeping the session id; a disabled-compaction session is reported unsupported. Detached carriers spawn, report status and survive the parent. Exercised on Linux.'
+      ? 'The mods plugin loads and the zero-summary restart replaces the context in place through the native compact hook while keeping the session id; a disabled-compaction session is reported unsupported. Detached carriers spawn, report status and survive the parent. Exercised on Linux. Provider credentials may be inherited read-only from the user settings env allowlist (D37) and are reported by source; AI4AI_CREDENTIAL_INHERITANCE=isolated restores project,local-only behaviour.'
       : mac
-        ? 'The mods plugin loads and the zero-summary in-place restart completed on macOS with the session id preserved (handoff verified). The detached carrier was exercised on macOS with a real two-turn executor: spawn, status, message queued into the same session (both turn markers in the executor log), stop, and the error paths (unauthorized target, message to a completed executor) all completed.'
+        ? 'The mods plugin loads and the zero-summary in-place restart completed on macOS with the session id preserved (handoff verified). The detached carrier was exercised on macOS with a real two-turn executor: spawn, status, message queued into the same session (both turn markers in the executor log), stop, and the error paths (unauthorized target, message to a completed executor) all completed. Provider credentials may be inherited read-only from the user settings env allowlist (D37); isolated mode is available.'
         : 'The mods plugin and the detached carrier are implemented; native Windows is out of scope (WSL counts as Linux) and was not exercised.';
     const carrier = linux || mac ? 'supported' as const : 'not-tested' as const;
     const common = {
-      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart'] as ('compact' | 'restart')[], self: { modes: ['restart'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[], }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: carrier, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -152,6 +153,17 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
     // personal settings (including a different provider) do not override the
     // caller's intended route.
     if (process.env.AI4AI_CLAUDE_CONFIG_DIR) env.CLAUDE_CONFIG_DIR = process.env.AI4AI_CLAUDE_CONFIG_DIR;
+    // D37: a user whose provider is configured only at the user level must work
+    // without editing anything. The provider env allowlist is resolved read-only
+    // (project settings > user settings > process env, plus the adapter's own
+    // explicit knobs) and injected here; nothing is written to any user file.
+    // Behaviour/policy stays isolated because `--setting-sources` remains
+    // `project,local`. In isolated mode nothing is read or injected.
+    const credentials = await resolveClaudeCredentials({ workspace: ctx.identity.workspace, explicit: env }).catch(() => null);
+    if (credentials) {
+      Object.assign(env, credentials.env);
+      await writeCredentialReport(executorDir(ctx.home, executorId), credentials.report).catch(() => undefined);
+    }
     return {
       command: process.env.AI4AI_CLAUDE_BIN || 'claude',
       args,
@@ -185,7 +197,12 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
       used: nativeUsed, model: nativeModel, window: nativeWindow,
       runtimeVersion,
     });
-    return details;
+    // D37 provenance: report where the provider credentials came from, names
+    // only. The carrier persisted the report at launch; if it is missing (older
+    // executor) fall back to the installation-level view.
+    const credentials = await readCredentialReport(executorDir(ctx.home, _record.executorId)).catch(() => null)
+      ?? harnessCredentialReport('claude-code', ctx.identity.workspace);
+    return { ...details, credentials };
   }
 }
 

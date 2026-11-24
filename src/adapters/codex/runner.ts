@@ -19,6 +19,8 @@ import path from 'node:path';
 import { CodexAppServer } from './app-server.js';
 import { applyRevertHandoff, type RpcTransport } from './native-handoff.js';
 import { taskDelivery } from '../../core/handoff-delivery.js';
+import { clearHandoffRequest, controlEnvelopeOperationId, readHandoffRequest, writeHandoffStatus } from '../../core/executor-request.js';
+import type { Identity } from '../../contract/types.js';
 
 const args = process.argv.slice(2);
 const threadIndex = args.indexOf('--thread');
@@ -59,6 +61,51 @@ const writeOutput = async (): Promise<void> => {
       threadId, text: answer, ...(failure ? { error: failure } : {}), ...(handoff ? { handoff } : {}),
     }, null, 2) + '\n');
   } catch { /* output evidence is best-effort */ }
+};
+
+const nativeSource = (tid: string): Identity => ({
+  harness: 'codex', workspace: cwd, surface: 'headless', session: tid, generation: 'codex-thread', agent: 'main',
+});
+
+/** Publish the executor-side outcome for the orchestrator's reconcile. */
+const publishStatus = async (
+  phase: 'scheduled' | 'applied' | 'completed' | 'failed' | 'cancelled',
+  mechanism: 'surface-replacement' | 'native-compaction',
+  reason: string,
+  extra: { successorTurnId?: string; continued?: boolean; idleAfter?: boolean; errorCode?: string } = {},
+): Promise<void> => {
+  if (!executorDir || !threadId) return;
+  const source = nativeSource(threadId);
+  const successor = { ...source, generation: String(extra.successorTurnId ?? new Date().toISOString()) };
+  await writeHandoffStatus(executorDir, {
+    format: 2, kind: 'handoff-status', operationId: String(handoff?.operationId ?? currentOperationId ?? 'unknown'),
+    phase, mechanism, source, successor, session: threadId, generation: successor.generation,
+    reason, ...extra, updatedAt: new Date().toISOString(),
+  }).catch(() => undefined);
+};
+let currentOperationId: string | undefined;
+
+/** Turn an external executor-target request into the local handoff intent. */
+const adoptExternalRequest = async (): Promise<boolean> => {
+  if (!executorDir) return false;
+  const request = await readHandoffRequest(executorDir);
+  if (!request) return false;
+  if (Date.parse(request.deadlineAt) < Date.now()) {
+    currentOperationId = request.operationId;
+    await publishStatus('failed', request.mode === 'compact' ? 'native-compaction' : 'surface-replacement', 'The executor-target handoff request expired', { errorCode: 'handoff-timeout' });
+    await clearHandoffRequest(executorDir);
+    return false;
+  }
+  currentOperationId = request.operationId;
+  await writeHandoff({
+    format: 2, kind: 'handoff', operationId: request.operationId,
+    request: { operation: 'handoff', operationId: request.operationId, target: 'self', mode: request.mode, ...(request.task !== undefined ? { task: request.task } : {}) },
+    source: nativeSource(threadId ?? ''), executorId: process.env.AI4AI_EXECUTOR_ID, threadId,
+    mode: request.mode, mechanism: request.mode, proofMechanism: request.mode === 'compact' ? 'native-compaction' : 'surface-replacement',
+    phase: 'intent', createdAt: new Date().toISOString(),
+  });
+  await clearHandoffRequest(executorDir);
+  return true;
 };
 
 /** Notifications plus a resettable waiter so each turn/compaction step is distinct. */
@@ -153,6 +200,7 @@ const applyHandoff = async (): Promise<boolean> => {
   const intent = await readHandoff();
   if (!intent || intent.phase !== 'intent' || !threadId) return false;
   const operationId = String(intent.operationId ?? 'unknown');
+  currentOperationId = operationId;
   const mode = intent.mode === 'compact' ? 'compact' : 'restart';
   const record: Record<string, unknown> = { ...intent, phase: 'applying', applyingAt: new Date().toISOString() };
   await writeHandoff(record);
@@ -206,10 +254,12 @@ const applyHandoff = async (): Promise<boolean> => {
         ...(outcome.ok ? {} : { error: outcome.reason }),
       };
       if (!outcome.ok) {
+        await publishStatus('failed', 'surface-replacement', outcome.reason ?? 'restart handoff failed', { errorCode: 'codex-handoff-failed' });
         failure = `codex headless restart handoff failed: ${outcome.reason}`;
         exitCode = 1;
         return false;
       }
+      await publishStatus(outcome.ok ? (outcome.completed ? 'completed' : 'applied') : 'failed', 'surface-replacement', outcome.reason ?? phase, { ...(successorTurnId ? { successorTurnId } : {}) });
       // The successor identity is the same thread; report it so a supervisor
       // can reconcile without inventing a new session.
       process.stdout.write(JSON.stringify({ session_id: threadId }) + '\n');
@@ -240,6 +290,7 @@ const applyHandoff = async (): Promise<boolean> => {
       appliedAt: new Date().toISOString(),
     };
     await writeHandoff(finalRecord);
+    await publishStatus(settled.ok ? 'completed' : 'failed', 'native-compaction', settled.ok ? 'Native compaction and successor turn completed' : (settled.detail ?? 'compaction failed'), { ...(successorTurnId ? { successorTurnId } : {}) });
     handoff = {
       operationId, phase: finalRecord.phase, compacted: true, mechanism: 'compact', proofMechanism: 'native-compaction', successorThreadId: threadId, successorTurnId,
       ...(settled.ok ? {} : { error: settled.detail }),
@@ -253,6 +304,7 @@ const applyHandoff = async (): Promise<boolean> => {
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     await writeHandoff({ ...record, phase: 'failed', error: detail, appliedAt: new Date().toISOString() });
+    await publishStatus('failed', mode === 'compact' ? 'native-compaction' : 'surface-replacement', detail, { errorCode: 'codex-handoff-failed' });
     handoff = { operationId, phase: 'failed', error: detail };
     failure = `codex headless handoff failed: ${detail}`;
     exitCode = 1;
@@ -270,7 +322,8 @@ try {
     threadId = resumed.thread?.id ?? resumeThreadId;
     threadModel = resumed.thread?.model;
   } else {
-    const started = await server.request('thread/start', { cwd, approvalPolicy: 'never', sandbox: 'workspace-write' }) as { thread?: { id?: string; model?: string } };
+    const sandbox = process.env.AI4AI_CODEX_SANDBOX === 'danger-full-access' ? 'danger-full-access' : 'workspace-write';
+    const started = await server.request('thread/start', { cwd, approvalPolicy: 'never', sandbox }) as { thread?: { id?: string; model?: string } };
     threadId = started.thread?.id;
     threadModel = started.thread?.model;
   }
@@ -288,6 +341,20 @@ try {
       if (row?.model) await writeFile(path.join(executorDir, 'model.json'), JSON.stringify({ model: row.model }) + '\n');
     } catch { /* model metadata is best-effort */ }
   }
+  // Invisible executor-target handoff envelope: apply it before any model turn.
+  const controlOperation = controlEnvelopeOperationId(task);
+  if (controlOperation) {
+    const adopted = await adoptExternalRequest();
+    if (!adopted) {
+      failure = failure ?? 'no valid executor-target handoff request was found';
+      exitCode = 1;
+    } else if (!(await applyHandoff())) {
+      exitCode = 1;
+    }
+    await writeOutput();
+    server.close();
+    process.exit(exitCode);
+  }
   events = [];
   const started = await server.request('turn/start', {
     threadId,
@@ -298,6 +365,7 @@ try {
     failure = settled.detail ?? 'codex turn failed';
     exitCode = 1;
   } else {
+    await adoptExternalRequest();
     await applyHandoff();
   }
 } catch (error) {

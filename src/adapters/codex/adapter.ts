@@ -93,7 +93,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
     const level = linux || mac ? 'supported' as const : 'not-tested' as const;
     const modes = (linux ? ['restart', 'compact'] : ['restart']) as ('compact' | 'restart')[];
     const common = {
-      handoff: { availability: level, modes, self: { modes } },
+      handoff: { availability: level, modes, self: { modes }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
       spawn: {
         availability: level, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -216,7 +216,9 @@ export class CodexAdapter extends ExternalExecutorAdapter {
    */
   async handoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome> {
     if (request.target !== 'self') {
-      return { status: 'unsupported', reason: 'Codex handoff targets the caller self only; detached executors cannot replace their context in place', unavailable: ['handoff.executor'] };
+      // Executor-target restart/compact uses the durable request + control turn
+      // consumed by the executor's runner; rotation is executed by the core.
+      return super.handoff(request, ctx);
     }
     if (request.surface !== undefined && request.surface !== 'preserve') {
       return { status: 'unsupported', reason: 'Codex handoff preserves the surface; cross-surface handoff is not implemented', unavailable: ['handoff.crossSurface'] };
