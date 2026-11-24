@@ -175,7 +175,7 @@ AI Harness Extension Kit (ai4ai)
 - spawn — start a detached executor that works in parallel while this session continues.
 - message / stop / finish / list — manage executors (message revives a terminal executor in its session; finish completes gracefully).
 - capabilities — list supported operations for this harness.
-- CLI helpers (orchestrator-side; shell commands, not tool calls): `ai4ai watch --executor <id> --until "<condition>" [--timeout S]` (exit 0 met / 3 timeout / 2 usage / 1 runtime), `ai4ai events --executor <id>` (normalized tail with cursor), `ai4ai sweep` (identity-checked orphan cleanup). Run `ai4ai --help` for conditions and flags.
+- CLI helpers (orchestrator-side; shell commands, not tool calls): `ai4ai watch --executor <id> --until "<condition>" [--timeout S]` (exit 0 met / 3 timeout / 2 usage / 1 runtime), `ai4ai events --executor <id> [--follow]` (normalized tail with cursor; opt-in read-only follow), `ai4ai transcript --executor <id> [--tail N]` (opt-in bounded/redacted transcript tail), `ai4ai adoption --executor <id>` (verify-adoption proof), `ai4ai activity --executor <id>` (bounded activity summary), `ai4ai sweep` (identity-checked orphan cleanup). Run `ai4ai --help` for conditions and flags.
 Notices are informational; on pending, finish the turn.
 ```
 
