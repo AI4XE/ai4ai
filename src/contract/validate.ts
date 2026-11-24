@@ -311,7 +311,12 @@ export function validateResult(value: unknown): Validation<Result> {
         if (!(FIELD_STATE_VALUES as readonly string[]).includes(String(state))) issues.push(problem(`fieldStates.${key}`, 'schema', 'Unknown field state'));
         if (state === 'disabled') {
           if (Array.isArray(value.unavailable) && value.unavailable.includes(key)) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A disabled field is not missing and must not appear in unavailable'));
-        } else if (Array.isArray(value.unavailable) && !value.unavailable.includes(key)) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A missing field must also appear in unavailable'));
+        } else if (state !== 'unknown') {
+          // `unknown` is a truthful state of its own (D13): the harness does not
+          // expose the value, but the feature is not absent. Only a genuinely
+          // unavailable field must appear in the derived unavailable list.
+          if (Array.isArray(value.unavailable) && !value.unavailable.includes(key)) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A missing field must also appear in unavailable'));
+        }
         if (value.unavailable === undefined) issues.push(problem(`fieldStates.${key}`, 'inconsistent', 'A field state map requires the unavailable list it derives from'));
       }
     }
@@ -502,7 +507,10 @@ export function result(
   if (context.percent === null) fieldStates['context.percent'] = fieldStates['context.percent'] ?? 'unavailable';
   // Output-inclusive occupancy is only reported when the native usage carries
   // output tokens; a null value is an explicit, non-blocking unavailability.
-  const unavailable = [...new Set([...(options.unavailable ?? []), ...Object.keys(fieldStates).filter(key => fieldStates[key] !== 'disabled')])];
+  // `unknown` is a truthful state of its own (D13): a missing value that the
+  // harness does not expose must not be reported as `unavailable`, or a
+  // consumer reading only `unavailable` would treat a working feature as absent.
+  const unavailable = [...new Set([...(options.unavailable ?? []), ...Object.keys(fieldStates).filter(key => fieldStates[key] !== 'disabled' && fieldStates[key] !== 'unknown')])];
   return { ...composed, context, unavailable, fieldStates, autoCompact };
 }
 
