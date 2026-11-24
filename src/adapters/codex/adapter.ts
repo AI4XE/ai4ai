@@ -240,8 +240,15 @@ export class CodexAdapter extends ExternalExecutorAdapter {
    * Re-query a pending handoff written by the headless runner or the detached
    * TUI watcher. Without this, the same operationId would return the original
    * pending result forever even after the native side completed.
+   *
+   * An external caller re-querying an executor-target handoff has no
+   * `AI4AI_EXECUTOR_DIR`/`AI4AI_EXECUTOR_ID`, so the TUI/self file lookup
+   * alone cannot see the executor's handoff-status. Try the shared
+   * executor-target reconcile first; fall back to the Codex-local files.
    */
   async reconcileHandoff(request: Request, ctx: AdapterContext): Promise<NativeOutcome | undefined> {
+    const executor = await super.reconcileHandoff(request, ctx);
+    if (executor) return executor;
     return reconcileCodexHandoff(request, ctx);
   }
 
