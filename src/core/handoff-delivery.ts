@@ -11,12 +11,12 @@
  * - self restart without a task: `Handoff complete. Await the next instruction.\n[[ai4ai:<marker>]]`
  * - compact without a task: no delivery at all (the native summary is enough).
  * - fallback continuation (only when the native on-demand path is unavailable):
- *   `Handoff complete. Continue the original task only if it is unfinished; otherwise do nothing.\n[[ai4ai:<marker>]]`
+ *   `Handoff complete. Please continue.\n[[ai4ai:<marker>]]`
  */
 
 export const HANDOFF_HEADER_TASK = 'Handoff complete. Handoff material follows:';
 export const HANDOFF_HEADER_IDLE = 'Handoff complete. Await the next instruction.';
-export const HANDOFF_HEADER_CONTINUE = 'Handoff complete. Continue the original task only if it is unfinished; otherwise do nothing.';
+export const HANDOFF_HEADER_CONTINUE = 'Handoff complete. Please continue.';
 
 export type DeliveryKind = 'task' | 'idle' | 'continue';
 

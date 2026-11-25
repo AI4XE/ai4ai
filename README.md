@@ -55,22 +55,6 @@ ai4ai upgrade     # re-register
 ai4ai uninstall   # remove registrations
 ```
 
-## Provider credentials
-
-Detached executors keep **behaviour** isolated: they never inherit your hooks, plugins,
-permissions or MCP servers. **Credentials** are different. If your provider is configured only at
-the user level, ai4ai resolves its allowlisted `env` (`ANTHROPIC_*` for Claude Code) in the order
-explicit request → project settings → user settings (`~/.claude/settings.json` or
-`$CLAUDE_CONFIG_DIR/settings.json`) → process environment, and injects it into the carrier at
-launch. Nothing is written to your files, the value never enters `spec.json`, logs or evidence,
-and `status` reports only the source scope and key names.
-
-Codex, OpenCode and DeepSeek Harness read their own user home by default; a pinned isolated home
-(`CODEX_HOME`, `OPENCODE_CONFIG`, `DSH_HOME`) keeps the user configuration out.
-
-Set `AI4AI_CREDENTIAL_INHERITANCE=isolated` to restore strictly project/local-only behaviour for
-tests and multi-tenant hosts.
-
 ## What AI can do
 
 The same commands across harnesses (in-harness `session` tool and `ai4ai` CLI):

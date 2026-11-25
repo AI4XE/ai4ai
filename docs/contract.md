@@ -149,7 +149,7 @@ Acquisition rules for every source path:
 - schema-tolerant: an unknown shape degrades to `null`, never a guess;
 - errors and timeouts degrade to the next source, never fail `status`;
 - configuration is read through an allowlist of keys, mirroring each
-  harness's documented precedence; credentials are never read or returned.
+  harness's documented precedence; credentials are never read or returned for status.
 
 Platform source applicability (implemented layers; `—` means not applicable
 because the harness persists no such value):
@@ -188,6 +188,19 @@ harness model id and effort label (`modelVerification` says `reported`, `configu
 `unknown`); `autoCompact` is `{ tokens, ratio, source }` with an absolute threshold, a 0-1
 window ratio and its source. `unavailable`/`fieldStates` name every field no source could
 provide.
+
+## Provider credentials
+
+- Behaviour is isolated: an executor never inherits hooks, plugins, permissions or MCP servers.
+  Provider **credentials and identity** may be inherited read-only when the provider is configured
+  only at the user level.
+- Resolution order: explicit request → project settings → user settings provider `env` →
+  process environment (allowlisted `ANTHROPIC_*` keys for Claude Code).
+- Nothing is written to user files; values never enter `spec.json`, logs or evidence, and
+  `status` reports only the source scope and key names.
+- Codex, OpenCode and DeepSeek Harness read their own user home by default; pinning an isolated
+  home (`CODEX_HOME`, `OPENCODE_CONFIG`, `DSH_HOME`) keeps the user configuration out.
+- `AI4AI_CREDENTIAL_INHERITANCE=isolated` restores strict project/local-only behaviour.
 
 ## Capability declarations
 
