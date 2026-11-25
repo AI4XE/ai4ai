@@ -1,7 +1,7 @@
 import type { Register, CoreEngineInterface } from 'claude-code';
-import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
+import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolCall } from '../../contract/tool.js';
 import { RetainedInput, mergeRetained } from '../../core/retained-input.js';
-import { parseDelivery, isDeliveryText as isCanonicalDelivery, taskDelivery, idleDelivery } from '../../core/handoff-delivery.js';
+import { parseDelivery, isDeliveryText as isCanonicalDelivery, taskDelivery, idleDelivery, noTaskCompactDecision } from '../../core/handoff-delivery.js';
 import { controlEnvelopeOperationId } from '../../core/control-envelope.js';
 
 /**
@@ -13,7 +13,7 @@ import { controlEnvelopeOperationId } from '../../core/control-envelope.js';
  */
 
 interface Binding { harness: string; workspace: string; surface: 'tui' | 'headless'; session: string; generation: string; agent: string }
-interface HandoffRecord { operationId: string; marker: string; phase: string; mechanism?: 'restart' | 'compact'; request: { task?: string; mode?: 'restart' | 'compact' }; source: Binding }
+interface HandoffRecord { operationId: string; marker: string; phase: string; mechanism?: 'restart' | 'compact'; request: { task?: string; mode?: 'restart' | 'compact'; continuation?: 'auto' | 'off' }; source: Binding }
 interface Runtime {
   binding?: Binding;
   instance: string;
@@ -32,6 +32,8 @@ interface Runtime {
   admissionTurn?: string;
   /** True while the native summarizer is running for a compact handoff. */
   compacting?: boolean;
+  /** True when the no-task compact fallback continuation was injected. */
+  fallback?: boolean;
   /** Rotation seed: the initial D29 text is a normal task, never a delivery. */
   seed?: boolean;
   /** Turn that only carries the invisible executor-target handoff envelope. */
@@ -281,14 +283,20 @@ async function pump($: CoreEngineInterface, s: Runtime): Promise<void> {
       if (!applied?.record || applied.record.phase !== 'applied') return;
       if (s.binding) s.binding = { ...s.binding, generation: s.active!.marker };
       await writeBinding($, s, s.active!);
-      if (s.active?.request.task) {
-        const text = taskDelivery(s.active.request.task, s.active.marker);
-        s.delivery = { text, operationId: s.active.operationId, marker: s.active.marker, invalid: false, adopted: false };
-        await $.prompt.submit({ text });
+      const decision = noTaskCompactDecision({
+        task: s.active?.request.task,
+        continuation: s.active?.request.continuation,
+        mode: 'fallback',
+        marker: s.active?.marker ?? '',
+      });
+      if (decision.delivery === null) {
+        await transition($, s, 'completed',
+          decision.fallbackUsed ? 'No-task compact completed' : 'No-task compact completed; continuation disabled by the caller (the session may be idle)',
+          { continued: decision.continued, idleAfter: decision.idleAfter, fallbackUsed: decision.fallbackUsed });
       } else {
-        // No delivery message: the native summary continues the work and the
-        // durable binding proves the handoff. Complete without an adoption turn.
-        await transition($, s, 'completed', 'Native compaction completed; the original task continues with no extra message');
+        s.fallback = decision.fallbackUsed;
+        s.delivery = { text: decision.delivery, operationId: s.active!.operationId, marker: s.active!.marker, invalid: false, adopted: false };
+        await $.prompt.submit({ text: decision.delivery });
       }
       return;
     }
@@ -432,7 +440,10 @@ export const register: Register = on => {
         if (s.delivery && !s.delivery.adopted) {
           s.delivery.adopted = true;
           s.binding = { ...s.binding!, generation: s.delivery.marker };
-          await transition($, s, 'completed', 'Successor adopted the replaced context; handoff complete');
+          await transition($, s, 'completed', s.fallback
+            ? 'Successor adopted the replaced context with the minimal continuation fallback; handoff complete'
+            : 'Successor adopted the replaced context; handoff complete',
+            { continued: true, fallbackUsed: s.fallback === true });
         }
       }
     });
@@ -558,7 +569,19 @@ export const register: Register = on => {
   on('tool.call', { tool }, async ($: any, e: any) => {
     if (e.agentId) return { deny: 'AI4AI requires the native main session' };
     return serial(async () => {
-      const request: any = normalizeToolRequest(e) as any;
+      // The hooks sandbox has no `process` global; the executor-context guard
+      // is enforced by the worker, which owns AI4AI_EXECUTOR_ID. Only the
+      // in-harness default is decided here.
+      const norm = normalizeToolCall(e);
+      if (!norm.ok) {
+        return { result: JSON.stringify({
+          operation: 'handoff', operationId: norm.operationId, status: 'failed', reason: norm.failure.message,
+          durable: false, modelVerification: 'unknown', verification: { model: 'unknown', context: 'reported' },
+          notices: [], unavailable: [],
+          error: { code: norm.failure.code, message: norm.failure.message, correctedCall: norm.failure.correctedCall },
+        }) };
+      }
+      const request: any = norm.request;
       for (const key of ['tool', 'tool_use_id', 'agentId', 'requestMeta']) delete request[key];
       const usage = await (async () => {
         if (request.operation !== 'status') return {};
@@ -578,7 +601,7 @@ export const register: Register = on => {
         } catch { return {}; }
       })();
       if (!s.binding) throw new Error('AI4AI native binding is unavailable');
-      const out = await rpc($, s.node, { caller: s.binding, instance: s.instance, action: 'request', request, ...usage }, s.bindingPath);
+      const out = await rpc($, s.node, { caller: s.binding, instance: s.instance, action: 'request', request, targetDefaulted: norm.notices.length > 0, ...usage }, s.bindingPath);
       if (out.record) {
         s.active = out.record;
         // An explicit cancel/stop or a failed request ends the window; retained
@@ -586,7 +609,9 @@ export const register: Register = on => {
         if (TERMINAL.includes(String(out.record.phase))) s.retained.clear(RETAINED_SCOPE);
       }
       dbg($, `tool result state=${String(out.result?.status)} record=${String(out.record?.phase)}`);
-      return { result: JSON.stringify(out.result) };
+      if (norm.notices.length === 0) return { result: JSON.stringify(out.result) };
+      const merged = { ...(out.result ?? {}), notices: [...((out.result && out.result.notices) ?? []), ...norm.notices] };
+      return { result: JSON.stringify(merged) };
     }).catch((error: any) => ({ result: JSON.stringify({ operation: e.operation, operationId: e.operationId, status: 'unknown', reason: 'AI4AI native handler failed: ' + String(error?.message ?? error).slice(0, 600), durable: false, modelVerification: 'unknown', verification: { model: 'unknown', context: 'reported' }, context: { window: null, used: null, percent: null, percentSource: null }, unavailable: [], notices: [] }) }));
   });
 };

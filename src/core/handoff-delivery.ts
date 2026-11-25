@@ -93,3 +93,30 @@ export const isDeliveryText = (text: unknown): boolean => parseDelivery(text) !=
 export const LEGACY_DELIVERY_PREFIX = 'AI4AI handoff delivery ';
 export const isLegacyDeliveryText = (text: unknown): boolean =>
   typeof text === 'string' && (text.startsWith(LEGACY_DELIVERY_PREFIX) || text.startsWith(`The ai4ai plugin sent a message:\n${LEGACY_DELIVERY_PREFIX}`));
+
+/**
+ * D39 no-task compact continuation policy. `in-turn` harnesses continue inside
+ * the same loop and must receive no message; `fallback` harnesses stall at the
+ * turn boundary and get the minimal conditional continuation by default. The
+ * caller may pass `continuation: "off"` to accept a stalled session. The result
+ * always states the truth: a fallback is never native-equivalent.
+ */
+export interface NoTaskCompactDecision {
+  delivery: string | null;
+  continued: boolean;
+  idleAfter: boolean;
+  fallbackUsed: boolean;
+}
+
+export function noTaskCompactDecision(options: {
+  task?: string | undefined;
+  continuation?: 'auto' | 'off' | undefined;
+  mode: 'in-turn' | 'fallback';
+  marker: string;
+}): NoTaskCompactDecision {
+  const { task, continuation, mode, marker } = options;
+  if (task) return { delivery: taskDelivery(task, marker), continued: true, idleAfter: false, fallbackUsed: false };
+  if (mode === 'in-turn') return { delivery: null, continued: true, idleAfter: false, fallbackUsed: false };
+  if (continuation === 'off') return { delivery: null, continued: false, idleAfter: true, fallbackUsed: false };
+  return { delivery: continueDelivery(marker), continued: true, idleAfter: false, fallbackUsed: true };
+}

@@ -71,6 +71,13 @@
       ],
       "description": "Handoff mode: restart (default) starts a fresh context containing only the task material with no summary; compact is an explicit opt-in that keeps a harness-generated history summary."
     },
+    "continuation": {
+      "enum": [
+        "auto",
+        "off"
+      ],
+      "description": "No-task compact continuation: auto (per-harness default: a minimal conditional continuation where the harness stalls) or off (accept a stalled session; no message is injected)."
+    },
     "surface": {
       "enum": [
         "preserve",

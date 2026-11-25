@@ -173,6 +173,7 @@ export abstract class ExternalExecutorAdapter implements Adapter {
       const handoffRequest: ExecutorHandoffRequest = {
         format: 2, kind: 'handoff-request', operationId: request.operationId, mode,
         ...(request.task !== undefined ? { task: request.task } : {}),
+        ...(request.continuation !== undefined ? { continuation: request.continuation } : {}),
         marker: `ai4ai-context-${randomUUID()}`,
         caller: ctx.identity, requestedAt: now.toISOString(),
         deadlineAt: new Date(now.getTime() + Math.min(Math.max(request.timeoutMs ?? 120000, 5000), 600000)).toISOString(),
@@ -236,7 +237,7 @@ export abstract class ExternalExecutorAdapter implements Adapter {
       : undefined;
     switch (status.phase) {
       case 'completed':
-        return { ...base, status: 'completed', state: 'completed', handoff: { phase: 'completed' }, reason: status.reason ?? 'The executor completed the handoff', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}), ...(status.continued !== undefined ? { continued: status.continued } : {}), ...(status.idleAfter !== undefined ? { idleAfter: status.idleAfter } : {}) } as NativeOutcome;
+        return { ...base, status: 'completed', state: 'completed', handoff: { phase: 'completed' }, reason: status.reason ?? 'The executor completed the handoff', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}), ...(status.continued !== undefined ? { continued: status.continued } : {}), ...(status.idleAfter !== undefined ? { idleAfter: status.idleAfter } : {}), ...(status.fallbackUsed !== undefined ? { fallbackUsed: status.fallbackUsed } : {}) } as NativeOutcome;
       case 'applied':
         return { ...base, status: 'applied', state: 'running', handoff: { phase: 'applied' }, reason: status.reason ?? 'The executor applied the handoff; delivery pending', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}) } as NativeOutcome;
       case 'failed':

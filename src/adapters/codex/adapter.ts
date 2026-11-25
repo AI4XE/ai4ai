@@ -93,7 +93,7 @@ export class CodexAdapter extends ExternalExecutorAdapter {
     const level = linux || mac ? 'supported' as const : 'not-tested' as const;
     const modes = (linux ? ['restart', 'compact'] : ['restart']) as ('compact' | 'restart')[];
     const common = {
-      handoff: { availability: level, modes, self: { modes }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: level, modes, self: { modes }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] }, noTaskCompact: { continuation: 'fallback' as const, default: 'on' as const } },
       spawn: {
         availability: level, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],

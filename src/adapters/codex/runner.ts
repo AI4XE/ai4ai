@@ -18,7 +18,7 @@ import { readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer } from './app-server.js';
 import { applyRevertHandoff, type RpcTransport } from './native-handoff.js';
-import { taskDelivery } from '../../core/handoff-delivery.js';
+import { noTaskCompactDecision, taskDelivery, idleDelivery } from '../../core/handoff-delivery.js';
 import { clearHandoffRequest, controlEnvelopeOperationId, readHandoffRequest, writeHandoffStatus } from '../../core/executor-request.js';
 import type { Identity } from '../../contract/types.js';
 
@@ -72,7 +72,7 @@ const publishStatus = async (
   phase: 'scheduled' | 'applied' | 'completed' | 'failed' | 'cancelled',
   mechanism: 'surface-replacement' | 'native-compaction',
   reason: string,
-  extra: { successorTurnId?: string; continued?: boolean; idleAfter?: boolean; errorCode?: string } = {},
+  extra: { successorTurnId?: string; continued?: boolean; idleAfter?: boolean; fallbackUsed?: boolean; errorCode?: string } = {},
 ): Promise<void> => {
   if (!executorDir || !threadId) return;
   const source = nativeSource(threadId);
@@ -206,7 +206,17 @@ const applyHandoff = async (): Promise<boolean> => {
   await writeHandoff(record);
   try {
     events = [];
-    const delivery = taskDelivery(String(intent.request?.task ?? ''), operationId);
+    const compactDecision = noTaskCompactDecision({
+      task: intent.request?.task,
+      continuation: intent.request?.continuation,
+      mode: 'fallback',
+      marker: operationId,
+    });
+    // Restart keeps the D25 templates: task material, or "Await the next
+    // instruction" with no task. Only compact has a no-task continuation policy.
+    const delivery = mode === 'restart'
+      ? (intent.request?.task ? taskDelivery(String(intent.request.task), operationId) : idleDelivery(operationId))
+      : (compactDecision.delivery ?? '');
     let successorThreadId = threadId;
     let successorTurnId: string | undefined;
     if (mode === 'restart') {
@@ -273,6 +283,20 @@ const applyHandoff = async (): Promise<boolean> => {
     const compacted = await waitFor(candidate => matchesTurn(candidate, undefined), handoffTimeoutMs);
     if (!compacted) throw new Error('compaction did not reach a final state within the timeout');
 
+    if (!delivery) {
+      // No task and continuation off: the compaction is real but the thread may
+      // stay idle. Report that truthfully instead of inventing a successor turn.
+      const finalRecord = {
+        ...record, phase: 'completed', compacted: true, mechanism: 'compact', proofMechanism: 'native-compaction',
+        successorThreadId: threadId, continued: compactDecision.continued, idleAfter: compactDecision.idleAfter, fallbackUsed: compactDecision.fallbackUsed,
+        appliedAt: new Date().toISOString(),
+      };
+      await writeHandoff(finalRecord);
+      await publishStatus('completed', 'native-compaction', 'Native compaction completed; continuation disabled by the caller (the thread may be idle)', { continued: compactDecision.continued, idleAfter: compactDecision.idleAfter, fallbackUsed: compactDecision.fallbackUsed });
+      handoff = { operationId, phase: 'completed', compacted: true, mechanism: 'compact', proofMechanism: 'native-compaction', successorThreadId: threadId, continued: compactDecision.continued, idleAfter: compactDecision.idleAfter, fallbackUsed: compactDecision.fallbackUsed };
+      process.stdout.write(JSON.stringify({ session_id: threadId }) + '\n');
+      return true;
+    }
     events = [];
     answer = '';
     const started = await server.request('turn/start', { threadId, input: [{ type: 'text', text: delivery }] }, handoffTimeoutMs) as { turn?: { id?: string } };
@@ -286,11 +310,14 @@ const applyHandoff = async (): Promise<boolean> => {
       proofMechanism: 'native-compaction',
       successorThreadId: threadId,
       successorTurnId,
+      continued: settled.ok ? true : false,
+      idleAfter: settled.ok ? false : undefined,
+      fallbackUsed: compactDecision.fallbackUsed,
       ...(settled.ok ? {} : { error: settled.detail }),
       appliedAt: new Date().toISOString(),
     };
     await writeHandoff(finalRecord);
-    await publishStatus(settled.ok ? 'completed' : 'failed', 'native-compaction', settled.ok ? 'Native compaction and successor turn completed' : (settled.detail ?? 'compaction failed'), { ...(successorTurnId ? { successorTurnId } : {}) });
+    await publishStatus(settled.ok ? 'completed' : 'failed', 'native-compaction', settled.ok ? 'Native compaction and successor turn completed' : (settled.detail ?? 'compaction failed'), { ...(successorTurnId ? { successorTurnId } : {}), ...(settled.ok ? { continued: true } : {}), ...(compactDecision.fallbackUsed ? { fallbackUsed: true } : {}) });
     handoff = {
       operationId, phase: finalRecord.phase, compacted: true, mechanism: 'compact', proofMechanism: 'native-compaction', successorThreadId: threadId, successorTurnId,
       ...(settled.ok ? {} : { error: settled.detail }),

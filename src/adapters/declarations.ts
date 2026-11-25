@@ -15,6 +15,7 @@ export interface DeclarationInput {
     modelOverride?: Availability;
     reasoningEffortOverride?: Availability;
     crossSurface?: Availability;
+    noTaskCompact?: { continuation: 'in-turn' | 'fallback'; default: 'on' | 'off' };
   };
   spawn?: {
     availability?: Availability;
@@ -69,6 +70,7 @@ export function declaration(input: DeclarationInput): CapabilityDeclaration {
       modelOverride: handoff.modelOverride ?? 'unsupported',
       reasoningEffortOverride: handoff.reasoningEffortOverride ?? 'unsupported',
       crossSurface: handoff.crossSurface ?? 'unsupported',
+      ...(handoff.noTaskCompact ? { noTaskCompact: handoff.noTaskCompact } : {}),
     },
     spawn: {
       availability: spawn.availability ?? 'not-tested',

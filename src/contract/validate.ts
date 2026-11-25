@@ -19,7 +19,7 @@ const done = <T>(value: unknown, issues: Issue[]): Validation<T> => issues.lengt
 
 const REQUEST_KEYS = [
   'requiredFeatures', 'operation', 'operationId', 'target', 'owner', 'mode', 'surface',
-  'task', 'model', 'reasoningEffort', 'policy', 'spawn', 'isolation', 'count', 'timeoutMs', 'reason', 'logTail',
+  'task', 'model', 'reasoningEffort', 'policy', 'spawn', 'isolation', 'count', 'timeoutMs', 'reason', 'logTail', 'continuation',
 ] as const;
 
 const SPAWN_KEYS = ['persistence', 'surface', 'profile', 'permissionMode', 'allowedTools', 'disallowedTools', 'envExclude', 'mcp', 'origin'] as const;
@@ -112,23 +112,24 @@ export function validateRequest(value: unknown, features: readonly string[] = FE
     }
     // A self restart may omit the task (D25: "Await the next instruction") and
     // a compact task is always optional (D12).
+    if (has('continuation') && !['auto', 'off'].includes(String(value.continuation))) issues.push(problem('continuation', 'schema', 'Expected continuation "auto" or "off"'));
     notApplicable(['owner', 'count', 'isolation', 'policy', 'spawn', 'logTail']);
   } else if (operation === 'spawn') {
     if (!has('task')) issues.push(problem('task', 'required', 'spawn requires task material'));
-    notApplicable(['target', 'owner', 'mode', 'surface', 'logTail']);
+    notApplicable(['target', 'owner', 'mode', 'surface', 'logTail', 'continuation']);
   } else if (operation === 'status') {
-    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn']);
+    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'continuation']);
   } else if (operation === 'message') {
     if (!has('target')) issues.push(problem('target', 'required', 'message requires an owned target'));
     if (!has('task')) issues.push(problem('task', 'required', 'message requires text'));
-    notApplicable(['owner', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'logTail']);
+    notApplicable(['owner', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'logTail', 'continuation']);
   } else if (operation === 'cancel' || operation === 'stop' || operation === 'finish') {
     if (!has('target')) issues.push(problem('target', 'required', `${String(operation)} requires an owned target`));
-    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'logTail']);
+    notApplicable(['owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'spawn', 'logTail', 'continuation']);
   } else if (operation === 'list') {
-    notApplicable(['target', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs', 'spawn', 'logTail']);
+    notApplicable(['target', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs', 'spawn', 'logTail', 'continuation']);
   } else if (operation === 'capabilities') {
-    notApplicable(['target', 'owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs', 'spawn', 'logTail']);
+    notApplicable(['target', 'owner', 'task', 'model', 'reasoningEffort', 'policy', 'isolation', 'count', 'mode', 'surface', 'reason', 'timeoutMs', 'spawn', 'logTail', 'continuation']);
   }
   return done<Request>(value, issues);
 }
@@ -253,7 +254,7 @@ const RESULT_KEYS = [
   'turnStartedAt', 'idleSince', 'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail',
   'mechanism', 'sessionChanged', 'sourceSession', 'successorSession', 'sourceGeneration', 'successorGeneration',
   'successor', 'predecessorExecutorId', 'successorExecutorId', 'lineage', 'predecessorStopped', 'alternatives',
-  'continued', 'idleAfter', 'lastError', 'credentials',
+  'continued', 'idleAfter', 'fallbackUsed', 'lastError', 'credentials',
 ] as const;
 
 /** Results are closed too, so a misspelled field cannot masquerade as evidence. */
@@ -448,7 +449,7 @@ export function validateResult(value: unknown): Validation<Result> {
     }
   }
   if (value.alternatives !== undefined && (!Array.isArray(value.alternatives) || value.alternatives.some(mode => !member(mode, HANDOFF_MODES)))) issues.push(problem('alternatives', 'schema', 'Expected a list of handoff modes'));
-  for (const key of ['predecessorStopped', 'continued', 'idleAfter'] as const) {
+  for (const key of ['predecessorStopped', 'continued', 'idleAfter', 'fallbackUsed'] as const) {
     if (value[key] !== undefined && value[key] !== null && typeof value[key] !== 'boolean') issues.push(problem(key, 'schema', 'Expected boolean or null'));
   }
   if (value.lastError !== undefined && value.lastError !== null) {

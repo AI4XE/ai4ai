@@ -119,7 +119,7 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
     return [
       declaration({
         harness: 'opencode', os, interface: 'tui', reason,
-        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
+        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] }, noTaskCompact: { continuation: 'in-turn' as const, default: 'off' as const } },
         ...common,
         ...(verified ? { evidence: `matrix:opencode/${os}/tui/2026-11-21` } : {}),
       }),
@@ -136,7 +136,7 @@ export class OpenCodeAdapter extends ExternalExecutorAdapter {
         // Linux evidence: executor-target restart/compact completed in the same
         // session with the task admitted and answered.
         reason: 'A persistent opencode executor is backed by one per-executor `opencode serve`; the in-harness plugin handles the wake turn, so executor-target restart and compact complete in the same session. The carrier waits for plugin registration before submitting a turn, because a cold plugin cache can answer the port before hooks exist. Rotation stays available as the explicit alternative.',
-        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
+        handoff: { availability: level, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] }, noTaskCompact: { continuation: 'in-turn' as const, default: 'off' as const } },
         ...common,
         ...(verified ? { evidence: `matrix:opencode/${os}/headless/2026-11-24` } : {}),
       }),

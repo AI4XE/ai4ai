@@ -34,8 +34,7 @@ interface PluginRow {
   state?: { status?: unknown };
 }
 
-/** Poll the server plugin registry until the ai4ai plugin is active. */
-export async function waitForAi4aiPlugin(options: PluginReadinessOptions): Promise<PluginReadiness> {
+/** Poll the server plugin registry until the ai4ai plugin is active. */export async function waitForAi4aiPlugin(options: PluginReadinessOptions): Promise<PluginReadiness> {
   const timeoutMs = options.timeoutMs ?? 60_000;
   const intervalMs = options.intervalMs ?? 500;
   const doFetch = options.fetchImpl ?? fetch;
@@ -64,6 +63,42 @@ export async function waitForAi4aiPlugin(options: PluginReadinessOptions): Promi
       }
     } catch (error) {
       detail = `the plugin probe failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    await sleep(intervalMs);
+  }
+  return { ready: false, waitedMs: now() - started, detail };
+}
+
+/**
+ * The 2.x CLI refuses a turn until the server answers its V2 health probe; the
+ * server's TCP port becomes connectable before that endpoint is ready (observed:
+ * `UnexpectedStatus: 503` one second after `opencode serve` listened). Wait for
+ * a 2xx from `/global/health` before spawning `opencode run`.
+ */
+export interface ServerHealthOptions {
+  url: string;
+  timeoutMs?: number;
+  intervalMs?: number;
+  fetchImpl?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+export async function waitForServerHealth(options: ServerHealthOptions): Promise<PluginReadiness> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const intervalMs = options.intervalMs ?? 250;
+  const doFetch = options.fetchImpl ?? fetch;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); }));
+  const now = options.now ?? (() => Date.now());
+  const started = now();
+  let detail = 'the server health probe did not run';
+  while (now() - started < timeoutMs) {
+    try {
+      const response = await doFetch(`${options.url}/global/health`);
+      if (response.ok) return { ready: true, waitedMs: now() - started, detail: 'the server answered its V2 health probe' };
+      detail = `the V2 health probe returned HTTP ${response.status}`;
+    } catch (error) {
+      detail = `the V2 health probe failed: ${error instanceof Error ? error.message : String(error)}`;
     }
     await sleep(intervalMs);
   }

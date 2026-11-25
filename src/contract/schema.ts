@@ -61,6 +61,7 @@ export const REQUEST_SCHEMA = {
     target: { ...id, description: 'Target agent: "self" for this session or an owned executor id.' },
     owner: { ...id, description: 'For list: only return executors created by this owner identity.' },
     mode: { enum: [...HANDOFF_MODES], description: 'Handoff mode: restart (default) starts a fresh context containing only the task material with no summary; compact is an explicit opt-in that keeps a harness-generated history summary.' },
+    continuation: { enum: ['auto', 'off'], description: 'No-task compact continuation: auto (per-harness default: a minimal conditional continuation where the harness stalls) or off (accept a stalled session; no message is injected).' },
     surface: { enum: [...SURFACES], description: 'Interaction surface: preserve (default) or an explicit cross-surface target.' },
     task: { ...boundedText, description: 'Seed material for handoff, spawn or message: the task the context or executor adopts.' },
     model: { ...shortText, description: 'Optional model override; when omitted the harness configuration is inherited.' },
@@ -104,28 +105,28 @@ export const REQUEST_SCHEMA = {
       if: { properties: { operation: { const: 'spawn' } } },
       then: {
         required: ['task'],
-        not: { anyOf: [{ required: ['target'] }, { required: ['owner'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['logTail'] }] },
+        not: { anyOf: [{ required: ['target'] }, { required: ['owner'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['logTail'] }, { required: ['continuation'] }] },
       },
     },
     {
       if: { properties: { operation: { const: 'status' } } },
-      then: { not: { anyOf: [{ required: ['owner'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['spawn'] }] } },
+      then: { not: { anyOf: [{ required: ['owner'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['spawn'] }, { required: ['continuation'] }] } },
     },
     {
       if: { properties: { operation: { enum: ['message'] } } },
-      then: { required: ['target', 'task'], not: { anyOf: [{ required: ['owner'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['spawn'] }, { required: ['logTail'] }] } },
+      then: { required: ['target', 'task'], not: { anyOf: [{ required: ['owner'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['spawn'] }, { required: ['logTail'] }, { required: ['continuation'] }] } },
     },
     {
       if: { properties: { operation: { enum: ['cancel', 'stop', 'finish'] } } },
-      then: { required: ['target'], not: { anyOf: [{ required: ['owner'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['spawn'] }, { required: ['logTail'] }] } },
+      then: { required: ['target'], not: { anyOf: [{ required: ['owner'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['spawn'] }, { required: ['logTail'] }, { required: ['continuation'] }] } },
     },
     {
       if: { properties: { operation: { const: 'list' } } },
-      then: { not: { anyOf: [{ required: ['target'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['reason'] }, { required: ['timeoutMs'] }, { required: ['spawn'] }, { required: ['logTail'] }] } },
+      then: { not: { anyOf: [{ required: ['target'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['reason'] }, { required: ['timeoutMs'] }, { required: ['spawn'] }, { required: ['logTail'] }, { required: ['continuation'] }] } },
     },
     {
       if: { properties: { operation: { const: 'capabilities' } } },
-      then: { not: { anyOf: [{ required: ['target'] }, { required: ['owner'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['reason'] }, { required: ['timeoutMs'] }, { required: ['spawn'] }, { required: ['logTail'] }] } },
+      then: { not: { anyOf: [{ required: ['target'] }, { required: ['owner'] }, { required: ['task'] }, { required: ['model'] }, { required: ['reasoningEffort'] }, { required: ['policy'] }, { required: ['isolation'] }, { required: ['count'] }, { required: ['mode'] }, { required: ['surface'] }, { required: ['reason'] }, { required: ['timeoutMs'] }, { required: ['spawn'] }, { required: ['logTail'] }, { required: ['continuation'] }] } },
     },
   ],
 } as const;
@@ -205,6 +206,11 @@ const capabilitySchema = {
         modelOverride: { enum: [...AVAILABILITY] },
         reasoningEffortOverride: { enum: [...AVAILABILITY] },
         crossSurface: { enum: [...AVAILABILITY] },
+        noTaskCompact: {
+          type: 'object', additionalProperties: false,
+          properties: { continuation: { enum: ['in-turn', 'fallback'] }, default: { enum: ['on', 'off'] } },
+          required: ['continuation', 'default'],
+        },
       },
       required: ['availability', 'modes', 'modelOverride', 'reasoningEffortOverride', 'crossSurface'],
     },
@@ -356,6 +362,7 @@ export const RESULT_SCHEMA = {
     alternatives: { type: 'array', uniqueItems: true, items: { enum: [...HANDOFF_MODES] } },
     continued: { type: ['boolean', 'null'] },
     idleAfter: { type: ['boolean', 'null'] },
+    fallbackUsed: { type: ['boolean', 'null'] },
     lastError: {
       anyOf: [
         { type: 'null' },

@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { install, statusReport, detectReport, currentOs } from './install/manager.js';
 import { Ai4aiStore } from './core/store.js';
 import { execute } from './core/operations.js';
-import { HARNESSES, type HarnessId, type Surface } from './contract/states.js';
+import { HARNESSES, EVENT_KINDS, type EventKind, type HarnessId, type Surface } from './contract/states.js';
 import { TOOL_DESCRIPTION, TOOL_NAME } from './contract/tool.js';
 import type { Identity } from './contract/types.js';
 import { claudeAdapter } from './adapters/claude/adapter.js';
@@ -34,7 +34,7 @@ interface Parsed {
 
 const VALUE_FLAGS = [
   'harness', 'scope', 'workspace', 'home', 'profile', 'package-root', 'contract', 'operation', 'task', 'target', 'mode', 'session', 'surface', 'operation-id', 'timeout', 'model', 'reasoning-effort', 'count',
-  'executor', 'until', 'condition', 'cursor', 'tail', 'format', 'interval', 'spawn', 'persistence', 'permission-mode', 'allowed-tools', 'disallowed-tools', 'env-exclude', 'mcp-deny', 'spawn-surface', 'spawn-profile', 'log-tail', 'log-cursor', 'log-format', 'isolation', 'policy', 'limit', 'session',
+  'executor', 'until', 'condition', 'cursor', 'tail', 'format', 'kind', 'continuation', 'interval', 'spawn', 'persistence', 'permission-mode', 'allowed-tools', 'disallowed-tools', 'env-exclude', 'mcp-deny', 'spawn-surface', 'spawn-profile', 'log-tail', 'log-cursor', 'log-format', 'isolation', 'policy', 'limit', 'session',
 ];
 const BOOLEAN_FLAGS = ['yes', 'json', 'dry-run', 'help', 'version', 'any', 'transcript', 'follow'];
 const CLI_OPERATIONS = ['handoff', 'spawn', 'status', 'message', 'cancel', 'stop', 'finish', 'list', 'capabilities'] as const;
@@ -70,6 +70,16 @@ const harnesses = (parsed: Parsed): HarnessId[] | undefined => {
 
 const fileExists = async (file: string): Promise<boolean> => {
   try { await access(file); return true; } catch { return false; }
+};
+
+/** PARITY-041: `events --kind` filter (repeatable or comma separated). */
+const eventKinds = (parsed: Parsed): EventKind[] | undefined => {
+  const values = parsed.flags.get('kind');
+  if (!values) return undefined;
+  const kinds = values.flatMap(value => value.split(',')).map(value => value.trim()).filter(Boolean);
+  if (kinds.length === 0) return undefined;
+  for (const kind of kinds) if (!EVENT_KINDS.includes(kind as EventKind)) throw new UsageError(`Unknown event kind: ${kind} (expected ${EVENT_KINDS.join('|')})`);
+  return kinds as EventKind[];
 };
 
 /**
@@ -182,6 +192,8 @@ async function runOperation(parsed: Parsed): Promise<void> {
   }
   const mode = flag(parsed, 'mode');
   if (mode !== undefined) request.mode = mode;
+  const continuation = flag(parsed, 'continuation');
+  if (continuation !== undefined) request.continuation = continuation;
   const model = flag(parsed, 'model');
   if (model !== undefined) request.model = model;
   const reasoningEffort = flag(parsed, 'reasoning-effort');
@@ -430,10 +442,12 @@ async function runEvents(parsed: Parsed): Promise<void> {
   const store = await Ai4aiStore.open(home);
   const record = (await store.executors()).find(candidate => candidate.executorId === executorId);
   if (!record) throw new UsageError(`Unknown executor: ${executorId}`);
+  const kinds = eventKinds(parsed);
   const tail = await readEventTail(home, executorId, record.harness, {
     ...(flag(parsed, 'cursor') !== undefined ? { cursor: Number(flag(parsed, 'cursor')) } : {}),
     ...(flag(parsed, 'tail') !== undefined ? { tail: Number(flag(parsed, 'tail')) } : {}),
     ...(flag(parsed, 'format') !== undefined ? { format: flag(parsed, 'format') as 'events' | 'lines' } : {}),
+    ...(kinds ? { kind: kinds } : {}),
   });
   console.log(JSON.stringify(tail, null, 2));
 }
@@ -504,10 +518,11 @@ async function runEventsFollow(parsed: Parsed): Promise<void> {
   if (!record) throw new UsageError(`Unknown executor: ${executorId}`);
   const timeoutSeconds = Number(flag(parsed, 'timeout') ?? 300);
   const intervalMs = Math.max(200, Number(flag(parsed, 'interval') ?? 1000));
+  const kinds = eventKinds(parsed);
   let cursor = Number(flag(parsed, 'cursor') ?? 0);
   const deadline = Date.now() + Math.max(1, timeoutSeconds) * 1000;
   for (;;) {
-    const tail = await readEventTail(home, executorId, record.harness, { cursor, tail: 1000 });
+    const tail = await readEventTail(home, executorId, record.harness, { cursor, tail: 1000, ...(kinds ? { kind: kinds } : {}) });
     cursor = tail.nextCursor;
     if ((tail.events?.length ?? 0) > 0) console.log(JSON.stringify(tail));
     if (Date.now() >= deadline) { process.exitCode = 3; return; }
@@ -555,7 +570,7 @@ Watcher (read-only, declarative):
               turn-age >= N, context.percent >= N,
               event ~ REGEX, processState=orphaned.
   Exit codes: 0 condition met, 3 timeout, 2 usage/config, 1 runtime.
-  ai4ai events --executor <id> [--tail N] [--cursor N] [--format events|lines]
+  ai4ai events --executor <id> [--tail N] [--cursor N] [--kind message,tool,...] [--format events|lines]
   ai4ai sweep [--json]
 
 Spawn options: --persistence one-shot|persistent --permission-mode bypassPermissions|dontAsk

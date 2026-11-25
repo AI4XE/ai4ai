@@ -91,6 +91,8 @@ export interface Request {
    * only available where the capability declaration lists it.
    */
   mode?: HandoffMode;
+  /** No-task compact continuation: `auto` (per-harness default) or `off` (accept a stalled session). */
+  continuation?: 'auto' | 'off';
   /** `preserve` (default) or an explicit cross-surface value. */
   surface?: Surface;
   /** Task seed material for handoff/spawn/message. */
@@ -293,6 +295,8 @@ export interface Result {
   continued?: boolean | null;
   /** True when an idle executor had no work to continue (not a failure). */
   idleAfter?: boolean | null;
+  /** True when the minimal conditional continuation message was injected for a no-task compact. */
+  fallbackUsed?: boolean | null;
   /** Last error observed for a durable in-flight request. */
   lastError?: ContractError | null;
   modelVerification: ModelVerification;
@@ -330,6 +334,8 @@ export interface CapabilityDeclaration {
     modelOverride: Availability;
     reasoningEffortOverride: Availability;
     crossSurface: Availability;
+    /** No-task compact: whether the harness continues in-turn or needs the minimal fallback, and the default. */
+    noTaskCompact?: { continuation: 'in-turn' | 'fallback'; default: 'on' | 'off' };
   };
   spawn: {
     availability: Availability;

@@ -189,6 +189,8 @@ export interface ReadEventsOptions {
   cursor?: number;
   tail?: number;
   format?: 'events' | 'lines';
+  /** PARITY-041: keep only these normalized event kinds (events format only). */
+  kind?: EventKind[];
 }
 
 /**
@@ -228,7 +230,9 @@ export async function readEventTail(home: string, executorId: string, harness: H
     if (typeof entry?.line !== 'string') entry = { ts: '', stream: 'unknown', line };
     events.push(mapLogLine(entry, base + start + index + 1, harness));
   });
-  return { format, events, nextCursor: end, reset };
+  const kind = options.kind;
+  const filtered = kind && kind.length > 0 ? events.filter(item => kind.includes(item.kind as EventKind)) : events;
+  return { format, events: filtered, nextCursor: end, reset };
 }
 
 /** Size of the log currently on disk (0 when absent). */

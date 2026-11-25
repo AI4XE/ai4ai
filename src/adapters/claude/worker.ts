@@ -217,6 +217,9 @@ if (command.action === 'transition') {
   if (successor.session !== latest.source.session) throw new Error('Handoff successor changed the native session id; no transition recorded');
   const next: ClaudeRecord = {
     ...latest, phase: to, reason: command.reason ?? to,
+    ...(command.continued !== undefined ? { continued: command.continued } : {}),
+    ...(command.idleAfter !== undefined ? { idleAfter: command.idleAfter } : {}),
+    ...(command.fallbackUsed !== undefined ? { fallbackUsed: command.fallbackUsed } : {}),
     ...(to === 'applied'
       ? {
           successor,
@@ -226,7 +229,10 @@ if (command.action === 'transition') {
       : {}),
   };
   await journal.transaction(caller, async (_rows, commit) => commit(next));
-  await publishStatus(next);
+  await publishStatus(next, {
+    ...(command.continued !== undefined ? { continued: command.continued } : {}),
+    ...(command.idleAfter !== undefined ? { idleAfter: command.idleAfter } : {}),
+  });
   console.log(JSON.stringify({ record: next, result: response(next) }));
   process.exit(0);
 }
@@ -327,6 +333,18 @@ if (request.operation === 'cancel' || request.operation === 'stop') {
 }
 
 if (request.operation === 'handoff' && request.target === 'self') {
+  // D38: a detached executor must not silently self-renew through the tool
+  // default. The plugin marks a defaulted target; an explicit target wins.
+  if (process.env.AI4AI_EXECUTOR_ID && command.targetDefaulted === true) {
+    console.log(JSON.stringify({ result: {
+      operation: 'handoff', operationId: request.operationId, status: 'failed',
+      reason: `A detached executor (${process.env.AI4AI_EXECUTOR_ID}) cannot omit target and cannot renew itself; an executor handoff requires an explicit target=<owned executor id>.`,
+      durable: false, modelVerification: 'unknown', verification: { model: 'unknown', context: 'reported' },
+      notices: [], unavailable: [],
+      error: { code: 'handoff-executor-self-renewal', message: 'Executor-context handoff requires an explicit target', correctedCall: `{"operation":"handoff","target":"<owned executor id>","mode":"${request.mode ?? 'restart'}","operationId":"...","task":"..."}` },
+    } }));
+    process.exit(0);
+  }
   if (prior) {
     console.log(JSON.stringify({ result: prior.fingerprint === fingerprint(request) ? response(prior) : result(request, 'failed', 'Conflicting operation identifier reuse') }));
     process.exit(0);

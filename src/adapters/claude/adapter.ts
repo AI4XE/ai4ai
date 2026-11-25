@@ -49,7 +49,7 @@ export class ClaudeAdapter extends ExternalExecutorAdapter {
         : 'The mods plugin and the detached carrier are implemented; native Windows is out of scope (WSL counts as Linux) and was not exercised.';
     const carrier = linux || mac ? 'supported' as const : 'not-tested' as const;
     const common = {
-      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[], }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: linux || mac ? 'supported' as const : 'not-tested' as const, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[], }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] }, noTaskCompact: { continuation: 'fallback' as const, default: 'on' as const } },
       spawn: {
         availability: carrier, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],

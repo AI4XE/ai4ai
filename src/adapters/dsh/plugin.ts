@@ -9,12 +9,12 @@ import { Ai4aiStore } from '../../core/store.js';
 import { currentOs, execute } from '../../core/operations.js';
 import type { Identity, Request, Result } from '../../contract/types.js';
 import { DshAdapter } from './adapter.js';
-import { TOOL_DESCRIPTION, normalizeToolRequest } from '../../contract/tool.js';
+import { TOOL_DESCRIPTION, normalizeToolCall } from '../../contract/tool.js';
 import { reconcileDshStatus, resolveDshStatus, type DshNativeStatus } from './status.js';
 import { AI4AI_HOME_FALLBACK_NOTICE, resolveAi4aiStoreHome } from '../../core/ai4ai-home.js';
 import { sessionActivity, sessionPointer } from '../../core/session-probe.js';
 import { effectiveDshSelection, foldDshSelection } from '../../core/dsh-selection.js';
-import { continueDelivery, taskDelivery } from '../../core/handoff-delivery.js';
+import { continueDelivery, taskDelivery, noTaskCompactDecision } from '../../core/handoff-delivery.js';
 
 interface NativeMessage { id: string; role: string; content: { type: string; text?: string; id?: string; toolCallId?: string }[]; toolCallId?: string; isError?: boolean; turn?: number; step?: number; source?: { kind: string; ai4ai?: JournalRecord } }
 interface NativeEvent { seq: number; type: string; time?: number; data: NativeMessage & { name?: string; message?: NativeMessage; isError?: boolean }; sourceEventSeqs?: number[] }
@@ -61,8 +61,9 @@ interface JournalRecord {
   /** Compact observations (no synthetic work is created). */
   continued?: boolean;
   idleAfter?: boolean;
+  fallbackUsed?: boolean;
   /** Exact request covered by the fingerprint; keeps later parsing independent of optional fields. */
-  request?: { operation: 'handoff'; operationId: string; target: 'self'; task?: string; mode?: 'restart' | 'compact' };
+  request?: { operation: 'handoff'; operationId: string; target: 'self'; task?: string; mode?: 'restart' | 'compact'; continuation?: 'auto' | 'off' };
   /** True for a request delivered by the external control plane (executor-target). */
   external?: boolean;
 }
@@ -184,7 +185,7 @@ function journal(events: readonly NativeEvent[], session: NativeSession): Locate
         proof: { source: entry.record.owner, successor, mechanism: 'native-compaction', nativeEvidence: `session:${session.id}:compaction:${summary.seq}` },
         proofMechanism: 'native-compaction',
         reason: 'Native step-boundary summary produced',
-        continued, idleAfter: !continued,
+        continued, idleAfter: !continued, fallbackUsed: false,
       },
     });
   }
@@ -216,6 +217,7 @@ function receipt(request: Request, record: JournalRecord, durable: boolean): Res
     ...(record.proofMechanism ? { mechanism: record.proofMechanism } : {}),
     ...(record.continued !== undefined ? { continued: record.continued } : {}),
     ...(record.idleAfter !== undefined ? { idleAfter: record.idleAfter } : {}),
+    ...(record.fallbackUsed !== undefined ? { fallbackUsed: record.fallbackUsed } : {}),
   });
 }
 
@@ -337,7 +339,7 @@ export function apply(ctx: DshContext): () => void {
     }
     const mode: 'restart' | 'compact' = request.mode === 'compact' ? 'compact' : 'restart';
     const task = typeof request.task === 'string' ? request.task : '';
-    const canonical = { operation: 'handoff' as const, operationId: request.operationId, target: 'self' as const, ...(task ? { task } : {}), mode };
+    const canonical = { operation: 'handoff' as const, operationId: request.operationId, target: 'self' as const, ...(task ? { task } : {}), mode, ...(request.continuation !== undefined ? { continuation: request.continuation } : {}) };
     const record: JournalRecord = { version: 2, operationId: request.operationId, fingerprint: fingerprint(canonical), phase: 'intent', owner, boundary: session.seq, task, mode, request: canonical, external: true, reason: 'External executor-target handoff accepted; applying at the next safe step' };
     session.append('user/message', {
       id: randomUUID(), role: 'user',
@@ -355,13 +357,22 @@ export function apply(ctx: DshContext): () => void {
     parameters: REQUEST_SCHEMA,
     output: { schema: { type: 'object' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args, exec): Promise<Result> {
-      const validated = validateRequest(normalizeToolRequest(args));
+      const norm = normalizeToolCall(args, { ...(process.env.AI4AI_EXECUTOR_ID ? { executorId: process.env.AI4AI_EXECUTOR_ID } : {}) });
+      if (!norm.ok) {
+        const operationId = norm.operationId;
+        return {
+          operation: 'handoff', operationId, status: 'failed', reason: norm.failure.message, durable: false,
+          modelVerification: 'unknown', verification: { model: 'unknown', context: 'reported' }, notices: [], unavailable: [],
+          error: { code: norm.failure.code, message: norm.failure.message, correctedCall: norm.failure.correctedCall },
+        } as Result;
+      }
+      const validated = validateRequest(norm.request);
       if (!validated.ok) throw new Error(JSON.stringify(validated.issues));
       const request = validated.value;
       const agent = exec.agent;
       if (!active) return result(request, 'failed', 'Integration was unloaded');
       if (!agent || !rootAgent(agent)) return result(request, 'authorization-required', 'Native root-agent identity is required');
-      return serial(async () => {
+      const output = await serial(async (): Promise<Result> => {
         exec.signal.throwIfAborted();
         const session = agent.session;
         const caller = identity(agent);
@@ -450,7 +461,7 @@ export function apply(ctx: DshContext): () => void {
         // object is stored so the pre-step parser can reproduce it byte for
         // byte regardless of optional fields on the original request.
         const mode: 'restart' | 'compact' = request.mode === 'compact' ? 'compact' : 'restart';
-        const canonical = { operation: 'handoff' as const, operationId: request.operationId, target: 'self' as const, ...(request.task !== undefined ? { task: request.task } : {}), mode };
+        const canonical = { operation: 'handoff' as const, operationId: request.operationId, target: 'self' as const, ...(request.task !== undefined ? { task: request.task } : {}), mode, ...(request.continuation !== undefined ? { continuation: request.continuation } : {}) };
         const record: JournalRecord = { version: 2, operationId: request.operationId, fingerprint: fingerprint(canonical), phase: 'intent', owner: caller, boundary: session.seq, task: request.task ?? '', mode, request: canonical };
         // The intent must exist in the native append-only journal: the
         // pre-step hook reads user/message records, and a tool result alone is
@@ -463,6 +474,9 @@ export function apply(ctx: DshContext): () => void {
         session.append('user/message', intent, { surfaceOp: 'append' });
         return { ...receipt(request, record, false) };
       });
+      if (norm.notices.length === 0) return output;
+      const merged = output as Result;
+      return { ...merged, notices: [...(merged.notices ?? []), ...norm.notices] } as Result;
     },
   });
 
@@ -527,6 +541,7 @@ export function apply(ctx: DshContext): () => void {
           : 'Native summary produced; the executor has no further work in this turn',
       continued,
       idleAfter: !continued,
+      fallbackUsed: false,
     };
   };
 
@@ -555,13 +570,25 @@ export function apply(ctx: DshContext): () => void {
       await publishStatus(failed, { errorCode: 'dsh-compaction-failed' });
       return;
     }
-    const applied = compactApplied(record, result?.summarySeq, 'idle');
+    const decision = noTaskCompactDecision({
+      task: record.task,
+      continuation: record.request?.continuation,
+      mode: 'fallback',
+      marker: `ai4ai-context-${record.operationId}`,
+    });
+    const appliedBase = compactApplied(record, result?.summarySeq, 'idle');
+    const applied: JournalRecord = decision.delivery === null
+      ? { ...appliedBase, continued: decision.continued, idleAfter: decision.idleAfter, fallbackUsed: decision.fallbackUsed, reason: 'Native summary produced; continuation disabled by the caller (the agent may stay idle)' }
+      : { ...appliedBase, continued: decision.continued, idleAfter: decision.idleAfter, fallbackUsed: decision.fallbackUsed, reason: record.task ? (appliedBase.reason ?? 'Native summary produced; the task is delivered as the next input') : 'Native summary produced; the minimal conditional continuation wakes the agent' };
+    if (decision.delivery === null) {
+      await durable(session);
+      await publishStatus(applied);
+      return;
+    }
     // An idle agent must be woken; appending to the surface alone does not open
     // a turn. The conditional continuation is the documented fallback for a
     // surface whose only compaction API is idle-bound.
-    const delivery = record.task
-      ? taskDelivery(record.task, `ai4ai-context-${record.operationId}`)
-      : continueDelivery(`ai4ai-context-${record.operationId}`);
+    const delivery = decision.delivery;
     if (!agent.followup) {
       const failed: JournalRecord = { ...record, phase: 'failed', reason: 'The idle-bound compaction could not wake a new turn; the summary was produced but the task was not delivered' };
       session.append('user/message', { id: randomUUID(), role: 'user', content: [{ type: 'text', text: 'AI4AI compact handoff could not deliver its task; the original context is retained.' }], source: { kind: SOURCE, ai4ai: failed } }, { surfaceOp: 'append' });

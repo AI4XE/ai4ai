@@ -190,7 +190,7 @@ export class DshAdapter extends ExternalExecutorAdapter {
     const headlessHandoff = 'supported' as const;
     const webLevel = 'supported' as const;
     const headless = {
-      handoff: { availability: headlessHandoff, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: headlessHandoff, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, executor: { modes: ['restart', 'compact', 'rotation'] as ('compact' | 'restart' | 'rotation')[] }, noTaskCompact: { continuation: 'in-turn' as const, default: 'off' as const } },
       spawn: {
         availability: carrier, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],
@@ -203,7 +203,7 @@ export class DshAdapter extends ExternalExecutorAdapter {
       evidence: `matrix:dsh/${os}/headless/2026-11-22`,
     };
     const web = {
-      handoff: { availability: webLevel, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] } },
+      handoff: { availability: webLevel, modes: ['restart', 'compact'] as ('compact' | 'restart')[], self: { modes: ['restart', 'compact'] as ('compact' | 'restart' | 'rotation')[] }, noTaskCompact: { continuation: 'in-turn' as const, default: 'off' as const } },
       spawn: {
         availability: webLevel, maxConcurrent: 4,
         persistenceModes: ['one-shot', 'persistent'] as ('one-shot' | 'persistent')[],

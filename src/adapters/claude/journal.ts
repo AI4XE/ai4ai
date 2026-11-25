@@ -29,9 +29,18 @@ export interface ClaudeRecord {
    */
   proofMechanism?: StoredProofMechanism;
   successor?: Identity;
+  /** No-task compact continuation truth (observation only). */
+  continued?: boolean;
+  idleAfter?: boolean;
+  fallbackUsed?: boolean;
 }
 
 export interface ClaudeCommand {
+  /** True when the tool layer filled target='self' (D38 executor guard). */
+  targetDefaulted?: boolean;
+  continued?: boolean;
+  idleAfter?: boolean;
+  fallbackUsed?: boolean;
   action: 'binding' | 'inspect' | 'request' | 'transition' | 'recover' | 'bind' | 'intake' | 'debug';
   caller?: Identity;
   instance?: string;
@@ -75,6 +84,9 @@ function response(record: ClaudeRecord, operation: Request['operation'] = 'hando
           },
         }
       : {}),
+    ...(record.continued !== undefined ? { continued: record.continued } : {}),
+    ...(record.idleAfter !== undefined ? { idleAfter: record.idleAfter } : {}),
+    ...(record.fallbackUsed !== undefined ? { fallbackUsed: record.fallbackUsed } : {}),
   });
 }
 

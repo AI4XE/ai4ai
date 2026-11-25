@@ -171,11 +171,11 @@ primary discovery surface and every input property carries its own description.
 ```text
 AI Harness Extension Kit (ai4ai)
 - status — query this session's context window, tokens used, usage percent, model, reasoning effort and auto-compact setting. Returns context {window, used (tokens), percent (0–100), sources}, model, reasoningEffort, autoCompact {tokens, ratio, source}.
-- handoff — renew this session's context at a safe point: start a fresh context that keeps the same task when the conversation gets long or the context is nearly full.
+- handoff — renew a context at a safe point. target defaults to self for an in-harness call; an executor handoff requires an explicit target=<owned executor id> (mode restart|compact|rotation; rotation and executor contexts never default).
 - spawn — start a detached executor that works in parallel while this session continues.
 - message / stop / finish / list — manage executors (message revives a terminal executor in its session; finish completes gracefully).
 - capabilities — list supported operations for this harness.
-- CLI helpers (orchestrator-side; shell commands, not tool calls): `ai4ai watch --executor <id> --until "<condition>" [--timeout S]` (exit 0 met / 3 timeout / 2 usage / 1 runtime), `ai4ai events --executor <id> [--follow]` (normalized tail with cursor; opt-in read-only follow), `ai4ai transcript --executor <id> [--tail N]` (opt-in bounded/redacted transcript tail), `ai4ai adoption --executor <id>` (verify-adoption proof), `ai4ai activity --executor <id>` (bounded activity summary), `ai4ai sweep` (identity-checked orphan cleanup). Run `ai4ai --help` for conditions and flags.
+- CLI helpers (orchestrator-side; shell commands, not tool calls): `ai4ai watch --executor <id> --until "<condition>" [--timeout S]` (exit 0 met / 3 timeout / 2 usage / 1 runtime), `ai4ai events --executor <id> [--follow] [--kind message,tool,...]` (normalized tail with cursor and optional kind filter; opt-in read-only follow), `ai4ai transcript --executor <id> [--tail N]` (opt-in bounded/redacted transcript tail), `ai4ai adoption --executor <id>` (verify-adoption proof), `ai4ai activity --executor <id>` (bounded activity summary), `ai4ai sweep` (identity-checked orphan cleanup). Run `ai4ai --help` for conditions and flags.
 Notices are informational; on pending, finish the turn.
 ```
 
@@ -287,6 +287,13 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
         "rotation"
       ],
       "description": "Handoff mode: restart (default) starts a fresh context containing only the task material with no summary; compact is an explicit opt-in that keeps a harness-generated history summary."
+    },
+    "continuation": {
+      "enum": [
+        "auto",
+        "off"
+      ],
+      "description": "No-task compact continuation: auto (per-harness default: a minimal conditional continuation where the harness stalls) or off (accept a stalled session; no message is injected)."
     },
     "surface": {
       "enum": [
@@ -622,6 +629,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
               "required": [
                 "logTail"
               ]
+            },
+            {
+              "required": [
+                "continuation"
+              ]
             }
           ]
         }
@@ -686,6 +698,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "spawn"
+              ]
+            },
+            {
+              "required": [
+                "continuation"
               ]
             }
           ]
@@ -757,6 +774,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "logTail"
+              ]
+            },
+            {
+              "required": [
+                "continuation"
               ]
             }
           ]
@@ -834,6 +856,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "logTail"
+              ]
+            },
+            {
+              "required": [
+                "continuation"
               ]
             }
           ]
@@ -914,6 +941,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "logTail"
+              ]
+            },
+            {
+              "required": [
+                "continuation"
               ]
             }
           ]
@@ -999,6 +1031,11 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
             {
               "required": [
                 "logTail"
+              ]
+            },
+            {
+              "required": [
+                "continuation"
               ]
             }
           ]
@@ -1594,6 +1631,12 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
       ]
     },
     "idleAfter": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "fallbackUsed": {
       "type": [
         "boolean",
         "null"
@@ -2206,6 +2249,28 @@ A `supported` spawn must declare `lifecycle: "detached"`; a tested failure is re
                   "limited",
                   "unsupported",
                   "not-tested"
+                ]
+              },
+              "noTaskCompact": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "continuation": {
+                    "enum": [
+                      "in-turn",
+                      "fallback"
+                    ]
+                  },
+                  "default": {
+                    "enum": [
+                      "on",
+                      "off"
+                    ]
+                  }
+                },
+                "required": [
+                  "continuation",
+                  "default"
                 ]
               }
             },

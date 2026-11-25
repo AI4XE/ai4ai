@@ -20,7 +20,7 @@ import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import { controlEnvelopeOperationId } from '../../core/control-envelope.js';
-import { waitForAi4aiPlugin } from './readiness.js';
+import { waitForAi4aiPlugin, waitForServerHealth } from './readiness.js';
 
 const args = process.argv.slice(2);
 const valueOf = (name: string): string | undefined => {
@@ -117,6 +117,23 @@ async function startServer(): Promise<ServerRecord> {
 
 let server = await readServer();
 if (!server) server = await startServer();
+
+// The 2.x CLI waits for the server's V2 health endpoint before accepting a
+// turn; `startServer` only waits for the TCP port, so a cold server can still
+// answer 503 to `opencode run`. Wait for health on every 2.x turn (a warm
+// server answers immediately).
+if (major >= 2) {
+  const health = await waitForServerHealth({ url: server.url });
+  if (executorDirectory) {
+    await writeFile(path.join(executorDirectory, 'server-health.json'), JSON.stringify({
+      at: new Date().toISOString(), ...health,
+    }, null, 2) + '\n').catch(() => undefined);
+  }
+  if (!health.ready) {
+    process.stderr.write(`opencode carrier aborted: ${health.detail}\n`);
+    process.exit(1);
+  }
+}
 
 // The server answers on its port before the in-harness plugin is registered.
 // A control envelope submitted in that window is executed as ordinary model

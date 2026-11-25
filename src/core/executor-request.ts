@@ -27,6 +27,8 @@ export interface ExecutorHandoffRequest {
   operationId: string;
   mode: Exclude<HandoffMode, 'rotation'>;
   task?: string;
+  /** No-task compact continuation choice forwarded to the executor carrier. */
+  continuation?: 'auto' | 'off';
   marker: string;
   caller: Identity;
   requestedAt: string;
@@ -48,6 +50,7 @@ export interface ExecutorHandoffStatus {
   generation?: string;
   continued?: boolean;
   idleAfter?: boolean;
+  fallbackUsed?: boolean;
   reason?: string;
   errorCode?: string;
   updatedAt: string;

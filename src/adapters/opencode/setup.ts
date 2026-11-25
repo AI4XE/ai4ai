@@ -7,7 +7,7 @@ import { resolveBindingFile } from '../../install/binding.js';
 import { result, validateRequest } from '../../contract/validate.js';
 import { handoffOutcome } from '../../contract/states.js';
 import { REQUEST_SCHEMA } from '../../contract/schema.js';
-import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolRequest } from '../../contract/tool.js';
+import { TOOL_DESCRIPTION, TOOL_NAME, normalizeToolCall } from '../../contract/tool.js';
 import { Ai4aiStore } from '../../core/store.js';
 import { activeRecord } from '../../core/journal.js';
 import { currentOs, execute } from '../../core/operations.js';
@@ -264,13 +264,22 @@ export async function setup(ctx: any): Promise<() => void> {
       input: REQUEST_SCHEMA,
       options: { namespace: 'ai4ai', codemode: false },
       async execute(input: unknown, native: any) {
-        const parsed = validateRequest(normalizeToolRequest(input));
+        const norm = normalizeToolCall(input, { ...(process.env.AI4AI_EXECUTOR_ID ? { executorId: process.env.AI4AI_EXECUTOR_ID } : {}) });
+        if (!norm.ok) {
+          return { content: JSON.stringify({
+            operation: 'handoff', operationId: norm.operationId, status: 'failed', reason: norm.failure.message,
+            durable: false, modelVerification: 'unknown', verification: { model: 'unknown', context: 'reported' },
+            notices: [], unavailable: [],
+            error: { code: norm.failure.code, message: norm.failure.message, correctedCall: norm.failure.correctedCall },
+          }) };
+        }
+        const parsed = validateRequest(norm.request);
         if (!parsed.ok) throw new Error('AI4AI request schema/version mismatch');
         const request = parsed.value;
         native.signal?.throwIfAborted?.();
         const messages = await ctx.session.context({ sessionID: native.sessionID });
         const caller = identity(native.sessionID, messages);
-        return serial(async () => {
+        const output = await serial(async () => {
           if (request.operation === 'status' && (request.target === undefined || request.target === 'self')) return { content: JSON.stringify(await status(request, caller)) };
           if (['spawn', 'message', 'list'].includes(request.operation) || (request.target !== undefined && request.target !== 'self')) {
             return { content: JSON.stringify(await external(request, caller)) };
@@ -293,6 +302,11 @@ export async function setup(ctx: any): Promise<() => void> {
           if (out.record) sessions.set(native.sessionID, out.record);
           return { content: JSON.stringify(out.result) };
         });
+        if (norm.notices.length === 0) return output;
+        try {
+          const value = JSON.parse(output.content) as Record<string, unknown>;
+          return { ...output, content: JSON.stringify({ ...value, notices: [...((value.notices as unknown[]) ?? []), ...norm.notices] }) };
+        } catch { return output; }
       },
     });
   });
@@ -348,7 +362,7 @@ export async function setup(ctx: any): Promise<() => void> {
       event.result = previous;
       const applied = await journal.transition(record.source, record.operationId, ['scheduled'], 'applied', 'Native summary produced; successor input pending');
       sessions.set(event.sessionID, applied);
-      await publishStatus(applied, { continued: true });
+      await publishStatus(applied, { continued: true, fallbackUsed: false });
       return;
     }
     event.result = { summary: 'AI4AI compaction admission unavailable; original window retained.', native: { messages: event.messages }, metadata: { ai4aiRejected: true } };
@@ -413,9 +427,9 @@ export async function setup(ctx: any): Promise<() => void> {
     if (record.mechanism === 'compact' && !record.request.task) {
       // No task: the native summary continues the original work and nothing is
       // delivered. Completion is the summary itself, not an adoption turn.
-      const completed = await journal.transition(record.source, record.operationId, ['applied'], 'completed', 'Native compaction completed; the original task continues with no extra message');
+      const completed = await journal.transition(record.source, record.operationId, ['applied'], 'completed', 'Native compaction completed in the same loop; the original task continues with no extra message');
       sessions.set(event.sessionID, completed);
-      await publishStatus(completed, { continued: true });
+      await publishStatus(completed, { continued: true, fallbackUsed: false });
       await replayRetainedInput(event.sessionID, completed);
       return;
     }
