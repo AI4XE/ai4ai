@@ -229,7 +229,10 @@ export abstract class ExternalExecutorAdapter implements Adapter {
         const proof = status.source && status.successor
           ? { source: status.source, successor: status.successor, mechanism: status.mechanism ?? 'surface-replacement', nativeEvidence: `executor:${record.executorId}:turn-ledger` }
           : undefined;
-        return { ...base, status: 'completed', state: 'completed', handoff: { phase: 'completed' }, reason: 'The successor turn completed after the native transition', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}) } as NativeOutcome;
+        // The in-harness component already decided the truth fields when it wrote
+        // `applied`; the adoption path must report them (D39) instead of only the
+        // later `completed` branch doing so.
+        return { ...base, status: 'completed', state: 'completed', handoff: { phase: 'completed' }, reason: 'The successor turn completed after the native transition', ...(proof ? { proof } : {}), ...(status.mechanism ? { mechanism: status.mechanism } : {}), ...(status.continued !== undefined ? { continued: status.continued } : {}), ...(status.idleAfter !== undefined ? { idleAfter: status.idleAfter } : {}), ...(status.fallbackUsed !== undefined ? { fallbackUsed: status.fallbackUsed } : {}) } as NativeOutcome;
       }
     }
     const proof = status.source && status.successor

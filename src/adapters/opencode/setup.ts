@@ -362,7 +362,7 @@ export async function setup(ctx: any): Promise<() => void> {
       event.result = previous;
       const applied = await journal.transition(record.source, record.operationId, ['scheduled'], 'applied', 'Native summary produced; successor input pending');
       sessions.set(event.sessionID, applied);
-      await publishStatus(applied, { continued: true, fallbackUsed: false });
+      await publishStatus(applied, { continued: true, idleAfter: false, fallbackUsed: false });
       return;
     }
     event.result = { summary: 'AI4AI compaction admission unavailable; original window retained.', native: { messages: event.messages }, metadata: { ai4aiRejected: true } };
@@ -429,7 +429,7 @@ export async function setup(ctx: any): Promise<() => void> {
       // delivered. Completion is the summary itself, not an adoption turn.
       const completed = await journal.transition(record.source, record.operationId, ['applied'], 'completed', 'Native compaction completed in the same loop; the original task continues with no extra message');
       sessions.set(event.sessionID, completed);
-      await publishStatus(completed, { continued: true, fallbackUsed: false });
+      await publishStatus(completed, { continued: true, idleAfter: false, fallbackUsed: false });
       await replayRetainedInput(event.sessionID, completed);
       return;
     }

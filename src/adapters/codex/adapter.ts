@@ -482,6 +482,11 @@ function handoffRecordOutcome(record: any, threadId: string, fallbackMode: 'rest
       status: phase === 'completed' ? 'completed' : 'applied',
       reason: String(record.reason ?? (phase === 'completed' ? 'The detached runner applied this handoff' : 'The detached runner applied this handoff; the successor turn is still running')),
       proof: handoffRecordProof(record, threadId, fallbackMode),
+      // D39: the runner decided the continuation truth when it applied the
+      // handoff; surface it instead of only reporting `continued`.
+      ...(record.continued !== undefined ? { continued: record.continued === true } : {}),
+      ...(record.idleAfter !== undefined ? { idleAfter: record.idleAfter === true } : {}),
+      ...(record.fallbackUsed !== undefined ? { fallbackUsed: record.fallbackUsed === true } : {}),
     };
   }
   if (phase === 'failed') {
