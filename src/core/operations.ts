@@ -47,7 +47,7 @@ const PASSTHROUGH = [
   'turnId', 'queuePosition', 'persistence', 'runtimeVersion', 'mcpFiltered', 'logTail', 'credentials',
   'mechanism', 'sessionChanged', 'sourceSession', 'successorSession', 'sourceGeneration',
   'successorGeneration', 'successor', 'predecessorExecutorId', 'successorExecutorId', 'lineage',
-  'predecessorStopped', 'alternatives', 'continued', 'idleAfter', 'lastError',
+  'predecessorStopped', 'alternatives', 'continued', 'idleAfter', 'fallbackUsed', 'lastError',
 ] as const;
 
 export function normalizeOutcome(request: Request, outcome: NativeOutcome): Result {

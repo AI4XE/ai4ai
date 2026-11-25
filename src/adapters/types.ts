@@ -63,6 +63,7 @@ export interface NativeOutcome {
   alternatives?: import('../contract/states.js').HandoffMode[];
   continued?: boolean | null;
   idleAfter?: boolean | null;
+  fallbackUsed?: boolean | null;
   lastError?: ContractError | null;
 }
 
