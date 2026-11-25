@@ -314,6 +314,7 @@ export function apply(ctx: DshContext): () => void {
       ...(record.reason ? { reason: record.reason } : {}),
       ...(record.continued !== undefined ? { continued: record.continued } : {}),
       ...(record.idleAfter !== undefined ? { idleAfter: record.idleAfter } : {}),
+      ...(record.fallbackUsed !== undefined ? { fallbackUsed: record.fallbackUsed } : {}),
       ...extra,
       updatedAt: new Date().toISOString(),
     };
