@@ -443,7 +443,7 @@ export const register: Register = on => {
           await transition($, s, 'completed', s.fallback
             ? 'Successor adopted the replaced context with the minimal continuation fallback; handoff complete'
             : 'Successor adopted the replaced context; handoff complete',
-            { continued: true, fallbackUsed: s.fallback === true });
+            { continued: true, idleAfter: false, fallbackUsed: s.fallback === true });
         }
       }
     });
